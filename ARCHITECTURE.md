@@ -18,8 +18,8 @@ Tokio I/O world.
    kernel starts it when they exist and unloads it when they disappear.
 5. **I/O is isolated.** Nothing blocks the UI thread. Tokio workers talk back
    through a post-office of `Send` closures executed on the UI thread.
-6. **The workspace is portable.** Configuration is plain TOML; secrets are in
-   the OS keychain; no proprietary database.
+6. **The workspace is portable.** Configuration is plain TOML; secrets live in
+   the platform vault (Credential Manager on Windows); no proprietary database.
 
 ## 2. Cordis → Rust
 
@@ -155,8 +155,8 @@ implementation.
 
 Notable contracts:
 
-- `SessionService` — profile CRUD, settings, snippets, highlight rules, keychain
-  password/passphrase access, export/import.
+- `SessionService` — profile CRUD, settings, snippets, highlight rules, platform
+  vault password/passphrase access, export/import.
 - `TransportProvider` — `connect(spec, events) -> Result<()>`; must return
   immediately and report progress through the channel.
 - `Transport` — `Send` handle with `write`, `resize`, `close`.
