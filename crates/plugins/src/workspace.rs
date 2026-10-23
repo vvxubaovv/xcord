@@ -7,10 +7,11 @@ use tokio::sync::broadcast;
 use xcord_cordis::{Context, Plugin, PluginMeta, Result};
 use xcord_plugin_api::{
     services, AuthRequest, Command, Commands, ConnectSpec, HostKeySummary, OpenRequest, Runtime,
-    RuntimeHandle, Sessions, TabInfo, TabStatus, TerminalId, Transport, TransportEvent,
-    TransportRegistry, Transports, Ui, UiCommand, Workspace, WorkspaceEvent, WorkspaceService,
+    RuntimeHandle, SessionService, Sessions, TabInfo, TabStatus, TerminalId, Transport,
+    TransportEvent, TransportRegistry, Transports, Ui, UiCommand, Workspace, WorkspaceEvent,
+    WorkspaceService,
 };
-use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings};
+use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile};
 use xcord_vt::Terminal;
 
 use crate::logging::TerminalOutputEvent;
@@ -46,13 +47,12 @@ impl Plugin for WorkspacePlugin {
         let sessions = ctx.require::<Sessions>(services::SESSIONS)?;
         let commands = ctx.require::<Commands>(services::COMMANDS)?;
         let ui = ctx.require::<Ui>(services::UI_HOST)?;
-        let settings = sessions.settings();
 
         let state = Rc::new(WorkspaceState::new(
             ctx.clone(),
             runtime.handle(),
             transports.0.clone(),
-            settings,
+            sessions.0.clone(),
         ));
 
         let service: Rc<dyn WorkspaceService> = state.clone();
@@ -192,7 +192,7 @@ pub struct WorkspaceState {
     ctx: Context,
     runtime: RuntimeHandle,
     transports: Rc<TransportRegistry>,
-    settings: Settings,
+    sessions: Rc<dyn SessionService>,
     tabs: RefCell<Vec<TabState>>,
     active: Cell<Option<TerminalId>>,
     next_id: Cell<u64>,
@@ -204,13 +204,13 @@ impl WorkspaceState {
         ctx: Context,
         runtime: RuntimeHandle,
         transports: Rc<TransportRegistry>,
-        settings: Settings,
+        sessions: Rc<dyn SessionService>,
     ) -> Self {
         Self {
             ctx,
             runtime,
             transports,
-            settings,
+            sessions,
             tabs: RefCell::new(Vec::new()),
             active: Cell::new(None),
             next_id: Cell::new(0),
@@ -279,7 +279,8 @@ impl WorkspaceState {
             command: profile.startup_command.clone(),
             connect_timeout: Duration::from_secs(20),
             keepalive: Some(Duration::from_secs(profile.keepalive_secs.max(5))),
-            accept_new_host_keys: self.settings.host_key_policy == HostKeyPolicy::AcceptNew,
+            accept_new_host_keys: self.sessions.settings().host_key_policy
+                == HostKeyPolicy::AcceptNew,
             known_hosts: None,
         })
     }
@@ -296,7 +297,7 @@ impl WorkspaceState {
             .ok_or_else(|| "SSH transport is not loaded.".to_string())?;
 
         let id = self.next_id();
-        let scrollback = self.settings.scrollback.max(100);
+        let scrollback = self.sessions.settings().scrollback.max(100);
         let terminal = Terminal::new(cols as usize, rows as usize, scrollback);
         let title = profile.name.clone();
 

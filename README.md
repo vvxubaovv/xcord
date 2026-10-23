@@ -49,8 +49,8 @@ guide, the threading model, and the session-open sequence.
 - **Terminal**: xterm-256color, truecolor, alt screen, scroll regions, SGR,
   wide characters, combining marks, OSC title/clipboard, bracketed paste,
   application cursor keys, scrollback, selection/copy/paste.
-- **Session manager**: folders/groups, search, edit/delete, import/export,
-  human-readable `config.toml`.
+- **Session manager**: folders/groups, search, edit/delete, a human-readable
+  `config.toml`.
 - **Compose bar + snippets**: send a line without touching the shell prompt;
   one-click snippets.
 - **Command palette**: every plugin can contribute commands; `Ctrl+Shift+P`.
@@ -77,7 +77,7 @@ guide, the threading model, and the session-open sequence.
 
 | Xshell strength | Xcord |
 |---|---|
-| Mature session manager | Groups, tags, search, quick connect, TOML import/export |
+| Mature session manager | Groups, tags, search, quick connect, plain TOML |
 | Great terminal | xterm-256color, truecolor, scrollback, selection |
 | Compose bar and quick commands | Compose bar + plugin-provided snippets |
 | Highlight rules | Regex rules with live reload |
@@ -89,7 +89,7 @@ guide, the threading model, and the session-open sequence.
 | Windows-only | GPUI targets Windows, macOS and Linux |
 | Closed plugin ecosystem | Every feature is a plugin; stable service contracts |
 | Dated, dense UI | Clean dark/light themes and a command palette |
-| Data lock-in / awkward sync | Plain TOML workspace, portable export/import |
+| Data lock-in / awkward sync | Plain TOML workspace, no database |
 | Monolithic features | Capability plugins, dependency graph, hot reload |
 
 ## Build and run
@@ -108,6 +108,10 @@ renderer. For a smaller, faster binary:
 ```bash
 cargo build --release -p xcord
 ```
+
+The repository includes a China-friendly crates.io mirror in
+`.cargo/config.toml`. Delete that file (or edit the source) to use your default
+registry.
 
 ### Configuration
 
@@ -191,4 +195,4 @@ Contributions that add a plugin should only depend on `xcord-cordis` and
 
 ## License
 
-MIT OR Apache-2.0.
+MIT. See [LICENSE-MIT](LICENSE-MIT).

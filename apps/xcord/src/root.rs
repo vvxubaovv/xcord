@@ -6,14 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, Context, Div, Entity, Font, Hsla, KeyDownEvent, Render, Rgba, SharedString,
-    Stateful, Window,
+    div, px, rgb, Context, Div, Entity, Font, Hsla, KeyDownEvent, MouseButton, Render, Rgba,
+    SharedString, Window,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -932,11 +931,10 @@ impl XcordApp {
         label: &'static str,
         cx: &mut Context<Self>,
         handler: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-    ) -> Stateful<Div> {
+    ) -> Div {
         let theme = self.theme();
         let hover_bg = rgbc(theme.panel_alt);
         div()
-            .id(button_id("header"))
             .px_3()
             .py_1()
             .rounded_md()
@@ -944,9 +942,12 @@ impl XcordApp {
             .text_color(rgbc(theme.muted))
             .cursor_pointer()
             .hover(move |style| style.bg(hover_bg))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                handler(this, cx);
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    handler(this, cx);
+                }),
+            )
             .child(label)
     }
 
@@ -1030,7 +1031,8 @@ impl XcordApp {
                             }))
                             .child(self.search.clone()),
                     )
-                    .child(primary_button("New session", theme).on_click(
+                    .child(primary_button("New session", theme).on_mouse_up(
+                        MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
                     )),
             )
@@ -1042,22 +1044,20 @@ impl XcordApp {
                     .border_color(rgbc(theme.border))
                     .flex()
                     .gap_2()
-                    .child(
-                        small_button("Plugins", theme)
-                            .flex_1()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.plugins_panel = true;
-                                this.refresh_plugins();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        small_button("Settings", theme)
-                            .flex_1()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.open_settings(cx);
-                            })),
-                    ),
+                    .child(small_button("Plugins", theme).flex_1().on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.plugins_panel = true;
+                            this.refresh_plugins();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(small_button("Settings", theme).flex_1().on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.open_settings(cx);
+                        }),
+                    )),
             )
     }
 
@@ -1106,9 +1106,12 @@ impl XcordApp {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover_bg))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.connect_profile(id.clone(), window, cx);
-                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.connect_profile(id.clone(), window, cx);
+                        }),
+                    )
                     .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(status_color))
                     .child(
                         div()
@@ -1144,9 +1147,12 @@ impl XcordApp {
                     .text_color(rgbc(theme.muted))
                     .cursor_pointer()
                     .hover(move |style| style.text_color(rgbc(theme.accent)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_session_dialog(Some(edit_id.clone()), cx);
-                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_session_dialog(Some(edit_id.clone()), cx);
+                        }),
+                    )
                     .child("edit"),
             )
     }
@@ -1191,13 +1197,16 @@ impl XcordApp {
                     })
                     .cursor_pointer()
                     .hover(|style| style.bg(rgbc(theme.panel_alt)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.workspace.select(tab_id);
-                        this.pending_focus = Some(PendingFocus::Terminal);
-                        let _ = window;
-                        this.sync(cx);
-                        cx.notify();
-                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.workspace.select(tab_id);
+                            this.pending_focus = Some(PendingFocus::Terminal);
+                            let _ = window;
+                            this.sync(cx);
+                            cx.notify();
+                        }),
+                    )
                     .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(dot))
                     .child(
                         div()
@@ -1221,11 +1230,14 @@ impl XcordApp {
                             .text_color(rgbc(theme.muted))
                             .cursor_pointer()
                             .hover(|style| style.text_color(rgbc(theme.danger)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.workspace.close(tab_id);
-                                this.sync(cx);
-                                cx.notify();
-                            }))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.workspace.close(tab_id);
+                                    this.sync(cx);
+                                    cx.notify();
+                                }),
+                            )
                             .child("×"),
                     ),
             );
@@ -1250,7 +1262,10 @@ impl XcordApp {
                     .text_color(rgbc(theme.muted))
                     .cursor_pointer()
                     .hover(|style| style.text_color(rgbc(theme.accent)))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
+                    )
                     .child("+"),
             )
     }
@@ -1274,9 +1289,12 @@ impl XcordApp {
                     .text_color(rgbc(theme.muted))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgbc(theme.panel_alt)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.send_snippet(&command, enter, cx);
-                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.send_snippet(&command, enter, cx);
+                        }),
+                    )
                     .child(snippet.name.clone()),
             );
         }
@@ -1306,10 +1324,10 @@ impl XcordApp {
                     .rounded_md()
                     .child(self.compose.clone()),
             )
-            .child(
-                primary_button("Send", theme)
-                    .on_click(cx.listener(|this, _, window, cx| this.send_compose(window, cx))),
-            )
+            .child(primary_button("Send", theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.send_compose(window, cx)),
+            ))
             .child(chips)
     }
 
@@ -1408,9 +1426,12 @@ impl XcordApp {
                     .border_color(rgbc(theme.border))
                     .cursor_pointer()
                     .hover(|style| style.border_color(rgbc(theme.accent)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.connect_profile(id.clone(), window, cx);
-                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.connect_profile(id.clone(), window, cx);
+                        }),
+                    )
                     .child(
                         div()
                             .flex()
@@ -1463,24 +1484,22 @@ impl XcordApp {
                 div()
                     .flex()
                     .gap_3()
-                    .child(
-                        primary_button("New session", theme).on_click(
-                            cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
-                        ),
-                    )
-                    .child(
-                        secondary_button("Command palette", theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.open_palette(cx))),
-                    )
-                    .child(
-                        secondary_button("Manage plugins", theme).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.plugins_panel = true;
-                                this.refresh_plugins();
-                                cx.notify();
-                            },
-                        )),
-                    ),
+                    .child(primary_button("New session", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
+                    ))
+                    .child(secondary_button("Command palette", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.open_palette(cx)),
+                    ))
+                    .child(secondary_button("Manage plugins", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.plugins_panel = true;
+                            this.refresh_plugins();
+                            cx.notify();
+                        }),
+                    )),
             )
             .child(
                 div()
@@ -1570,7 +1589,10 @@ impl XcordApp {
                             .text_color(rgbc(theme.muted))
                             .cursor_pointer()
                             .hover(|style| style.text_color(rgbc(theme.danger)))
-                            .on_click(cx.listener(|this, _, _, cx| this.close_session_dialog(cx)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.close_session_dialog(cx)),
+                            )
                             .child("×"),
                     ),
             )
@@ -1600,7 +1622,8 @@ impl XcordApp {
                     .flex()
                     .gap_2()
                     .child(
-                        auth_chip("Password", auth == AuthMode::Password, theme).on_click(
+                        auth_chip("Password", auth == AuthMode::Password, theme).on_mouse_up(
+                            MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.session_form {
                                     form.auth = AuthMode::Password;
@@ -1610,7 +1633,8 @@ impl XcordApp {
                         ),
                     )
                     .child(
-                        auth_chip("Private key", auth == AuthMode::PublicKey, theme).on_click(
+                        auth_chip("Private key", auth == AuthMode::PublicKey, theme).on_mouse_up(
+                            MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.session_form {
                                     form.auth = AuthMode::PublicKey;
@@ -1648,23 +1672,25 @@ impl XcordApp {
                             save_secret,
                             theme,
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(form) = &mut this.session_form {
-                                form.save_secret = !form.save_secret;
-                            }
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        checkbox("Log this session", logging, theme).on_click(cx.listener(
-                            |this, _, _, cx| {
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.session_form {
-                                    form.logging = !form.logging;
+                                    form.save_secret = !form.save_secret;
                                 }
                                 cx.notify();
-                            },
-                        )),
-                    ),
+                            }),
+                        ),
+                    )
+                    .child(checkbox("Log this session", logging, theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(form) = &mut this.session_form {
+                                form.logging = !form.logging;
+                            }
+                            cx.notify();
+                        }),
+                    )),
             )
             .child(
                 div()
@@ -1687,10 +1713,12 @@ impl XcordApp {
                         div()
                             .flex()
                             .gap_2()
-                            .child(secondary_button("Cancel", theme).on_click(
+                            .child(secondary_button("Cancel", theme).on_mouse_up(
+                                MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.close_session_dialog(cx)),
                             ))
-                            .child(primary_button("Save & connect", theme).on_click(
+                            .child(primary_button("Save & connect", theme).on_mouse_up(
+                                MouseButton::Left,
                                 cx.listener(|this, _, window, cx| this.submit_session(window, cx)),
                             )),
                     ),
@@ -1773,7 +1801,10 @@ impl XcordApp {
                     )
                     .child(if is_highlighter {
                         secondary_button("Reload", theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.reload_highlighter(cx)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.reload_highlighter(cx)),
+                            )
                             .into_any_element()
                     } else {
                         div()
@@ -1858,7 +1889,7 @@ impl XcordApp {
                                     .text_color(rgbc(theme.muted))
                                     .cursor_pointer()
                                     .hover(|style| style.text_color(rgbc(theme.danger)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                         this.plugins_panel = false;
                                         cx.notify();
                                     }))
@@ -1891,7 +1922,7 @@ impl XcordApp {
                             .child("Highlighter reload is live. Core plugins restart with the app."),
                     )
                     .child(
-                        secondary_button("Reinitialize highlighter", theme).on_click(
+                        secondary_button("Reinitialize highlighter", theme).on_mouse_up(MouseButton::Left, 
                             cx.listener(|this, _, _, cx| this.reload_highlighter(cx)),
                         ),
                     ),
@@ -1922,12 +1953,15 @@ impl XcordApp {
                         rgbc(theme.border)
                     })
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(form) = &mut this.settings_form {
-                            form.theme_id = id.clone();
-                        }
-                        cx.notify();
-                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if let Some(form) = &mut this.settings_form {
+                                form.theme_id = id.clone();
+                            }
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         div()
                             .text_size(px(10.5))
@@ -1974,10 +2008,13 @@ impl XcordApp {
                             .text_color(rgbc(theme.muted))
                             .cursor_pointer()
                             .hover(|style| style.text_color(rgbc(theme.danger)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.settings_form = None;
-                                cx.notify();
-                            }))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.settings_form = None;
+                                    cx.notify();
+                                }),
+                            )
                             .child("×"),
                     ),
             )
@@ -2004,14 +2041,15 @@ impl XcordApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(small_button("−", theme).on_click(cx.listener(
-                                |this, _, _, cx| {
+                            .child(small_button("−", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
                                     if let Some(form) = &mut this.settings_form {
                                         form.font_size = (form.font_size - 1.0).clamp(9.0, 28.0);
                                     }
                                     cx.notify();
-                                },
-                            )))
+                                }),
+                            ))
                             .child(
                                 div()
                                     .w(px(44.))
@@ -2019,14 +2057,15 @@ impl XcordApp {
                                     .text_color(rgbc(theme.foreground))
                                     .child(format!("{:.0}", form.font_size)),
                             )
-                            .child(small_button("+", theme).on_click(cx.listener(
-                                |this, _, _, cx| {
+                            .child(small_button("+", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
                                     if let Some(form) = &mut this.settings_form {
                                         form.font_size = (form.font_size + 1.0).clamp(9.0, 28.0);
                                     }
                                     cx.notify();
-                                },
-                            ))),
+                                }),
+                            )),
                     ),
             )
             .child(
@@ -2034,7 +2073,8 @@ impl XcordApp {
                     .flex()
                     .gap_4()
                     .child(
-                        checkbox("Copy on select", form.copy_on_select, theme).on_click(
+                        checkbox("Copy on select", form.copy_on_select, theme).on_mouse_up(
+                            MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.settings_form {
                                     form.copy_on_select = !form.copy_on_select;
@@ -2044,17 +2084,19 @@ impl XcordApp {
                         ),
                     )
                     .child(
-                        checkbox("Compose bar", form.compose_bar, theme).on_click(cx.listener(
-                            |this, _, _, cx| {
+                        checkbox("Compose bar", form.compose_bar, theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.settings_form {
                                     form.compose_bar = !form.compose_bar;
                                 }
                                 cx.notify();
-                            },
-                        )),
+                            }),
+                        ),
                     )
                     .child(
-                        checkbox("Strict host keys", form.strict_host_keys, theme).on_click(
+                        checkbox("Strict host keys", form.strict_host_keys, theme).on_mouse_up(
+                            MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.settings_form {
                                     form.strict_host_keys = !form.strict_host_keys;
@@ -2069,17 +2111,19 @@ impl XcordApp {
                     .flex()
                     .gap_4()
                     .child(
-                        checkbox("Session logging", form.logging, theme).on_click(cx.listener(
-                            |this, _, _, cx| {
+                        checkbox("Session logging", form.logging, theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.settings_form {
                                     form.logging = !form.logging;
                                 }
                                 cx.notify();
-                            },
-                        )),
+                            }),
+                        ),
                     )
                     .child(
-                        checkbox("Output highlighting", form.highlight, theme).on_click(
+                        checkbox("Output highlighting", form.highlight, theme).on_mouse_up(
+                            MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.settings_form {
                                     form.highlight = !form.highlight;
@@ -2106,16 +2150,17 @@ impl XcordApp {
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(secondary_button("Cancel", theme).on_click(cx.listener(
-                        |this, _, _, cx| {
+                    .child(secondary_button("Cancel", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
                             this.settings_form = None;
                             cx.notify();
-                        },
-                    )))
-                    .child(
-                        primary_button("Save", theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
-                    ),
+                        }),
+                    ))
+                    .child(primary_button("Save", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.save_settings(cx)),
+                    )),
             )
     }
 
@@ -2153,12 +2198,15 @@ impl XcordApp {
                     })
                     .cursor_pointer()
                     .hover(|style| style.bg(rgba(theme.accent, 0.1)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.palette = None;
-                        this.commands.run(id, &this.ctx);
-                        this.sync(cx);
-                        cx.notify();
-                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.palette = None;
+                            this.commands.run(id, &this.ctx);
+                            this.sync(cx);
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         div()
                             .flex()
@@ -2275,10 +2323,13 @@ impl XcordApp {
             .id("notice-card")
             .shadow_lg()
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.notice = None;
-                cx.notify();
-            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.notice = None;
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .text_size(px(11.5))
@@ -2422,11 +2473,10 @@ fn input_colors(theme: &Theme) -> (Hsla, Hsla, Hsla, Hsla) {
     )
 }
 
-fn primary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+fn primary_button(label: &'static str, theme: &Theme) -> Div {
     let bg = rgbc(theme.accent);
     let fg = rgbc(theme.background);
     div()
-        .id(button_id("primary"))
         .h(px(32.))
         .px_3()
         .flex()
@@ -2442,9 +2492,8 @@ fn primary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
         .child(label)
 }
 
-fn secondary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+fn secondary_button(label: &'static str, theme: &Theme) -> Div {
     div()
-        .id(button_id("secondary"))
         .h(px(32.))
         .px_3()
         .flex()
@@ -2461,9 +2510,8 @@ fn secondary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
         .child(label)
 }
 
-fn small_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+fn small_button(label: &'static str, theme: &Theme) -> Div {
     div()
-        .id(button_id("small"))
         .h(px(28.))
         .px_2()
         .flex()
@@ -2480,9 +2528,8 @@ fn small_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
         .child(label)
 }
 
-fn checkbox(label: &'static str, checked: bool, theme: &Theme) -> Stateful<Div> {
+fn checkbox(label: &'static str, checked: bool, theme: &Theme) -> Div {
     div()
-        .id(button_id("check"))
         .flex()
         .items_center()
         .gap_2()
@@ -2518,11 +2565,6 @@ fn checkbox(label: &'static str, checked: bool, theme: &Theme) -> Stateful<Div> 
         )
 }
 
-fn button_id(prefix: &str) -> SharedString {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    SharedString::from(format!("{prefix}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
-}
-
 fn field(label: &'static str, input: Entity<TextInput>, theme: &Theme) -> Div {
     div()
         .flex()
@@ -2545,9 +2587,8 @@ fn field(label: &'static str, input: Entity<TextInput>, theme: &Theme) -> Div {
         )
 }
 
-fn auth_chip(label: &'static str, selected: bool, theme: &Theme) -> Stateful<Div> {
+fn auth_chip(label: &'static str, selected: bool, theme: &Theme) -> Div {
     div()
-        .id(button_id("auth"))
         .h(px(28.))
         .px_3()
         .flex()

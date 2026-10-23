@@ -41,9 +41,7 @@ impl Plugin for LoggingPlugin {
     fn apply(&self, ctx: Context, _config: serde_json::Value) -> Result<()> {
         let sessions = ctx.require::<Sessions>(services::SESSIONS)?;
         let settings = sessions.settings();
-        if !settings.logging {
-            return Ok(());
-        }
+        let log_all = settings.logging;
 
         let root = if settings.log_dir.trim().is_empty() {
             config_dir().join("logs")
@@ -62,7 +60,7 @@ impl Plugin for LoggingPlugin {
         let root_for_event = root.clone();
 
         ctx.on(move |event: &TerminalOutputEvent, _ctx| {
-            if !event.logging {
+            if !event.logging && !log_all {
                 return;
             }
             let mut writers = writers_for_event.borrow_mut();
