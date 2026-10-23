@@ -36,6 +36,11 @@ pub trait SessionService {
     fn store_passphrase(&self, profile: &SessionProfile, passphrase: &str) -> Result<(), String>;
     fn clear_passphrase(&self, profile: &SessionProfile) -> Result<(), String>;
 
+    /// API key used by the AI copilot, stored in the platform vault.
+    fn ai_api_key(&self) -> Option<String>;
+    fn store_ai_api_key(&self, key: &str) -> Result<(), String>;
+    fn clear_ai_api_key(&self) -> Result<(), String>;
+
     fn export(&self, path: &str) -> Result<(), String>;
     fn import(&self, path: &str) -> Result<(), String>;
 }

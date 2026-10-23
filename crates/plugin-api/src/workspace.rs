@@ -128,6 +128,9 @@ pub trait WorkspaceService {
         end: (usize, usize),
     ) -> String;
 
+    /// Recent terminal output (scrollback + screen) for AI/MCP consumers.
+    fn terminal_text(&self, id: TerminalId, max_lines: usize) -> Option<String>;
+
     fn subscribe(&self) -> broadcast::Receiver<WorkspaceEvent>;
 }
 

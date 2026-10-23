@@ -769,6 +769,18 @@ impl WorkspaceService for WorkspaceState {
         }
     }
 
+    fn terminal_text(&self, id: TerminalId, max_lines: usize) -> Option<String> {
+        let tabs = self.tabs.borrow();
+        let tab = tabs.iter().find(|tab| tab.id == id)?;
+        let max_lines = max_lines.clamp(20, 4000);
+        let scrollback = tab.terminal.scrollback_text(max_lines);
+        let screen = tab.terminal.screen_text();
+        let combined = format!("{scrollback}{screen}");
+        let lines: Vec<&str> = combined.lines().collect();
+        let start = lines.len().saturating_sub(max_lines);
+        Some(lines[start..].join("\n"))
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<WorkspaceEvent> {
         self.events.subscribe()
     }

@@ -1,0 +1,7 @@
+[package]
+name = "xcord-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xcord-store = { path = "../../crates/store" }

@@ -205,6 +205,22 @@ impl SessionService for SessionManager {
             .map_err(|error| error.to_string())
     }
 
+    fn ai_api_key(&self) -> Option<String> {
+        self.vault.get("ai:api_key").ok().flatten()
+    }
+
+    fn store_ai_api_key(&self, key: &str) -> std::result::Result<(), String> {
+        self.vault
+            .set("ai:api_key", key)
+            .map_err(|error| error.to_string())
+    }
+
+    fn clear_ai_api_key(&self) -> std::result::Result<(), String> {
+        self.vault
+            .delete("ai:api_key")
+            .map_err(|error| error.to_string())
+    }
+
     fn export(&self, path: &str) -> std::result::Result<(), String> {
         self.store
             .export_to(&PathBuf::from(path))

@@ -124,6 +124,8 @@ bridges them explicitly.
 ┌──────────────────────────── Tokio workers (russh, files) ────────────────────────────────┐
 │  SshProvider → SshTransport task (read/write/resize) → async_channel<TransportEvent>      │
 │  forwarder task → PostOffice.post(|ctx| ctx.service::<Rc<WorkspaceState>>()...)           │
+│  AI stream task → PostOffice(Delta/Tool/Finish) ────────────────────────────────────────► │
+│  MCP HTTP thread → PostOffice(tool call + oneshot) ◄──────────────────────────────────── ┘
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -167,6 +169,12 @@ Notable contracts:
 - `CommandRegistry` — command handlers receive `&Context`; registration effects
   remove them on unload.
 - `HighlightService` — byte spans with colors, queried by the renderer per row.
+- `McpToolRegistry` / `McpResourceRegistry` — names, JSON schemas, read-only
+  hints and UI-thread handlers; the shared capability surface for external MCP
+  clients and the copilot.
+- `McpStatus` — endpoint/token/tool count exposed to the shell.
+- `AiAssistant` — snapshot/send/clear facade; the concrete streaming/tool loop
+  stays in the `ai` plugin.
 
 ## 5. Session-open sequence
 
@@ -221,7 +229,92 @@ Rendering in `terminal_view.rs`:
 rows, so only the first glyph was visible. Xcord shapes without `force_width`
 and clips via the canvas. Keep this in mind if you refactor the renderer.
 
-## 7. Writing a plugin
+## 7. MCP and the AI copilot
+
+Xcord treats "AI capability" as a protocol, not a vendor SDK. The `mcp` plugin
+owns a capability registry and a localhost JSON-RPC endpoint; the `ai` plugin is
+just one more client of that registry.
+
+### 7.1 Capability registry
+
+`plugin-api::mcp` defines `ToolSpec` (name, description, JSON Schema,
+`read_only`) and `ResourceSpec`. Plugins register handlers on the UI thread:
+
+```rust
+tools.register(
+    ToolSpec {
+        name: "terminal_send".into(),
+        input_schema: json!({"type":"object", "properties": {"tab_id": {"type":"integer"}}}),
+        read_only: false,
+        ..
+    },
+    |_ctx, args| { /* mutate the workspace */ Ok(json!({"ok": true})) },
+);
+```
+
+Handlers are `Fn(&Context, Value)`, so they can call any service. The registry
+is intentionally not `Send`: all state lives on the UI thread. Two bridges make
+it reachable from the outside:
+
+```
+HTTP thread (tiny_http) ── Job{req, oneshot} ──► GPUI job pump
+        ▲                                          │
+        └──────────── oneshot response ────────────┘
+stdio bridge (xcord-mcp) ── POST /mcp ──► HTTP thread
+```
+
+The MCP plugin registers 12 tools and 3 readable resources plus a
+`xcord://terminal/{id}` template. `tools/call` results are returned as MCP text
+content; tool failures are `isError: true` results rather than transport errors,
+so a model can recover.
+
+Transport details:
+
+- `POST /mcp` accepts JSON-RPC 2.0 and returns a single JSON response (a valid
+  Streamable HTTP subset). Notifications get `202`.
+- `GET /health` is unauthenticated; everything else requires
+  `Authorization: Bearer <mcp_token>`.
+- The server binds only `127.0.0.1`. The token is generated on first launch,
+  persisted in settings, and mirrored to `<config>/mcp-token` for the bridge.
+- `apps/xcord-mcp` reads that file, forwards newline-delimited JSON-RPC over a
+  small HTTP/1.1 client, and prints responses. It intentionally supports plain
+  HTTP only because the endpoint is loopback.
+
+### 7.2 Copilot loop
+
+`AiService` keeps an OpenAI-format message history and a display-oriented
+snapshot. `send` captures the system prompt, the active terminal excerpt (if
+enabled), the tool list, and the "allow writes" policy, then spawns a Tokio
+task.
+
+```
+POST /chat/completions (stream)
+  └─ SSE deltas ──► Job(Delta) ──► copilot UI
+  └─ tool_calls? ──► for each call:
+        read_only || allow_writes ? call MCP via Job + oneshot : return policy error
+        append role=tool message
+        POST again (max 6 rounds)
+  └─ no tool calls ──► Job(Finish(history))
+```
+
+Key properties:
+
+- The network task never touches `Rc` state; every UI update is a `Job` closure
+  that looks up `Rc<AiService>` by service name.
+- Tool execution reuses the MCP registry, so a tool added by any plugin is
+  instantly available to the model.
+- Mutating tools return a descriptive policy error unless the user enables
+  **Writes allowed**; the default is read-only.
+- Terminal context is truncated on char boundaries and can be disabled per user.
+- API keys come from the platform vault or `XCORD_AI_API_KEY` /
+  `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`.
+- Providers are plain OpenAI-compatible endpoints (OpenAI, DeepSeek, Ollama,
+  vLLM, ...). Non-SSE JSON responses are accepted as a fallback.
+
+The shell's AI panel is only a renderer: it reads `AiSnapshot`, sends prompts,
+and toggles settings. The MCP/AI service state is not duplicated in the shell.
+
+## 8. Writing a plugin
 
 A plugin crate only needs `xcord-cordis` and `xcord-plugin-api`.
 
@@ -270,18 +363,23 @@ Register it in `xcord_builtins::install` (or from your own binary) with
 the same service name from your plugin. To extend the shell, contribute a
 `Command` or send a new `UiCommand`; no GPUI dependency is required.
 
-## 8. Testing strategy
+## 9. Testing strategy
 
 - **Kernel:** deterministic single-threaded tests for ordering, cascade unload,
   effects, failures, events and reload.
 - **Terminal:** feed byte streams and assert snapshots; no window needed.
 - **Store:** temp-directory round-trips and corruption handling.
-- **Plugins:** highlighter unit tests; the I/O bridge is exercised manually with
-  a real SSH server and by the `xcord-ssh` probe.
+- **Plugins:** highlighter unit tests, MCP registry dispatch/permission tests,
+  OpenAI response/tool parsing and UTF-8 truncation tests; the I/O bridge is
+  exercised manually with a real SSH server and by the `xcord-ssh` probe.
+- **MCP:** verified end-to-end with HTTP `initialize`, `tools/list`,
+  `tools/call`, `resources/read`, and the stdio bridge.
+- **AI:** verified with a local mock OpenAI-compatible SSE provider that emits a
+  `list_tabs` tool call followed by a final answer.
 - **UI:** verified with live sessions and `PrintWindow` captures. A future step
   is GPUI's test context for pixel/behavior tests.
 
-## 9. Trade-offs and future work
+## 10. Trade-offs and future work
 
 - The kernel is single-threaded by design. A multi-window shell would need one
   kernel per UI thread, or a `Send` variant.
@@ -294,3 +392,8 @@ the same service name from your plugin. To extend the shell, contribute a
 - Hot reload is exposed for the highlighter. Reloading core plugins is supported
   by the kernel but would close active sessions, so the UI intentionally limits
   it.
+- MCP uses a JSON-response subset of Streamable HTTP rather than SSE; the stdio
+  bridge is the tested external path. Per-call approval and streamed MCP
+  notifications are natural next steps.
+- The copilot history is intentionally in-memory. Persisting it would need a
+  redaction policy for terminal excerpts and tool results.

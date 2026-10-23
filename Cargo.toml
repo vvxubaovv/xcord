@@ -8,6 +8,7 @@ members = [
     "crates/store",
     "crates/plugins",
     "apps/xcord",
+    "apps/xcord-mcp",
 ]
 
 [workspace.package]

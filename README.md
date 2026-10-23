@@ -5,14 +5,20 @@
 Xcord takes the parts of Xshell that make daily SSH work pleasant (session
 management, a real terminal, compose bar, snippets, highlight rules, logging,
 keychain-backed credentials) and rebuilds them on an architecture where every
-feature is a plugin. The result is a fast native client that is not locked to
-one vendor, one OS, or one UI.
+feature is a plugin. An MCP server exposes the live workspace to AI clients, and
+a built-in copilot can inspect terminals and run approved tools.
 
 ![Xcord connected to a real SSH session](docs/terminal.png)
 
 > The screenshot above is a live SSH-2 session to `test.rebex.net`, rendered by
 > the custom GPUI terminal canvas. Host keys are verified with trust-on-first-use
 > and stored in OpenSSH's `known_hosts`.
+
+![Xcord AI copilot calling an MCP tool](docs/ai.png)
+
+> The copilot streams answers from any OpenAI-compatible endpoint and calls the
+> same MCP tools that external clients see. The screenshot uses a local mock
+> provider in a repository test; no API key is required to run Xcord.
 
 ## Why "everything is a plugin"
 
@@ -32,6 +38,8 @@ thin — it renders services and forwards user intent.
 | `highlights` | `highlights` plugin | Regex coloring of output |
 | `commands` | `commands` plugin | Command-palette contributions |
 | `logging` | `logging` plugin | Per-session log files |
+| `mcp-tools` / `mcp-resources` | `mcp` plugin | Capability registry exposed over MCP |
+| `ai` | `ai` plugin | Streaming copilot + tool-calling loop |
 | `ui-host` | **the shell** | Semantic commands from plugins to GPUI |
 
 Plugins declare `inject = ["runtime", "transports"]`; the kernel starts them when
@@ -60,6 +68,12 @@ guide, the threading model, and the session-open sequence.
 - **Themes**: Xcord Dark, Midnight Blue, Paper Light.
 - **Plugin manager**: live plugin states, diagnostics, and hot reload of the
   highlighter.
+- **MCP server**: 12 tools and 3 resources (plus a terminal template) over
+  localhost JSON-RPC, with a stdio bridge for Claude Desktop, Cursor, and other
+  MCP clients.
+- **AI copilot**: streaming chat, terminal context, and tool calling through the
+  MCP registry. It works with OpenAI, DeepSeek, Ollama/vLLM, and any compatible
+  endpoint. Terminal writes are blocked unless explicitly enabled.
 
 ### Keyboard shortcuts
 
@@ -69,6 +83,7 @@ guide, the threading model, and the session-open sequence.
 | `Ctrl+Shift+W` | Close active tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+Shift+P` | Command palette |
+| `Ctrl+Shift+I` | Toggle AI copilot |
 | `Ctrl+Shift+E` | Focus compose bar |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection / paste |
 | `Enter` in compose | Send line |
@@ -83,6 +98,7 @@ guide, the threading model, and the session-open sequence.
 | Highlight rules | Regex rules with live reload |
 | Session logging | Opt-in per-session logs |
 | Credential management | Windows Credential Manager; portable 0600 fallback elsewhere |
+| Built-in AI / extensibility | MCP server + copilot, every capability is a tool |
 
 | Xshell weakness | Xcord |
 |---|---|
@@ -103,10 +119,11 @@ cargo run -p xcord
 ```
 
 The debug build takes a few minutes the first time because GPUI compiles its
-renderer. For a smaller, faster binary:
+renderer. For a smaller, faster binary (the MCP bridge is a separate binary in the same
+target directory):
 
 ```bash
-cargo build --release -p xcord
+cargo build --release -p xcord -p xcord-mcp
 ```
 
 The repository includes a China-friendly crates.io mirror in
@@ -127,7 +144,59 @@ keychain backend is enabled. `known_hosts` uses the standard OpenSSH file
 (`~/.ssh/known_hosts`).
 
 For automation, `XCORD_AUTOCONNECT=<session-id>` connects to a stored session on
-launch. It is useful for smoke tests and demos.
+launch, and `XCORD_AI_PROMPT="..."` sends a copilot prompt on startup.
+
+### MCP server and AI copilot
+
+Xcord is also a local MCP capability server. Open **AI → Settings** to see the
+endpoint, bridge path, and a ready-to-paste Claude Desktop / Cursor config:
+
+```json
+{
+  "mcpServers": {
+    "xcord": {
+      "command": "C:\\path\\to\\xcord-mcp.exe"
+    }
+  }
+}
+```
+
+![AI and MCP settings](docs/ai-settings.png)
+
+The stdio bridge (`apps/xcord-mcp`) forwards newline-delimited JSON-RPC to
+`http://127.0.0.1:8765/mcp` using a per-install bearer token stored in
+`%APPDATA%\xcord\mcp-token`. Only localhost is bound.
+
+| MCP tool | Read-only | Purpose |
+|---|---|---|
+| `list_sessions` | yes | Saved profiles, auth type, whether secrets exist |
+| `list_tabs` | yes | Open tabs, status, dimensions, host key |
+| `terminal_read` | yes | Scrollback + screen text for a tab |
+| `terminal_send` | no | Write input / Enter to a tab |
+| `open_session` | no | Open a saved profile with vault credentials |
+| `close_tab` | no | Close a tab |
+| `select_tab` | yes | Activate a tab |
+| `list_plugins` | yes | Plugin graph and states |
+| `plugin_diagnostics` | yes | Recent kernel diagnostics |
+| `list_commands` | yes | Command-palette entries |
+| `run_command` | no | Execute a command by id |
+| `get_settings` | yes | Sanitized settings (token removed) |
+
+Resources: `xcord://sessions`, `xcord://tabs`, `xcord://plugins`, plus the
+`xcord://terminal/{id}` template. The copilot calls this exact registry, so
+external clients and the in-app assistant have identical capabilities.
+
+To use the copilot, open **AI → Settings**, choose a preset (DeepSeek, OpenAI,
+Ollama) or enter any OpenAI-compatible base URL, and store an API key in the
+platform vault. The key can also come from `XCORD_AI_API_KEY`,
+`DEEPSEEK_API_KEY`, or `OPENAI_API_KEY`.
+
+- **Terminal context** sends the active tab's recent output to the model. Disable
+  it for sensitive hosts.
+- **Writes blocked** is the default. Enable it only when you want the model to
+  call `terminal_send`, `open_session`, `close_tab`, or `run_command`.
+- Streaming, tool calls, tool results, and errors appear inline. `Ctrl+Shift+I`
+  toggles the panel.
 
 ### Tests
 
@@ -140,7 +209,10 @@ cargo test --workspace
 - `xcord-vt`: text, wrapping, SGR/truecolor, wide chars, scrolling, alt screen,
   resize, OSC, selection, scroll regions.
 - `xcord-store`: TOML round-trip, corruption backup, settings.
-- `xcord-builtins`: highlighter matching/priority.
+- `xcord-builtins`: highlighter matching/priority, OpenAI response/tool parsing,
+  UTF-8-safe truncation.
+- `xcord-plugin-api`: MCP tool/resource registry registration, dispatch and
+  permissions.
 
 There is also an end-to-end SSH probe that speaks to a public test server:
 
@@ -157,11 +229,14 @@ crates/
   ssh/          russh transport, known_hosts, async session task
   store/        TOML workspace + platform secret vault
   plugin-api/   service contracts shared by plugins and shells
-  plugins/      first-party plugins (runtime, ssh, sessions, workspace, ...)
+  plugins/      first-party plugins (runtime, ssh, sessions, workspace, mcp, ai, ...)
 apps/
-  xcord/        GPUI shell: sidebar, tabs, terminal canvas, dialogs, palette
+  xcord/        GPUI shell: sidebar, tabs, terminal canvas, AI panel, dialogs
+  xcord-mcp/    stdio ↔ localhost MCP bridge
 docs/
   terminal.png
+  ai.png
+  ai-settings.png
 ```
 
 ## Security notes
@@ -175,6 +250,12 @@ docs/
 - OSC 52 clipboard writes are supported; all other escape sequences are parsed
   locally and never executed.
 - Session logs are plain text. Treat them as sensitive.
+- The MCP endpoint binds to `127.0.0.1` and requires a bearer token. Any local
+  process that can read `mcp-token` can drive terminals when the app is running;
+  protect the config directory.
+- The copilot sends terminal output to the configured provider when **Terminal
+  context** is enabled. Tool-driven writes are blocked by default and require an
+  explicit toggle.
 
 ## Known limitations / roadmap
 
@@ -187,6 +268,7 @@ increments are:
 - IME composition in the terminal view (text inputs already use
   `EntityInputHandler`; the terminal currently uses raw key events)
 - Search in scrollback, reflow on resize, sixel/kitty graphics
+- Per-call AI tool approval, persisted conversations, MCP streamable HTTP/SSE
 - Xshell `.xsh`/PuTTY import, encrypted workspace sync
 - Packaging and code signing
 

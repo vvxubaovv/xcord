@@ -19,8 +19,10 @@
 //!
 //! [`Context`]: xcord_cordis::Context
 
+pub mod ai;
 pub mod commands;
 pub mod highlight;
+pub mod mcp;
 pub mod runtime;
 pub mod session;
 pub mod theme;
@@ -28,8 +30,13 @@ pub mod transport;
 pub mod ui;
 pub mod workspace;
 
+pub use ai::{Ai, AiAssistant, AiMessageView, AiSnapshot};
 pub use commands::{Command, CommandRegistry, Commands};
 pub use highlight::{HighlightService, HighlightSpan, Highlights};
+pub use mcp::{
+    McpResourceRegistry, McpResources, McpServerStatus, McpStatus, McpToolRegistry, McpTools,
+    ResourceContent, ResourceSpec, ToolSpec,
+};
 pub use runtime::{Job, PostOffice, Runtime, RuntimeHandle, RuntimeService};
 pub use session::{SessionService, Sessions};
 pub use theme::{Theme, ThemeService, Themes};
@@ -53,4 +60,8 @@ pub mod services {
     pub const THEMES: &str = "themes";
     pub const HIGHLIGHTS: &str = "highlights";
     pub const UI_HOST: &str = "ui-host";
+    pub const MCP_TOOLS: &str = "mcp-tools";
+    pub const MCP_RESOURCES: &str = "mcp-resources";
+    pub const MCP_STATUS: &str = "mcp-status";
+    pub const AI: &str = "ai";
 }

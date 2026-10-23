@@ -219,6 +219,19 @@ pub struct Settings {
     pub bell: bool,
     pub highlight: bool,
     pub last_session: Option<String>,
+
+    // MCP server (localhost, JSON-RPC over HTTP)
+    pub mcp_enabled: bool,
+    pub mcp_port: u16,
+    /// Generated on first launch. Empty means "generate and persist".
+    pub mcp_token: String,
+
+    // AI copilot (OpenAI-compatible chat completions)
+    pub ai_base_url: String,
+    pub ai_model: String,
+    pub ai_allow_writes: bool,
+    pub ai_include_terminal: bool,
+    pub ai_system_prompt: String,
 }
 
 impl Default for Settings {
@@ -241,8 +254,24 @@ impl Default for Settings {
             bell: true,
             highlight: true,
             last_session: None,
+            mcp_enabled: true,
+            mcp_port: 8765,
+            mcp_token: String::new(),
+            ai_base_url: "https://api.deepseek.com/v1".into(),
+            ai_model: "deepseek-chat".into(),
+            ai_allow_writes: false,
+            ai_include_terminal: true,
+            ai_system_prompt: default_ai_system_prompt(),
         }
     }
+}
+
+fn default_ai_system_prompt() -> String {
+    "You are Xcord Copilot, an SSH operations assistant embedded in a terminal workspace. \
+     Use the provided MCP tools to inspect sessions, tabs, terminal output and plugins before \
+     making claims. Prefer read-only tools. Never run destructive commands unless the user \
+     explicitly asks for them. Keep answers concise; put shell commands in fenced code blocks."
+        .into()
 }
 
 fn default_font() -> String {

@@ -8,9 +8,11 @@
 //! plugins pending until their injected services appear, so registration order
 //! is a declaration of intent rather than a hard requirement.
 
+mod ai;
 mod commands_plugin;
 mod highlights;
 mod logging;
+mod mcp;
 mod runtime_plugin;
 mod sessions;
 mod ssh_transport;
@@ -39,4 +41,6 @@ pub fn install(ctx: &Context) {
     ctx.plugin(workspace::WorkspacePlugin);
     ctx.plugin(highlights::HighlightsPlugin);
     ctx.plugin(logging::LoggingPlugin);
+    ctx.plugin(mcp::McpPlugin);
+    ctx.plugin(ai::AiPlugin);
 }

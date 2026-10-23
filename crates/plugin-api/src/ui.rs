@@ -17,6 +17,8 @@ pub enum UiCommand {
     SelectPrevTab,
     CopySelection,
     Paste,
+    ToggleAi,
+    OpenAiSettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

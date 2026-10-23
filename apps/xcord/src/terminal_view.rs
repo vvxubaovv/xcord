@@ -206,6 +206,11 @@ impl TerminalView {
                     cx.stop_propagation();
                     return;
                 }
+                "i" => {
+                    self.ui.send(UiCommand::ToggleAi);
+                    cx.stop_propagation();
+                    return;
+                }
                 "c" => {
                     self.copy_selection(cx);
                     cx.stop_propagation();

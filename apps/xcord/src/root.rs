@@ -17,8 +17,9 @@ use gpui::{
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
 use xcord_plugin_api::{
-    services, Command, Commands, Highlights, NoticeLevel, OpenRequest, Runtime, Sessions, TabInfo,
-    TabStatus, TerminalId, Theme, Themes, Ui, UiCommand, UiHost, Workspace, WorkspaceEvent,
+    services, Ai, AiMessageView, AiSnapshot, Command, Commands, Highlights, McpStatus, NoticeLevel,
+    OpenRequest, Runtime, Sessions, TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand,
+    UiHost, Workspace, WorkspaceEvent,
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings};
 
@@ -63,6 +64,15 @@ struct PaletteState {
     selected: usize,
 }
 
+struct AiConfigForm {
+    base_url: Entity<TextInput>,
+    model: Entity<TextInput>,
+    api_key: Entity<TextInput>,
+    allow_writes: bool,
+    include_terminal: bool,
+    error: Option<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingFocus {
     Terminal,
@@ -70,6 +80,8 @@ enum PendingFocus {
     DialogSecret,
     Compose,
     Palette,
+    AiInput,
+    AiBase,
 }
 
 struct NoticeState {
@@ -97,16 +109,21 @@ pub struct XcordApp {
     commands: Commands,
     themes: Themes,
     highlights: Highlights,
+    ai: Ai,
+    mcp: McpStatus,
 
     ui_rx: Receiver<UiCommand>,
     terminal: Entity<TerminalView>,
     search: Entity<TextInput>,
     compose: Entity<TextInput>,
+    ai_input: Entity<TextInput>,
 
     session_form: Option<SessionForm>,
     settings_form: Option<SettingsForm>,
+    ai_config: Option<AiConfigForm>,
     palette: Option<PaletteState>,
     plugins_panel: bool,
+    ai_open: bool,
     plugin_infos: Vec<PluginInfo>,
 
     tabs: Vec<TabInfo>,
@@ -161,11 +178,20 @@ impl XcordApp {
             .require::<Ui>(services::UI_HOST)
             .expect("ui-host service missing"))
         .clone();
+        let ai = (*ctx
+            .require::<Ai>(services::AI)
+            .expect("ai plugin did not start"))
+        .clone();
+        let mcp = (*ctx
+            .require::<McpStatus>(services::MCP_STATUS)
+            .expect("mcp plugin did not start"))
+        .clone();
 
         let settings = sessions.settings();
         let theme = themes.active();
         let search = Self::make_input(&theme, "Search sessions", false, cx);
         let compose = Self::make_input(&theme, "Send a command to the active session…", false, cx);
+        let ai_input = Self::make_input(&theme, "Ask about this session…", false, cx);
         let terminal = cx.new(|cx| {
             TerminalView::new(
                 workspace.clone(),
@@ -186,14 +212,19 @@ impl XcordApp {
             commands,
             themes,
             highlights,
+            ai,
+            mcp,
             ui_rx,
             terminal,
             search,
             compose,
+            ai_input,
             session_form: None,
             settings_form: None,
+            ai_config: None,
             palette: None,
             plugins_panel: false,
+            ai_open: false,
             plugin_infos: Vec::new(),
             tabs: Vec::new(),
             active: None,
@@ -208,6 +239,13 @@ impl XcordApp {
         if let Ok(session_id) = std::env::var("XCORD_AUTOCONNECT") {
             if !session_id.trim().is_empty() {
                 app.connect_profile(session_id, window, cx);
+            }
+        }
+        if let Ok(prompt) = std::env::var("XCORD_AI_PROMPT") {
+            if !prompt.trim().is_empty() {
+                app.ai_open = true;
+                app.pending_focus = Some(PendingFocus::AiInput);
+                let _ = app.ai.send(&prompt);
             }
         }
         app
@@ -393,6 +431,13 @@ impl XcordApp {
                 self.sync(cx);
             }
             UiCommand::CopySelection | UiCommand::Paste => {}
+            UiCommand::ToggleAi => {
+                self.ai_open = !self.ai_open;
+                if self.ai_open {
+                    self.pending_focus = Some(PendingFocus::AiInput);
+                }
+            }
+            UiCommand::OpenAiSettings => self.open_ai_config(cx),
         }
         cx.notify();
     }
@@ -737,6 +782,645 @@ impl XcordApp {
         cx.notify();
     }
 
+    fn open_ai_config(&mut self, cx: &mut Context<Self>) {
+        let settings = self.sessions.settings();
+        let theme = self.theme.clone();
+        let base_url = Self::make_input(&theme, "https://api.deepseek.com/v1", false, cx);
+        let model = Self::make_input(&theme, "deepseek-chat", false, cx);
+        let api_key = Self::make_input(&theme, "Leave blank to keep the stored key", true, cx);
+        base_url.update(cx, |input, cx| {
+            input.set_value(settings.ai_base_url.clone(), cx)
+        });
+        model.update(cx, |input, cx| {
+            input.set_value(settings.ai_model.clone(), cx)
+        });
+        self.ai_config = Some(AiConfigForm {
+            base_url,
+            model,
+            api_key,
+            allow_writes: settings.ai_allow_writes,
+            include_terminal: settings.ai_include_terminal,
+            error: None,
+        });
+        self.pending_focus = Some(PendingFocus::AiBase);
+        cx.notify();
+    }
+
+    fn save_ai_config(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.ai_config.as_ref() else {
+            return;
+        };
+        let base_url = form.base_url.read(cx).value().trim().to_string();
+        let model = form.model.read(cx).value().trim().to_string();
+        let api_key = form.api_key.read(cx).value().to_string();
+        let allow_writes = form.allow_writes;
+        let include_terminal = form.include_terminal;
+        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+            if let Some(form) = &mut self.ai_config {
+                form.error = Some("Base URL must start with http:// or https://".into());
+            }
+            return;
+        }
+        if model.is_empty() {
+            if let Some(form) = &mut self.ai_config {
+                form.error = Some("Model is required.".into());
+            }
+            return;
+        }
+        let mut settings = self.sessions.settings();
+        settings.ai_base_url = base_url;
+        settings.ai_model = model;
+        settings.ai_allow_writes = allow_writes;
+        settings.ai_include_terminal = include_terminal;
+        if let Err(error) = self.sessions.save_settings(settings.clone()) {
+            if let Some(form) = &mut self.ai_config {
+                form.error = Some(error);
+            }
+            return;
+        }
+        self.settings = settings;
+        if !api_key.trim().is_empty() {
+            if let Err(error) = self.sessions.store_ai_api_key(api_key.trim()) {
+                if let Some(form) = &mut self.ai_config {
+                    form.error = Some(error);
+                }
+                return;
+            }
+        }
+        self.ai.refresh_key();
+        self.ai_config = None;
+        self.pending_focus = Some(PendingFocus::AiInput);
+        self.set_notice(NoticeLevel::Success, "AI settings saved.");
+        cx.notify();
+    }
+
+    fn clear_ai_key(&mut self, cx: &mut Context<Self>) {
+        match self.sessions.clear_ai_api_key() {
+            Ok(()) => {
+                self.ai.refresh_key();
+                self.set_notice(NoticeLevel::Success, "Stored AI API key removed.");
+            }
+            Err(error) => self.set_notice(NoticeLevel::Error, error),
+        }
+        cx.notify();
+    }
+
+    fn send_ai(&mut self, cx: &mut Context<Self>) {
+        let prompt = self.ai_input.read(cx).value().trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        match self.ai.send(&prompt) {
+            Ok(()) => {
+                self.ai_input.update(cx, |input, cx| input.clear(cx));
+                self.pending_focus = Some(PendingFocus::AiInput);
+            }
+            Err(error) => self.set_notice(NoticeLevel::Error, error),
+        }
+        cx.notify();
+    }
+
+    fn send_ai_prompt(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        if let Err(error) = self.ai.send(prompt) {
+            self.set_notice(NoticeLevel::Error, error);
+        }
+        self.pending_focus = Some(PendingFocus::AiInput);
+        cx.notify();
+    }
+
+    fn toggle_ai_include_terminal(&mut self, cx: &mut Context<Self>) {
+        let mut settings = self.sessions.settings();
+        settings.ai_include_terminal = !settings.ai_include_terminal;
+        if let Err(error) = self.sessions.save_settings(settings.clone()) {
+            self.set_notice(NoticeLevel::Error, error);
+        } else {
+            self.settings = settings;
+        }
+        cx.notify();
+    }
+
+    fn toggle_ai_allow_writes(&mut self, cx: &mut Context<Self>) {
+        let mut settings = self.sessions.settings();
+        settings.ai_allow_writes = !settings.ai_allow_writes;
+        if let Err(error) = self.sessions.save_settings(settings.clone()) {
+            self.set_notice(NoticeLevel::Error, error);
+        } else {
+            self.settings = settings;
+        }
+        cx.notify();
+    }
+
+    fn render_ai_panel(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let snapshot: AiSnapshot = self.ai.snapshot();
+        let mut messages = div()
+            .id("ai-messages")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .flex_1()
+            .overflow_y_scroll()
+            .px_3()
+            .py_3();
+
+        if snapshot.messages.is_empty() {
+            messages = messages
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgbc(theme.muted))
+                        .child("Ask the copilot to inspect a session, explain output, or run a fix with tools."),
+                )
+                .child(
+                    secondary_button("Explain this terminal", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.send_ai_prompt(
+                                "Explain what the active terminal is showing and what I should do next.",
+                                cx,
+                            )
+                        }),
+                    ),
+                )
+                .child(
+                    secondary_button("Why did the last command fail?", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.send_ai_prompt(
+                                "Look at the recent terminal output and explain why the last command failed.",
+                                cx,
+                            )
+                        }),
+                    ),
+                )
+                .child(
+                    secondary_button("Summarize open tabs", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.send_ai_prompt(
+                                "Summarize the open tabs and their connection status.",
+                                cx,
+                            )
+                        }),
+                    ),
+                );
+        } else {
+            for message in &snapshot.messages {
+                messages = messages.child(render_ai_message(message, theme));
+            }
+        }
+
+        if snapshot.streaming {
+            messages = messages.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.accent))
+                    .child(if snapshot.status.is_empty() {
+                        "Thinking…".to_string()
+                    } else {
+                        snapshot.status.clone()
+                    }),
+            );
+        }
+        if let Some(error) = &snapshot.error {
+            messages = messages.child(
+                div()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgba(theme.danger, 0.12))
+                    .border_1()
+                    .border_color(rgba(theme.danger, 0.4))
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.danger))
+                    .child(error.clone()),
+            );
+        }
+
+        let mut footer = div()
+            .border_t_1()
+            .border_color(rgbc(theme.border))
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_2();
+        footer = footer
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        checkbox("Terminal context", snapshot.include_terminal, theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.toggle_ai_include_terminal(cx)),
+                        ),
+                    )
+                    .child(
+                        checkbox(
+                            if snapshot.allow_writes {
+                                "Writes allowed"
+                            } else {
+                                "Writes blocked"
+                            },
+                            snapshot.allow_writes,
+                            theme,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.toggle_ai_allow_writes(cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(snapshot.model.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(34.))
+                            .bg(rgbc(theme.background))
+                            .border_1()
+                            .border_color(rgbc(theme.border))
+                            .rounded_md()
+                            .child(self.ai_input.clone()),
+                    )
+                    .child(primary_button("Send", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.send_ai(cx)),
+                    )),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter" {
+                    this.send_ai(cx);
+                    cx.stop_propagation();
+                }
+            }));
+
+        div()
+            .w(px(400.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgbc(theme.panel))
+            .border_l_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .h(px(46.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgbc(theme.border))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgbc(theme.foreground))
+                                    .child("AI Copilot"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(if snapshot.has_key {
+                                        rgbc(theme.muted)
+                                    } else {
+                                        rgbc(theme.danger)
+                                    })
+                                    .child(if snapshot.has_key {
+                                        format!("{} · MCP tools", snapshot.model)
+                                    } else {
+                                        "No API key — open settings".to_string()
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(small_button("Settings", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.open_ai_config(cx)),
+                            ))
+                            .child(
+                                div()
+                                    .id("ai-close")
+                                    .px_2()
+                                    .rounded_sm()
+                                    .text_size(px(16.))
+                                    .text_color(rgbc(theme.muted))
+                                    .cursor_pointer()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.ai_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    ),
+            )
+            .child(messages)
+            .child(footer)
+    }
+
+    fn render_ai_config(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(form) = self.ai_config.as_ref() else {
+            return div();
+        };
+        let has_key = self.ai.snapshot().has_key;
+        let mcp = self.mcp.snapshot();
+        let bridge = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
+            .map(|dir| {
+                dir.join(if cfg!(windows) {
+                    "xcord-mcp.exe"
+                } else {
+                    "xcord-mcp"
+                })
+            })
+            .unwrap_or_else(|| "xcord-mcp".into());
+        let mcp_config = serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {
+                "xcord": {
+                    "command": bridge.to_string_lossy()
+                }
+            }
+        }))
+        .unwrap_or_default();
+        let error = form.error.clone();
+
+        div()
+            .w(px(680.))
+            .max_h(px(720.))
+            .bg(rgbc(theme.panel_alt))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .rounded_lg()
+            .shadow_lg()
+            .p(px(22.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.ai_config = None;
+                    cx.notify();
+                } else if event.keystroke.key == "enter" {
+                    this.save_ai_config(cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child("AI & MCP"),
+                    )
+                    .child(
+                        div()
+                            .id("ai-config-close")
+                            .text_size(px(18.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.ai_config = None;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("Any OpenAI-compatible endpoint works. The key is stored in Windows Credential Manager."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        secondary_button("DeepSeek", theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &this.ai_config {
+                                    form.base_url.update(cx, |input, cx| {
+                                        input.set_value("https://api.deepseek.com/v1", cx)
+                                    });
+                                    form.model.update(cx, |input, cx| {
+                                        input.set_value("deepseek-chat", cx)
+                                    });
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        secondary_button("OpenAI", theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &this.ai_config {
+                                    form.base_url.update(cx, |input, cx| {
+                                        input.set_value("https://api.openai.com/v1", cx)
+                                    });
+                                    form.model.update(cx, |input, cx| {
+                                        input.set_value("gpt-4o-mini", cx)
+                                    });
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        secondary_button("Ollama", theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &this.ai_config {
+                                    form.base_url.update(cx, |input, cx| {
+                                        input.set_value("http://127.0.0.1:11434/v1", cx)
+                                    });
+                                    form.model.update(cx, |input, cx| {
+                                        input.set_value("qwen2.5-coder:7b", cx)
+                                    });
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(field("Base URL", form.base_url.clone(), theme))
+            .child(field("Model", form.model.clone(), theme))
+            .child(field(
+                if has_key {
+                    "API key (a key is already stored)"
+                } else {
+                    "API key"
+                },
+                form.api_key.clone(),
+                theme,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        checkbox("Send terminal context", form.include_terminal, theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.ai_config {
+                                    form.include_terminal = !form.include_terminal;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        checkbox("Allow terminal writes", form.allow_writes, theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.ai_config {
+                                    form.allow_writes = !form.allow_writes;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        small_button("Clear stored key", theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.clear_ai_key(cx)),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgbc(theme.background))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(if mcp.running {
+                                        rgbc(theme.success)
+                                    } else {
+                                        rgbc(theme.danger)
+                                    })
+                                    .child(if mcp.running {
+                                        format!("MCP server running · {} tools", mcp.tools)
+                                    } else {
+                                        format!(
+                                            "MCP server unavailable: {}",
+                                            mcp.error.as_deref().unwrap_or("disabled")
+                                        )
+                                    }),
+                            )
+                            .child(
+                                small_button("Copy Claude/Cursor config", theme).on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let config = mcp_config.clone();
+                                        move |_, _, _, cx| {
+                                            cx.write_to_clipboard(
+                                                gpui::ClipboardItem::new_string(config.clone()),
+                                            );
+                                        }
+                                    }),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(format!(
+                                "Endpoint: {}{}",
+                                mcp.url,
+                                if mcp.running {
+                                    format!(" · token {}", mask_token(&mcp.token))
+                                } else {
+                                    String::new()
+                                }
+                            )),
+                    )
+                    .child(
+                        div()
+                            .font(gpui::font("Consolas"))
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(mcp_config.replace('\n', " ")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(if error.is_some() {
+                                rgbc(theme.danger)
+                            } else {
+                                rgbc(theme.muted)
+                            })
+                            .child(error.unwrap_or_else(|| {
+                                "MCP speaks JSON-RPC on 127.0.0.1; the bridge reads mcp-token from the config directory.".into()
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(secondary_button("Cancel", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.ai_config = None;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(primary_button("Save", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.save_ai_config(cx)),
+                            )),
+                    ),
+            )
+    }
+
     fn open_palette(&mut self, cx: &mut Context<Self>) {
         let theme = self.theme.clone();
         let input = Self::make_input(&theme, "Type a command…", false, cx);
@@ -825,6 +1509,11 @@ impl XcordApp {
                 .session_form
                 .as_ref()
                 .map(|form| form.secret.read(cx).focus_handle_only()),
+            PendingFocus::AiInput => Some(self.ai_input.read(cx).focus_handle_only()),
+            PendingFocus::AiBase => self
+                .ai_config
+                .as_ref()
+                .map(|form| form.base_url.read(cx).focus_handle_only()),
         };
         if let Some(handle) = handle {
             window.focus(&handle);
@@ -856,6 +1545,14 @@ impl XcordApp {
                 "e" => {
                     self.settings.compose_bar = true;
                     self.pending_focus = Some(PendingFocus::Compose);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "i" => {
+                    self.ai_open = !self.ai_open;
+                    if self.ai_open {
+                        self.pending_focus = Some(PendingFocus::AiInput);
+                    }
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -917,6 +1614,13 @@ impl XcordApp {
                     ),
             )
             .child(div().flex_1())
+            .child(self.header_button("AI", cx, |this, cx| {
+                this.ai_open = !this.ai_open;
+                if this.ai_open {
+                    this.pending_focus = Some(PendingFocus::AiInput);
+                }
+                cx.notify();
+            }))
             .child(self.header_button("Palette", cx, |this, cx| this.open_palette(cx)))
             .child(self.header_button("Plugins", cx, |this, cx| {
                 this.plugins_panel = true;
@@ -2310,10 +3014,11 @@ impl XcordApp {
             NoticeLevel::Error => theme.danger,
             NoticeLevel::Success => theme.success,
         };
+        let right = if self.ai_open { px(418.) } else { px(18.) };
         div()
             .absolute()
-            .bottom(px(36.))
-            .right(px(18.))
+            .bottom(px(40.))
+            .right(right)
             .w(px(380.))
             .p_3()
             .rounded_md()
@@ -2369,7 +3074,8 @@ impl Render for XcordApp {
                     .min_h(px(0.))
                     .flex()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_main(cx)),
+                    .child(self.render_main(cx))
+                    .when(self.ai_open, |body| body.child(self.render_ai_panel(cx))),
             );
 
         if self.session_form.is_some() {
@@ -2414,6 +3120,20 @@ impl Render for XcordApp {
                     .child(self.render_settings_panel(cx)),
             );
         }
+        if self.ai_config.is_some() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba([0, 0, 0], 0.55))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .child(self.render_ai_config(cx)),
+            );
+        }
         if self.palette.is_some() {
             root = root.child(
                 div()
@@ -2441,6 +3161,69 @@ impl Drop for XcordApp {
 
 // ---------------------------------------------------------------------------
 // Small style helpers
+
+fn render_ai_message(message: &AiMessageView, theme: &Theme) -> Div {
+    let is_tool = message.role.starts_with("Tool");
+    let mut card = div().w_full().flex().flex_col().gap_1();
+    if is_tool {
+        card = card
+            .p_2()
+            .rounded_md()
+            .bg(rgbc(theme.panel_alt))
+            .border_1()
+            .border_color(rgbc(theme.border));
+    }
+    let role = match (&message.tool, message.role.as_str()) {
+        (Some(tool), _) => format!("{} · {tool}", message.role),
+        _ => message.role.clone(),
+    };
+    card.child(
+        div()
+            .text_size(px(9.5))
+            .text_color(if message.role == "You" {
+                rgbc(theme.accent)
+            } else if message.role == "AI" {
+                rgbc(theme.success)
+            } else {
+                rgbc(theme.muted)
+            })
+            .child(role),
+    )
+    .child(text_block(
+        &message.text,
+        if is_tool {
+            rgbc(theme.muted)
+        } else {
+            rgbc(theme.foreground)
+        },
+        if is_tool { 10.0 } else { 12.0 },
+    ))
+}
+
+fn text_block(text: &str, color: Rgba, size: f32) -> Div {
+    let mut column = div().w_full().flex().flex_col().gap_1();
+    for line in text.lines() {
+        column = column.child(
+            div()
+                .min_h(px(15.))
+                .text_size(px(size))
+                .text_color(color)
+                .child(if line.is_empty() {
+                    " ".to_string()
+                } else {
+                    line.to_string()
+                }),
+        );
+    }
+    column
+}
+
+fn mask_token(token: &str) -> String {
+    if token.len() <= 10 {
+        return "…".into();
+    }
+    format!("{}…{}", &token[..6], &token[token.len() - 4..])
+}
 
 fn ui_font() -> Font {
     if cfg!(windows) {
