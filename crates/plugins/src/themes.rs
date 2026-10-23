@@ -1,0 +1,103 @@
+use std::rc::Rc;
+
+use xcord_cordis::{Context, Plugin, PluginMeta, Result};
+use xcord_plugin_api::{services, Sessions, Theme, ThemeService, Themes};
+
+/// Registers the built-in color schemes and selects the user's preference.
+#[derive(Clone)]
+pub struct ThemesPlugin;
+
+impl Plugin for ThemesPlugin {
+    fn meta(&self) -> PluginMeta {
+        PluginMeta::new("themes", "Themes")
+            .description("Color schemes shared by the terminal and shell")
+            .author("xcord")
+            .capabilities(&["ui", "theme"])
+    }
+
+    fn inject(&self) -> &'static [&'static str] {
+        &[services::SESSIONS]
+    }
+
+    fn apply(&self, ctx: Context, _config: serde_json::Value) -> Result<()> {
+        let sessions = ctx.require::<Sessions>(services::SESSIONS)?;
+        let settings = sessions.settings();
+        let service = Rc::new(ThemeService::new(builtin_themes(), &settings.theme));
+        ctx.provide(services::THEMES, Themes(service))?;
+        Ok(())
+    }
+}
+
+pub fn builtin_themes() -> Vec<Theme> {
+    let mut themes = vec![Theme::fallback()];
+
+    themes.push(Theme {
+        id: "midnight",
+        name: "Midnight Blue",
+        background: [0x0b, 0x0f, 0x1a],
+        foreground: [0xcf, 0xd8, 0xef],
+        panel: [0x0f, 0x15, 0x24],
+        panel_alt: [0x14, 0x1b, 0x2e],
+        border: [0x22, 0x2d, 0x4a],
+        accent: [0x7a, 0xb8, 0xff],
+        muted: [0x6d, 0x7d, 0x9c],
+        danger: [0xff, 0x7a, 0x7a],
+        success: [0x6e, 0xe7, 0xa8],
+        cursor: [0xb0, 0xd0, 0xff],
+        selection: [0x24, 0x3a, 0x6a],
+        palette: [
+            [0x0b, 0x0f, 0x1a],
+            [0xff, 0x6b, 0x81],
+            [0x6e, 0xe7, 0xa8],
+            [0xff, 0xd1, 0x7a],
+            [0x7a, 0xb8, 0xff],
+            [0xc7, 0x9b, 0xff],
+            [0x6e, 0xe0, 0xef],
+            [0xcf, 0xd8, 0xef],
+            [0x5a, 0x67, 0x85],
+            [0xff, 0x9d, 0xad],
+            [0x9a, 0xf5, 0xc8],
+            [0xff, 0xe0, 0xa3],
+            [0xa8, 0xd1, 0xff],
+            [0xdf, 0xc2, 0xff],
+            [0xa8, 0xf0, 0xff],
+            [0xff, 0xff, 0xff],
+        ],
+    });
+
+    themes.push(Theme {
+        id: "paper",
+        name: "Paper Light",
+        background: [0xf7, 0xf4, 0xec],
+        foreground: [0x2b, 0x2f, 0x38],
+        panel: [0xef, 0xeb, 0xe1],
+        panel_alt: [0xe7, 0xe2, 0xd7],
+        border: [0xd2, 0xcb, 0xbd],
+        accent: [0x1f, 0x5f, 0xb8],
+        muted: [0x72, 0x6d, 0x63],
+        danger: [0xb8, 0x24, 0x3a],
+        success: [0x1e, 0x7a, 0x4a],
+        cursor: [0x1f, 0x5f, 0xb8],
+        selection: [0xc9, 0xdc, 0xf5],
+        palette: [
+            [0x2b, 0x2f, 0x38],
+            [0xb8, 0x24, 0x3a],
+            [0x1e, 0x7a, 0x4a],
+            [0x9a, 0x6b, 0x00],
+            [0x1f, 0x5f, 0xb8],
+            [0x7b, 0x3f, 0xa8],
+            [0x0f, 0x72, 0x7a],
+            [0x8a, 0x84, 0x78],
+            [0x5f, 0x5a, 0x50],
+            [0xd9, 0x3a, 0x4f],
+            [0x2e, 0x96, 0x5f],
+            [0xb5, 0x82, 0x12],
+            [0x33, 0x77, 0xd0],
+            [0x94, 0x58, 0xc4],
+            [0x1c, 0x8a, 0x92],
+            [0x2b, 0x2f, 0x38],
+        ],
+    });
+
+    themes
+}

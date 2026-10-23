@@ -1,0 +1,9 @@
+# China-friendly crates.io mirror. Delete this file to use your default registry.
+[source.crates-io]
+replace-with = "rsproxy"
+
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+retry = 5

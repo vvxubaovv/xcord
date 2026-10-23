@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.log
+/fetch.log
+/build-gpui.log
+/screenshots/
+/*.png
+/run*.log

@@ -1,0 +1,2575 @@
+//! The GPUI shell.
+//!
+//! The shell owns no protocol or terminal logic. It provides the `ui-host`
+//! service, renders the services plugins publish, and forwards user intent as
+//! commands. Plugins can be reloaded without touching this file.
+
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use async_channel::Receiver;
+use gpui::prelude::*;
+use gpui::{
+    div, px, rgb, Context, Div, Entity, Font, Hsla, KeyDownEvent, Render, Rgba, SharedString,
+    Stateful, Window,
+};
+use tokio::sync::broadcast::error::RecvError;
+use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
+use xcord_plugin_api::{
+    services, Command, Commands, Highlights, NoticeLevel, OpenRequest, Runtime, Sessions, TabInfo,
+    TabStatus, TerminalId, Theme, Themes, Ui, UiCommand, UiHost, Workspace, WorkspaceEvent,
+};
+use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings};
+
+use crate::terminal_view::TerminalView;
+use crate::text_input::TextInput;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    Password,
+    PublicKey,
+}
+
+struct SessionForm {
+    editing: Option<String>,
+    name: Entity<TextInput>,
+    group: Entity<TextInput>,
+    host: Entity<TextInput>,
+    port: Entity<TextInput>,
+    user: Entity<TextInput>,
+    secret: Entity<TextInput>,
+    key_path: Entity<TextInput>,
+    auth: AuthMode,
+    save_secret: bool,
+    logging: bool,
+    error: Option<String>,
+}
+
+struct SettingsForm {
+    theme_id: String,
+    font_size: f32,
+    scrollback: usize,
+    copy_on_select: bool,
+    compose_bar: bool,
+    logging: bool,
+    highlight: bool,
+    strict_host_keys: bool,
+    error: Option<String>,
+}
+
+struct PaletteState {
+    input: Entity<TextInput>,
+    selected: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingFocus {
+    Terminal,
+    DialogName,
+    DialogSecret,
+    Compose,
+    Palette,
+}
+
+struct NoticeState {
+    level: NoticeLevel,
+    message: String,
+    at: Instant,
+}
+
+struct UiHostImpl {
+    sender: async_channel::Sender<UiCommand>,
+}
+
+impl UiHost for UiHostImpl {
+    fn send(&self, command: UiCommand) {
+        let _ = self.sender.try_send(command);
+    }
+}
+
+pub struct XcordApp {
+    kernel: Kernel,
+    ctx: PluginContext,
+    runtime: Runtime,
+    workspace: Workspace,
+    sessions: Sessions,
+    commands: Commands,
+    themes: Themes,
+    highlights: Highlights,
+
+    ui_rx: Receiver<UiCommand>,
+    terminal: Entity<TerminalView>,
+    search: Entity<TextInput>,
+    compose: Entity<TextInput>,
+
+    session_form: Option<SessionForm>,
+    settings_form: Option<SettingsForm>,
+    palette: Option<PaletteState>,
+    plugins_panel: bool,
+    plugin_infos: Vec<PluginInfo>,
+
+    tabs: Vec<TabInfo>,
+    active: Option<TerminalId>,
+    terminal_active: Option<TerminalId>,
+    theme: Rc<Theme>,
+    settings: Settings,
+
+    notice: Option<NoticeState>,
+    pending_focus: Option<PendingFocus>,
+}
+
+impl XcordApp {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let kernel = Kernel::new();
+        let ctx = kernel.context();
+
+        let (ui_tx, ui_rx) = async_channel::unbounded();
+        let host: Rc<dyn UiHost> = Rc::new(UiHostImpl {
+            sender: ui_tx.clone(),
+        });
+        ctx.provide(services::UI_HOST, Ui(host))
+            .expect("ui-host service");
+
+        xcord_builtins::install(&ctx);
+
+        let runtime = (*ctx
+            .require::<Runtime>(services::RUNTIME)
+            .expect("runtime plugin did not start"))
+        .clone();
+        let workspace = (*ctx
+            .require::<Workspace>(services::WORKSPACE)
+            .expect("workspace plugin did not start"))
+        .clone();
+        let sessions = (*ctx
+            .require::<Sessions>(services::SESSIONS)
+            .expect("sessions plugin did not start"))
+        .clone();
+        let commands = (*ctx
+            .require::<Commands>(services::COMMANDS)
+            .expect("commands plugin did not start"))
+        .clone();
+        let themes = (*ctx
+            .require::<Themes>(services::THEMES)
+            .expect("themes plugin did not start"))
+        .clone();
+        let highlights = (*ctx
+            .require::<Highlights>(services::HIGHLIGHTS)
+            .expect("highlights plugin did not start"))
+        .clone();
+        let ui = (*ctx
+            .require::<Ui>(services::UI_HOST)
+            .expect("ui-host service missing"))
+        .clone();
+
+        let settings = sessions.settings();
+        let theme = themes.active();
+        let search = Self::make_input(&theme, "Search sessions", false, cx);
+        let compose = Self::make_input(&theme, "Send a command to the active session…", false, cx);
+        let terminal = cx.new(|cx| {
+            TerminalView::new(
+                workspace.clone(),
+                themes.clone(),
+                highlights.clone(),
+                ui.clone(),
+                settings.clone(),
+                cx,
+            )
+        });
+
+        let mut app = Self {
+            kernel,
+            ctx,
+            runtime,
+            workspace,
+            sessions,
+            commands,
+            themes,
+            highlights,
+            ui_rx,
+            terminal,
+            search,
+            compose,
+            session_form: None,
+            settings_form: None,
+            palette: None,
+            plugins_panel: false,
+            plugin_infos: Vec::new(),
+            tabs: Vec::new(),
+            active: None,
+            terminal_active: None,
+            theme,
+            settings,
+            notice: None,
+            pending_focus: Some(PendingFocus::Terminal),
+        };
+        app.sync(cx);
+        app.start_pumps(cx);
+        if let Ok(session_id) = std::env::var("XCORD_AUTOCONNECT") {
+            if !session_id.trim().is_empty() {
+                app.connect_profile(session_id, window, cx);
+            }
+        }
+        app
+    }
+
+    fn make_input(
+        theme: &Theme,
+        placeholder: &str,
+        password: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextInput> {
+        let (fg, placeholder_color, selection, cursor) = input_colors(theme);
+        let placeholder = placeholder.to_string();
+        cx.new(move |cx| {
+            TextInput::new(
+                placeholder,
+                password,
+                fg,
+                placeholder_color,
+                selection,
+                cursor,
+                cx,
+            )
+        })
+    }
+
+    fn start_pumps(&self, cx: &mut Context<Self>) {
+        // I/O jobs: drain bursts, then repaint once.
+        let runtime = self.runtime.clone();
+        let jobs = runtime.receiver();
+        cx.spawn(async move |this, cx| loop {
+            let first = match jobs.recv().await {
+                Ok(job) => job,
+                Err(_) => break,
+            };
+            runtime.execute(first);
+            while let Some(job) = runtime.try_next_job() {
+                runtime.execute(job);
+            }
+            if this
+                .update(cx, |app, cx| {
+                    app.sync(cx);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+
+        // Workspace notifications.
+        let mut events = self.workspace.subscribe();
+        cx.spawn(async move |this, cx| loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if this
+                        .update(cx, |app, cx| {
+                            app.on_workspace_event(event, cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    if this
+                        .update(cx, |app, cx| {
+                            app.sync(cx);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            }
+        })
+        .detach();
+
+        // Commands sent by plugins.
+        let ui_rx = self.ui_rx.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(command) = ui_rx.recv().await {
+                if this
+                    .update(cx, |app, cx| {
+                        app.handle_ui_command(command, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn sync(&mut self, cx: &mut Context<Self>) {
+        self.tabs = self.workspace.tabs();
+        self.active = self.workspace.active();
+        self.theme = self.themes.active();
+        if self.terminal_active != self.active {
+            let active = self.active;
+            self.terminal
+                .update(cx, |view, cx| view.set_active(active, cx));
+            self.terminal_active = active;
+        }
+    }
+
+    fn on_workspace_event(&mut self, event: WorkspaceEvent, cx: &mut Context<Self>) {
+        self.sync(cx);
+        if let Some(tab) = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+        {
+            if tab.status.is_connected()
+                && self
+                    .notice
+                    .as_ref()
+                    .map(|notice| notice.message.starts_with("Connecting"))
+                    .unwrap_or(false)
+            {
+                self.notice = None;
+            }
+        }
+        match event {
+            WorkspaceEvent::Notice { level, message } => {
+                self.set_notice(level, message);
+            }
+            WorkspaceEvent::Dirty(id) => {
+                if self.active == Some(id) {
+                    self.terminal.update(cx, |_, cx| cx.notify());
+                }
+            }
+            WorkspaceEvent::StatusChanged(id) | WorkspaceEvent::Bell(id) => {
+                if self.active == Some(id) {
+                    self.terminal.update(cx, |_, cx| cx.notify());
+                }
+            }
+            WorkspaceEvent::TabsChanged
+            | WorkspaceEvent::ActiveChanged(_)
+            | WorkspaceEvent::Closed(_) => {}
+        }
+        cx.notify();
+    }
+
+    fn handle_ui_command(&mut self, command: UiCommand, cx: &mut Context<Self>) {
+        match command {
+            UiCommand::NewSession => self.open_session_dialog(None, cx),
+            UiCommand::EditSession(id) => self.open_session_dialog(Some(id), cx),
+            UiCommand::OpenPalette => self.open_palette(cx),
+            UiCommand::ShowPlugins => {
+                self.plugins_panel = true;
+                self.refresh_plugins();
+            }
+            UiCommand::ShowSettings => self.open_settings(cx),
+            UiCommand::FocusCompose => {
+                self.settings.compose_bar = true;
+                self.pending_focus = Some(PendingFocus::Compose);
+            }
+            UiCommand::Notify { level, message } => self.set_notice(level, message),
+            UiCommand::CloseActiveTab => {
+                if let Some(id) = self.active {
+                    self.workspace.close(id);
+                    self.sync(cx);
+                }
+            }
+            UiCommand::ReconnectActive => {
+                if let Some(id) = self.active {
+                    if let Err(error) = self.workspace.reconnect(id) {
+                        self.set_notice(NoticeLevel::Error, error);
+                    }
+                    self.sync(cx);
+                }
+            }
+            UiCommand::SelectNextTab => {
+                self.workspace.select_next();
+                self.sync(cx);
+            }
+            UiCommand::SelectPrevTab => {
+                self.workspace.select_previous();
+                self.sync(cx);
+            }
+            UiCommand::CopySelection | UiCommand::Paste => {}
+        }
+        cx.notify();
+    }
+
+    fn set_notice(&mut self, level: NoticeLevel, message: impl Into<String>) {
+        self.notice = Some(NoticeState {
+            level,
+            message: message.into(),
+            at: Instant::now(),
+        });
+    }
+
+    fn open_session_dialog(&mut self, profile_id: Option<String>, cx: &mut Context<Self>) {
+        let existing = profile_id.as_ref().and_then(|id| self.sessions.get(id));
+        let profile = existing.clone().unwrap_or_else(|| SessionProfile::new(""));
+        let theme = self.theme.clone();
+        let name = Self::make_input(&theme, "Production web", false, cx);
+        let host = Self::make_input(&theme, "example.com", false, cx);
+        let port = Self::make_input(&theme, "22", false, cx);
+        let user = Self::make_input(&theme, "root", false, cx);
+        let secret = Self::make_input(&theme, "Leave blank to use the keychain", true, cx);
+        let key_path = Self::make_input(&theme, "~/.ssh/id_ed25519", false, cx);
+        let group = Self::make_input(&theme, "Sessions", false, cx);
+
+        name.update(cx, |input, cx| input.set_value(profile.name.clone(), cx));
+        group.update(cx, |input, cx| input.set_value(profile.group.clone(), cx));
+        host.update(cx, |input, cx| input.set_value(profile.host.clone(), cx));
+        port.update(cx, |input, cx| {
+            input.set_value(profile.port.to_string(), cx)
+        });
+        user.update(cx, |input, cx| input.set_value(profile.user.clone(), cx));
+
+        let (auth, save_secret, key) = match &profile.auth {
+            AuthKind::Password { save, .. } => (AuthMode::Password, *save, String::new()),
+            AuthKind::PublicKey {
+                path,
+                save_passphrase,
+                ..
+            } => (AuthMode::PublicKey, *save_passphrase, path.clone()),
+            AuthKind::Agent | AuthKind::None => (AuthMode::Password, false, String::new()),
+        };
+        key_path.update(cx, |input, cx| input.set_value(key, cx));
+
+        self.session_form = Some(SessionForm {
+            editing: profile_id,
+            name,
+            group,
+            host,
+            port,
+            user,
+            secret,
+            key_path,
+            auth,
+            save_secret,
+            logging: profile.logging,
+            error: None,
+        });
+        self.pending_focus = Some(PendingFocus::DialogName);
+        cx.notify();
+    }
+
+    fn close_session_dialog(&mut self, cx: &mut Context<Self>) {
+        self.session_form = None;
+        self.pending_focus = Some(PendingFocus::Terminal);
+        cx.notify();
+    }
+
+    fn submit_session(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = self.session_form.as_ref() else {
+            return;
+        };
+        let name = form.name.read(cx).value().trim().to_string();
+        let host = form.host.read(cx).value().trim().to_string();
+        let port_text = form.port.read(cx).value().trim().to_string();
+        let user = form.user.read(cx).value().trim().to_string();
+        let secret = form.secret.read(cx).value().to_string();
+        let key_path = form.key_path.read(cx).value().trim().to_string();
+        let auth = form.auth;
+        let save_secret = form.save_secret;
+        let logging = form.logging;
+        let group = form.group.read(cx).value().trim().to_string();
+        let editing = form.editing.clone();
+
+        if host.is_empty() {
+            if let Some(form) = &mut self.session_form {
+                form.error = Some("Host is required.".into());
+            }
+            return;
+        }
+        let port = match port_text.parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => {
+                if let Some(form) = &mut self.session_form {
+                    form.error = Some("Port must be a number between 1 and 65535.".into());
+                }
+                return;
+            }
+        };
+        if auth == AuthMode::PublicKey && key_path.is_empty() {
+            if let Some(form) = &mut self.session_form {
+                form.error = Some("Choose a private key file.".into());
+            }
+            return;
+        }
+
+        let existing = editing.as_ref().and_then(|id| self.sessions.get(id));
+        let mut profile = existing.clone().unwrap_or_else(|| SessionProfile::new(""));
+        profile.name = if name.is_empty() { host.clone() } else { name };
+        profile.host = host;
+        profile.port = port;
+        profile.user = user;
+        profile.group = if group.is_empty() {
+            "Sessions".into()
+        } else {
+            group
+        };
+        profile.logging = logging;
+        profile.auth = match auth {
+            AuthMode::Password => AuthKind::Password {
+                save: save_secret,
+                secret_id: existing.as_ref().and_then(|profile| match &profile.auth {
+                    AuthKind::Password { secret_id, .. } => secret_id.clone(),
+                    _ => None,
+                }),
+            },
+            AuthMode::PublicKey => AuthKind::PublicKey {
+                path: key_path,
+                save_passphrase: save_secret,
+                secret_id: existing.as_ref().and_then(|profile| match &profile.auth {
+                    AuthKind::PublicKey { secret_id, .. } => secret_id.clone(),
+                    _ => None,
+                }),
+            },
+        };
+
+        if let Err(error) = self.sessions.save(profile.clone()) {
+            if let Some(form) = &mut self.session_form {
+                form.error = Some(error);
+            }
+            return;
+        }
+
+        if save_secret && !secret.is_empty() {
+            let result = match auth {
+                AuthMode::Password => self.sessions.store_password(&profile, &secret),
+                AuthMode::PublicKey => self.sessions.store_passphrase(&profile, &secret),
+            };
+            if let Err(error) = result {
+                self.set_notice(
+                    NoticeLevel::Warning,
+                    format!("Secret was not saved: {error}"),
+                );
+            }
+        }
+
+        let credential = if !secret.is_empty() {
+            Some(secret)
+        } else {
+            match auth {
+                AuthMode::Password => self.sessions.password(&profile),
+                AuthMode::PublicKey => self.sessions.passphrase(&profile),
+            }
+        };
+        if auth == AuthMode::Password && credential.is_none() {
+            if let Some(form) = &mut self.session_form {
+                form.error = Some("This session needs a password.".into());
+            }
+            return;
+        }
+
+        match self.workspace.open(OpenRequest {
+            profile: profile.clone(),
+            credential,
+            cols: 80,
+            rows: 24,
+        }) {
+            Ok(id) => {
+                self.session_form = None;
+                self.pending_focus = Some(PendingFocus::Terminal);
+                self.sync(cx);
+                self.set_notice(
+                    NoticeLevel::Info,
+                    format!("Connecting to {}…", profile.endpoint()),
+                );
+                let _ = id;
+            }
+            Err(error) => {
+                if let Some(form) = &mut self.session_form {
+                    form.error = Some(error.clone());
+                }
+                self.set_notice(NoticeLevel::Error, error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn connect_profile(&mut self, profile_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.profile_id == profile_id) {
+            self.workspace.select(tab.id);
+            self.pending_focus = Some(PendingFocus::Terminal);
+            self.sync(cx);
+            cx.notify();
+            return;
+        }
+        let Some(profile) = self.sessions.get(&profile_id) else {
+            self.set_notice(NoticeLevel::Error, "Session no longer exists.");
+            return;
+        };
+        let credential = match &profile.auth {
+            AuthKind::Password { .. } => self.sessions.password(&profile),
+            AuthKind::PublicKey { .. } => self.sessions.passphrase(&profile),
+            _ => None,
+        };
+        if matches!(profile.auth, AuthKind::Password { .. }) && credential.is_none() {
+            self.open_session_dialog(Some(profile_id), cx);
+            if let Some(form) = &mut self.session_form {
+                form.error = Some("Enter the password for this session.".into());
+            }
+            self.pending_focus = Some(PendingFocus::DialogSecret);
+            cx.notify();
+            return;
+        }
+        match self.workspace.open(OpenRequest {
+            profile,
+            credential,
+            cols: 80,
+            rows: 24,
+        }) {
+            Ok(_) => {
+                self.pending_focus = Some(PendingFocus::Terminal);
+                self.sync(cx);
+                self.set_notice(NoticeLevel::Info, "Connecting…");
+            }
+            Err(error) => {
+                self.set_notice(NoticeLevel::Error, error);
+            }
+        }
+        let _ = window;
+        cx.notify();
+    }
+
+    fn filtered_sessions(&self, cx: &Context<Self>) -> Vec<SessionProfile> {
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        let mut sessions = self.sessions.list();
+        if !query.is_empty() {
+            sessions.retain(|profile| {
+                profile.name.to_lowercase().contains(&query)
+                    || profile.host.to_lowercase().contains(&query)
+                    || profile.user.to_lowercase().contains(&query)
+                    || profile
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_lowercase().contains(&query))
+            });
+        }
+        sessions.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        sessions
+    }
+
+    fn connect_first_filtered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(profile) = self.filtered_sessions(cx).first() {
+            let id = profile.id.clone();
+            self.connect_profile(id, window, cx);
+        }
+    }
+
+    fn send_compose(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.active else {
+            return;
+        };
+        let text = self.compose.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.workspace.write(id, text.as_bytes());
+        self.workspace.write(id, b"\r");
+        self.compose.update(cx, |input, cx| input.clear(cx));
+        self.pending_focus = Some(PendingFocus::Compose);
+        cx.notify();
+    }
+
+    fn send_snippet(&mut self, command: &str, send_enter: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.active else {
+            return;
+        };
+        self.workspace.write(id, command.as_bytes());
+        if send_enter {
+            self.workspace.write(id, b"\r");
+        }
+        self.pending_focus = Some(PendingFocus::Terminal);
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_form = Some(SettingsForm {
+            theme_id: self.themes.active_id().to_string(),
+            font_size: self.settings.font_size,
+            scrollback: self.settings.scrollback,
+            copy_on_select: self.settings.copy_on_select,
+            compose_bar: self.settings.compose_bar,
+            logging: self.settings.logging,
+            highlight: self.settings.highlight,
+            strict_host_keys: self.settings.host_key_policy == HostKeyPolicy::Strict,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.settings_form.as_ref() else {
+            return;
+        };
+        let mut settings = self.settings.clone();
+        settings.theme = form.theme_id.clone();
+        settings.font_size = form.font_size.clamp(9.0, 28.0);
+        settings.scrollback = form.scrollback.clamp(500, 200_000);
+        settings.copy_on_select = form.copy_on_select;
+        settings.compose_bar = form.compose_bar;
+        settings.logging = form.logging;
+        settings.highlight = form.highlight;
+        settings.host_key_policy = if form.strict_host_keys {
+            HostKeyPolicy::Strict
+        } else {
+            HostKeyPolicy::AcceptNew
+        };
+        if let Err(error) = self.sessions.save_settings(settings.clone()) {
+            if let Some(form) = &mut self.settings_form {
+                form.error = Some(error);
+            }
+            return;
+        }
+        self.settings = settings.clone();
+        self.themes.set_active(&settings.theme);
+        self.theme = self.themes.active();
+        self.terminal
+            .update(cx, |view, cx| view.set_settings(settings, cx));
+        self.settings_form = None;
+        self.set_notice(
+            NoticeLevel::Success,
+            "Settings saved. Reload plugins to apply logging/highlighter changes.",
+        );
+        cx.notify();
+    }
+
+    fn open_palette(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme.clone();
+        let input = Self::make_input(&theme, "Type a command…", false, cx);
+        self.palette = Some(PaletteState { input, selected: 0 });
+        self.pending_focus = Some(PendingFocus::Palette);
+        cx.notify();
+    }
+
+    fn filtered_commands(&self, cx: &Context<Self>) -> Vec<Command> {
+        let Some(palette) = &self.palette else {
+            return Vec::new();
+        };
+        let query = palette.input.read(cx).value().trim().to_lowercase();
+        self.commands
+            .list()
+            .into_iter()
+            .filter(|command| {
+                query.is_empty()
+                    || command.title.to_lowercase().contains(&query)
+                    || command.category.to_lowercase().contains(&query)
+                    || command.id.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn execute_palette(&mut self, cx: &mut Context<Self>) {
+        let commands = self.filtered_commands(cx);
+        let index = self
+            .palette
+            .as_ref()
+            .map(|palette| palette.selected)
+            .unwrap_or(0)
+            .min(commands.len().saturating_sub(1));
+        if let Some(command) = commands.get(index) {
+            let id = command.id;
+            self.palette = None;
+            self.commands.run(id, &self.ctx);
+            self.sync(cx);
+        } else {
+            self.palette = None;
+        }
+        cx.notify();
+    }
+
+    fn refresh_plugins(&mut self) {
+        self.plugin_infos = self.kernel.plugins();
+    }
+
+    fn reload_highlighter(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.kernel.plugin_id_by_name("highlights") else {
+            return;
+        };
+        match self.kernel.reload(id) {
+            Ok(()) => {
+                if let Ok(highlights) = self.ctx.require::<Highlights>(services::HIGHLIGHTS) {
+                    let highlights = (*highlights).clone();
+                    self.highlights = highlights.clone();
+                    self.terminal.update(cx, |view, cx| {
+                        view.set_highlights(highlights, cx);
+                    });
+                    self.set_notice(NoticeLevel::Success, "Highlighter hot-reloaded.");
+                }
+            }
+            Err(error) => self.set_notice(NoticeLevel::Error, error.to_string()),
+        }
+        self.refresh_plugins();
+        cx.notify();
+    }
+
+    fn apply_pending_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_focus.take() else {
+            return;
+        };
+        let handle = match pending {
+            PendingFocus::Terminal => Some(self.terminal.read(cx).focus_handle()),
+            PendingFocus::Compose => Some(self.compose.read(cx).focus_handle_only()),
+            PendingFocus::Palette => self
+                .palette
+                .as_ref()
+                .map(|palette| palette.input.read(cx).focus_handle_only()),
+            PendingFocus::DialogName => self
+                .session_form
+                .as_ref()
+                .map(|form| form.name.read(cx).focus_handle_only()),
+            PendingFocus::DialogSecret => self
+                .session_form
+                .as_ref()
+                .map(|form| form.secret.read(cx).focus_handle_only()),
+        };
+        if let Some(handle) = handle {
+            window.focus(&handle);
+        }
+    }
+
+    fn global_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let control = keystroke.modifiers.control || keystroke.modifiers.platform;
+        let shift = keystroke.modifiers.shift;
+        if control && shift {
+            match keystroke.key.as_str() {
+                "p" => {
+                    self.open_palette(cx);
+                    cx.stop_propagation();
+                }
+                "t" => {
+                    self.open_session_dialog(None, cx);
+                    cx.stop_propagation();
+                }
+                "w" => {
+                    if let Some(id) = self.active {
+                        self.workspace.close(id);
+                        self.sync(cx);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }
+                "e" => {
+                    self.settings.compose_bar = true;
+                    self.pending_focus = Some(PendingFocus::Compose);
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                _ => {}
+            }
+        }
+        if keystroke.key == "escape" {
+            if self.palette.is_some() {
+                self.palette = None;
+                cx.notify();
+                cx.stop_propagation();
+            } else if self.session_form.is_some() {
+                self.close_session_dialog(cx);
+                cx.stop_propagation();
+            } else if self.settings_form.is_some() {
+                self.settings_form = None;
+                cx.notify();
+                cx.stop_propagation();
+            } else if self.plugins_panel {
+                self.plugins_panel = false;
+                cx.notify();
+                cx.stop_propagation();
+            }
+        }
+    }
+
+    fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        div()
+            .h(px(46.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .bg(rgbc(theme.panel))
+            .border_b_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.accent))
+                            .child("XCORD"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgbc(theme.muted))
+                            .child("plugin-first SSH"),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(self.header_button("Palette", cx, |this, cx| this.open_palette(cx)))
+            .child(self.header_button("Plugins", cx, |this, cx| {
+                this.plugins_panel = true;
+                this.refresh_plugins();
+                cx.notify();
+            }))
+            .child(self.header_button("Settings", cx, |this, cx| this.open_settings(cx)))
+    }
+
+    fn header_button(
+        &self,
+        label: &'static str,
+        cx: &mut Context<Self>,
+        handler: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let theme = self.theme();
+        let hover_bg = rgbc(theme.panel_alt);
+        div()
+            .id(button_id("header"))
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .text_size(px(11.))
+            .text_color(rgbc(theme.muted))
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_bg))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                handler(this, cx);
+            }))
+            .child(label)
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let sessions = self.filtered_sessions(cx);
+        let mut groups: BTreeMap<String, Vec<SessionProfile>> = BTreeMap::new();
+        for profile in sessions {
+            let group = if profile.group.trim().is_empty() {
+                "Sessions".to_string()
+            } else {
+                profile.group.clone()
+            };
+            groups.entry(group).or_default().push(profile);
+        }
+
+        let mut list = div()
+            .id("session-list")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .flex_1()
+            .overflow_y_scroll()
+            .px_2()
+            .pb_2();
+        if groups.is_empty() {
+            list = list.child(
+                div()
+                    .p_3()
+                    .text_size(px(11.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("No sessions match. Create one to get started."),
+            );
+        }
+        for (group, profiles) in groups {
+            list = list.child(
+                div()
+                    .px_2()
+                    .pt_3()
+                    .pb_1()
+                    .text_size(px(9.5))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.muted))
+                    .child(group.to_uppercase()),
+            );
+            for profile in profiles {
+                list = list.child(self.render_session_row(profile, cx));
+            }
+        }
+
+        div()
+            .w(px(self.settings.sidebar_width.max(200.0)))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgbc(theme.panel))
+            .border_r_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .h(px(34.))
+                            .px(px(10.))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .bg(rgbc(theme.panel_alt))
+                            .border_1()
+                            .border_color(rgbc(theme.border))
+                            .rounded_md()
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.key == "enter" {
+                                    this.connect_first_filtered(window, cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .child(self.search.clone()),
+                    )
+                    .child(primary_button("New session", theme).on_click(
+                        cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
+                    )),
+            )
+            .child(list)
+            .child(
+                div()
+                    .p_2()
+                    .border_t_1()
+                    .border_color(rgbc(theme.border))
+                    .flex()
+                    .gap_2()
+                    .child(
+                        small_button("Plugins", theme)
+                            .flex_1()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.plugins_panel = true;
+                                this.refresh_plugins();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        small_button("Settings", theme)
+                            .flex_1()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_settings(cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn render_session_row(&self, profile: SessionProfile, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let tab = self.tabs.iter().find(|tab| tab.profile_id == profile.id);
+        let active = tab.map(|tab| Some(tab.id) == self.active).unwrap_or(false);
+        let status_color = tab
+            .map(|tab| match &tab.status {
+                TabStatus::Connected => rgbc(theme.success),
+                TabStatus::Connecting => rgbc(theme.accent),
+                TabStatus::Failed(_) => rgbc(theme.danger),
+                TabStatus::Closed => rgbc(theme.muted),
+            })
+            .unwrap_or(rgba(theme.muted, 0.35));
+        let row_bg = if active {
+            rgbc(theme.panel_alt)
+        } else {
+            rgba(theme.panel_alt, 0.0)
+        };
+        let hover_bg = rgba(theme.accent, 0.1);
+        let id = profile.id.clone();
+        let edit_id = profile.id.clone();
+        let subtitle = if profile.user.is_empty() {
+            profile.host.clone()
+        } else {
+            format!("{}@{}", profile.user, profile.host)
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_md()
+            .bg(row_bg)
+            .child(
+                div()
+                    .id(SharedString::from(format!("session-{}", profile.id)))
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover_bg))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.connect_profile(id.clone(), window, cx);
+                    }))
+                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(status_color))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(rgbc(theme.foreground))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(profile.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgbc(theme.muted))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(subtitle),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("edit-{}", edit_id)))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(10.))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(move |style| style.text_color(rgbc(theme.accent)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_session_dialog(Some(edit_id.clone()), cx);
+                    }))
+                    .child("edit"),
+            )
+    }
+
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let mut tabs = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_1()
+            .overflow_hidden()
+            .px_2();
+        for tab in &self.tabs {
+            let active = Some(tab.id) == self.active;
+            let tab_id = tab.id;
+            let dot = match &tab.status {
+                TabStatus::Connected => rgbc(theme.success),
+                TabStatus::Connecting => rgbc(theme.accent),
+                TabStatus::Failed(_) => rgbc(theme.danger),
+                TabStatus::Closed => rgbc(theme.muted),
+            };
+            tabs = tabs.child(
+                div()
+                    .id(SharedString::from(format!("tab-{}", tab.id)))
+                    .h(px(34.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .rounded_md()
+                    .bg(if active {
+                        rgbc(theme.background)
+                    } else {
+                        rgba(theme.panel_alt, 0.0)
+                    })
+                    .border_1()
+                    .border_color(if active {
+                        rgbc(theme.border)
+                    } else {
+                        rgba(theme.border, 0.0)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.workspace.select(tab_id);
+                        this.pending_focus = Some(PendingFocus::Terminal);
+                        let _ = window;
+                        this.sync(cx);
+                        cx.notify();
+                    }))
+                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .max_w(px(180.))
+                            .text_size(px(12.))
+                            .text_color(if active {
+                                rgbc(theme.foreground)
+                            } else {
+                                rgbc(theme.muted)
+                            })
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(tab.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("close-{}", tab.id)))
+                            .px_1()
+                            .rounded_sm()
+                            .text_size(px(12.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.workspace.close(tab_id);
+                                this.sync(cx);
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    ),
+            );
+        }
+
+        div()
+            .h(px(42.))
+            .flex()
+            .items_center()
+            .bg(rgbc(theme.panel))
+            .border_b_1()
+            .border_color(rgbc(theme.border))
+            .child(tabs)
+            .child(
+                div()
+                    .id("new-tab")
+                    .px_3()
+                    .py_1()
+                    .mr_2()
+                    .rounded_md()
+                    .text_size(px(18.))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgbc(theme.accent)))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)))
+                    .child("+"),
+            )
+    }
+
+    fn render_compose(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let snippets = self.sessions.snippets();
+        let mut chips = div().flex().items_center().gap_1();
+        for snippet in snippets.iter().take(3) {
+            let command = snippet.command.clone();
+            let enter = snippet.send_enter;
+            chips = chips.child(
+                div()
+                    .id(SharedString::from(format!("snippet-{}", snippet.id)))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.send_snippet(&command, enter, cx);
+                    }))
+                    .child(snippet.name.clone()),
+            );
+        }
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .bg(rgbc(theme.panel))
+            .border_t_1()
+            .border_color(rgbc(theme.border))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "enter" {
+                    this.send_compose(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(34.))
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .rounded_md()
+                    .child(self.compose.clone()),
+            )
+            .child(
+                primary_button("Send", theme)
+                    .on_click(cx.listener(|this, _, window, cx| this.send_compose(window, cx))),
+            )
+            .child(chips)
+    }
+
+    fn render_status(&self, _cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let action = |this: &Self| {
+            if let Some(tab) = this
+                .active
+                .and_then(|id| this.tabs.iter().find(|tab| tab.id == id))
+            {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(match &tab.status {
+                        TabStatus::Connected => "connected",
+                        TabStatus::Connecting => "connecting",
+                        TabStatus::Closed => "closed",
+                        TabStatus::Failed(_) => "failed",
+                    })
+                    .child(format!("{}@{}", tab.user, tab.host))
+                    .child(
+                        this.workspace
+                            .dimensions(tab.id)
+                            .map(|(cols, rows)| format!("{cols}×{rows}"))
+                            .unwrap_or_default(),
+                    )
+                    .child(
+                        tab.host_key
+                            .as_ref()
+                            .map(|key| {
+                                let fingerprint = key.fingerprint.clone();
+                                let short =
+                                    fingerprint.strip_prefix("SHA256:").unwrap_or(&fingerprint);
+                                format!("SHA256:{}", &short[..short.len().min(22)])
+                            })
+                            .unwrap_or_else(|| "no host key".into()),
+                    )
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("ready")
+                    .child(format!(
+                        "{} plugins active",
+                        this.kernel.active_plugins().len()
+                    ))
+            }
+        };
+
+        div()
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .bg(rgbc(theme.panel))
+            .border_t_1()
+            .border_color(rgbc(theme.border))
+            .child(action(self))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("UTF-8")
+                    .child("xterm-256color")
+                    .child("Ctrl+Shift+P palette"),
+            )
+    }
+
+    fn render_welcome(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let recent = self.sessions.list().into_iter().take(4).collect::<Vec<_>>();
+        let mut recent_list = div().flex().flex_col().gap_2().w(px(420.));
+        for profile in recent {
+            let id = profile.id.clone();
+            recent_list = recent_list.child(
+                div()
+                    .id(SharedString::from(format!("recent-{}", profile.id)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .cursor_pointer()
+                    .hover(|style| style.border_color(rgbc(theme.accent)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.connect_profile(id.clone(), window, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(rgbc(theme.foreground))
+                                    .child(profile.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgbc(theme.muted))
+                                    .child(profile.endpoint()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.accent))
+                            .child("connect"),
+                    ),
+            );
+        }
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_5()
+            .bg(rgbc(theme.background))
+            .child(
+                div()
+                    .text_size(px(46.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.accent))
+                    .child("XCORD"),
+            )
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(rgbc(theme.muted))
+                    .child("An SSH workspace where everything is a plugin."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        primary_button("New session", theme).on_click(
+                            cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
+                        ),
+                    )
+                    .child(
+                        secondary_button("Command palette", theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.open_palette(cx))),
+                    )
+                    .child(
+                        secondary_button("Manage plugins", theme).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.plugins_panel = true;
+                                this.refresh_plugins();
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgbc(theme.muted))
+                    .child("SSH • terminal • compose • snippets • highlight • logging • themes"),
+            )
+            .child(recent_list)
+    }
+
+    fn render_main(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let active = self.active;
+        let mut main = div()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgbc(theme.background));
+        main = main.child(self.render_tab_bar(cx));
+        if active.is_some() {
+            main = main.child(div().flex_1().min_h(px(0.)).child(self.terminal.clone()));
+            if self.settings.compose_bar {
+                main = main.child(self.render_compose(cx));
+            }
+            main = main.child(self.render_status(cx));
+        } else {
+            main = main.child(self.render_welcome(cx));
+            main = main.child(self.render_status(cx));
+        }
+        main
+    }
+
+    fn render_session_dialog(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(form) = self.session_form.as_ref() else {
+            return div();
+        };
+        let editing = form.editing.is_some();
+        let auth = form.auth;
+        let save_secret = form.save_secret;
+        let logging = form.logging;
+        let error = form.error.clone();
+
+        let mut card = div()
+            .w(px(640.))
+            .bg(rgbc(theme.panel_alt))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .rounded_lg()
+            .shadow_lg()
+            .p(px(22.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    this.close_session_dialog(cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "enter" {
+                    this.submit_session(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child(if editing {
+                                "Edit session"
+                            } else {
+                                "New session"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("dialog-close")
+                            .px_2()
+                            .text_size(px(18.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_click(cx.listener(|this, _, _, cx| this.close_session_dialog(cx)))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("Credentials are stored in the OS keychain, never in config.toml."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(field("Name", form.name.clone(), theme).flex_1())
+                    .child(field("Group", form.group.clone(), theme).flex_1()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(field("Host", form.host.clone(), theme).flex_1())
+                    .child(field("Port", form.port.clone(), theme).w(px(100.)))
+                    .child(field("User", form.user.clone(), theme).w(px(170.))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        auth_chip("Password", auth == AuthMode::Password, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.session_form {
+                                    form.auth = AuthMode::Password;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        auth_chip("Private key", auth == AuthMode::PublicKey, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.session_form {
+                                    form.auth = AuthMode::PublicKey;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            );
+
+        if auth == AuthMode::Password {
+            card = card.child(field("Password", form.secret.clone(), theme));
+        } else {
+            card = card
+                .child(field("Private key file", form.key_path.clone(), theme))
+                .child(field(
+                    "Key passphrase (optional)",
+                    form.secret.clone(),
+                    theme,
+                ));
+        }
+
+        card = card
+            .child(
+                div()
+                    .flex()
+                    .gap_5()
+                    .child(
+                        checkbox(
+                            if auth == AuthMode::Password {
+                                "Save password in keychain"
+                            } else {
+                                "Save passphrase in keychain"
+                            },
+                            save_secret,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(form) = &mut this.session_form {
+                                form.save_secret = !form.save_secret;
+                            }
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        checkbox("Log this session", logging, theme).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                if let Some(form) = &mut this.session_form {
+                                    form.logging = !form.logging;
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(if error.is_some() {
+                                rgbc(theme.danger)
+                            } else {
+                                rgbc(theme.muted)
+                            })
+                            .child(error.unwrap_or_else(|| {
+                                "Host keys are verified with trust-on-first-use.".into()
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(secondary_button("Cancel", theme).on_click(
+                                cx.listener(|this, _, _, cx| this.close_session_dialog(cx)),
+                            ))
+                            .child(primary_button("Save & connect", theme).on_click(
+                                cx.listener(|this, _, window, cx| this.submit_session(window, cx)),
+                            )),
+                    ),
+            );
+
+        card
+    }
+
+    fn render_plugins_panel(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(380.))
+            .id("plugin-rows")
+            .overflow_y_scroll();
+        for plugin in &self.plugin_infos {
+            let color = match plugin.state {
+                PluginState::Active => rgbc(theme.success),
+                PluginState::Pending | PluginState::Loading => rgbc(theme.accent),
+                PluginState::Failed => rgbc(theme.danger),
+                _ => rgbc(theme.muted),
+            };
+            let is_highlighter = plugin.name == "Output Highlighter";
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgbc(theme.background))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(color))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgbc(theme.foreground))
+                                            .child(plugin.name),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(rgbc(theme.muted))
+                                            .child(format!(
+                                                "v{} · {}",
+                                                plugin.version,
+                                                plugin.state.label()
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgbc(theme.muted))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(if let Some(error) = &plugin.error {
+                                        error.clone()
+                                    } else if plugin.description.is_empty() {
+                                        plugin.id.to_string()
+                                    } else {
+                                        plugin.description.to_string()
+                                    }),
+                            ),
+                    )
+                    .child(if is_highlighter {
+                        secondary_button("Reload", theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.reload_highlighter(cx)))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .child("core")
+                            .into_any_element()
+                    }),
+            );
+        }
+
+        let diagnostics = self.kernel.diagnostics();
+        let mut log = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(150.))
+            .id("diagnostic-log")
+            .overflow_y_scroll();
+        for diagnostic in diagnostics.iter().rev().take(12) {
+            let color = match diagnostic.level {
+                xcord_cordis::DiagnosticLevel::Error => rgbc(theme.danger),
+                xcord_cordis::DiagnosticLevel::Warn => rgbc(theme.accent),
+                xcord_cordis::DiagnosticLevel::Info => rgbc(theme.muted),
+            };
+            log = log.child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(color)
+                    .child(format!("[{}] {}", diagnostic.level, diagnostic.message)),
+            );
+        }
+
+        let active = self
+            .plugin_infos
+            .iter()
+            .filter(|p| p.state == PluginState::Active)
+            .count();
+        div()
+            .w(px(760.))
+            .max_h(px(620.))
+            .bg(rgbc(theme.panel_alt))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .rounded_lg()
+            .shadow_lg()
+            .p(px(22.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child("Plugins"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgbc(theme.muted))
+                                    .child(format!(
+                                        "{} active / {} registered",
+                                        active,
+                                        self.plugin_infos.len()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("plugins-close")
+                                    .text_size(px(18.))
+                                    .text_color(rgbc(theme.muted))
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(rgbc(theme.danger)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.plugins_panel = false;
+                                        cx.notify();
+                                    }))
+                                    .child("×"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("Everything is a plugin. Unloading a service cascades to its dependents; effects run in reverse order."),
+            )
+            .child(rows)
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("Kernel diagnostics"),
+            )
+            .child(log)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.muted))
+                            .child("Highlighter reload is live. Core plugins restart with the app."),
+                    )
+                    .child(
+                        secondary_button("Reinitialize highlighter", theme).on_click(
+                            cx.listener(|this, _, _, cx| this.reload_highlighter(cx)),
+                        ),
+                    ),
+            )
+    }
+
+    fn render_settings_panel(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(form) = self.settings_form.as_ref() else {
+            return div();
+        };
+        let themes = self.themes.themes();
+        let mut cards = div().flex().gap_2();
+        for candidate in &themes {
+            let selected = candidate.id == form.theme_id;
+            let id = candidate.id.to_string();
+            cards = cards.child(
+                div()
+                    .id(SharedString::from(format!("theme-{}", candidate.id)))
+                    .flex_1()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(rgb_u32(candidate.background)))
+                    .border_2()
+                    .border_color(if selected {
+                        rgbc(theme.accent)
+                    } else {
+                        rgbc(theme.border)
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(form) = &mut this.settings_form {
+                            form.theme_id = id.clone();
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(rgb_u32(candidate.foreground)))
+                            .child(candidate.name),
+                    ),
+            );
+        }
+
+        let error = form.error.clone();
+        div()
+            .w(px(620.))
+            .bg(rgbc(theme.panel_alt))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .rounded_lg()
+            .shadow_lg()
+            .p(px(22.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    this.settings_form = None;
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child("Settings"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-close")
+                            .text_size(px(18.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.settings_form = None;
+                                cx.notify();
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgbc(theme.muted))
+                    .child("Theme"),
+            )
+            .child(cards)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgbc(theme.foreground))
+                            .child("Font size"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(small_button("−", theme).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    if let Some(form) = &mut this.settings_form {
+                                        form.font_size = (form.font_size - 1.0).clamp(9.0, 28.0);
+                                    }
+                                    cx.notify();
+                                },
+                            )))
+                            .child(
+                                div()
+                                    .w(px(44.))
+                                    .text_size(px(12.))
+                                    .text_color(rgbc(theme.foreground))
+                                    .child(format!("{:.0}", form.font_size)),
+                            )
+                            .child(small_button("+", theme).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    if let Some(form) = &mut this.settings_form {
+                                        form.font_size = (form.font_size + 1.0).clamp(9.0, 28.0);
+                                    }
+                                    cx.notify();
+                                },
+                            ))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .child(
+                        checkbox("Copy on select", form.copy_on_select, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.copy_on_select = !form.copy_on_select;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        checkbox("Compose bar", form.compose_bar, theme).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.compose_bar = !form.compose_bar;
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        checkbox("Strict host keys", form.strict_host_keys, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.strict_host_keys = !form.strict_host_keys;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .child(
+                        checkbox("Session logging", form.logging, theme).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.logging = !form.logging;
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        checkbox("Output highlighting", form.highlight, theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.highlight = !form.highlight;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(if error.is_some() {
+                        rgbc(theme.danger)
+                    } else {
+                        rgbc(theme.muted)
+                    })
+                    .child(error.unwrap_or_else(|| {
+                        "Changes apply live. Some plugin options need a plugin reload.".into()
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(secondary_button("Cancel", theme).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.settings_form = None;
+                            cx.notify();
+                        },
+                    )))
+                    .child(
+                        primary_button("Save", theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_settings(cx))),
+                    ),
+            )
+    }
+
+    fn render_palette(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(palette) = self.palette.as_ref() else {
+            return div();
+        };
+        let commands = self.filtered_commands(cx);
+        let selected = palette.selected.min(commands.len().saturating_sub(1));
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(360.))
+            .id("palette-rows")
+            .overflow_y_scroll()
+            .p_1();
+        for (index, command) in commands.iter().enumerate() {
+            let id = command.id;
+            let is_selected = index == selected;
+            rows = rows.child(
+                div()
+                    .id(SharedString::from(format!("command-{}", command.id)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(if is_selected {
+                        rgba(theme.accent, 0.16)
+                    } else {
+                        rgba(theme.panel_alt, 0.0)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(theme.accent, 0.1)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.palette = None;
+                        this.commands.run(id, &this.ctx);
+                        this.sync(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgbc(theme.foreground))
+                                    .child(command.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(rgbc(theme.muted))
+                                    .child(command.category.to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.muted))
+                            .child(command.shortcut.unwrap_or("").to_string()),
+                    ),
+            );
+        }
+        if commands.is_empty() {
+            rows = rows.child(
+                div()
+                    .p_4()
+                    .text_size(px(11.))
+                    .text_color(rgbc(theme.muted))
+                    .child("No matching commands."),
+            );
+        }
+
+        div()
+            .w(px(640.))
+            .bg(rgbc(theme.panel_alt))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .rounded_lg()
+            .shadow_lg()
+            .p(px(12.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        this.palette = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    "up" => {
+                        if let Some(palette) = &mut this.palette {
+                            palette.selected = palette.selected.saturating_sub(1);
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    "down" => {
+                        if let Some(palette) = &mut this.palette {
+                            palette.selected = palette.selected.saturating_add(1);
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                    "enter" => {
+                        this.execute_palette(cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .child(
+                div()
+                    .bg(rgbc(theme.background))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .rounded_md()
+                    .child(palette.input.clone()),
+            )
+            .child(rows)
+            .child(
+                div()
+                    .px_2()
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("↑↓ navigate · Enter run · Esc close"),
+            )
+    }
+
+    fn render_notice(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme();
+        let Some(notice) = self.notice.as_ref() else {
+            return div().into_any_element();
+        };
+        let color = match notice.level {
+            NoticeLevel::Info => theme.accent,
+            NoticeLevel::Warning => theme.accent,
+            NoticeLevel::Error => theme.danger,
+            NoticeLevel::Success => theme.success,
+        };
+        div()
+            .absolute()
+            .bottom(px(36.))
+            .right(px(18.))
+            .w(px(380.))
+            .p_3()
+            .rounded_md()
+            .bg(rgbc(theme.panel_alt))
+            .border_1()
+            .border_color(rgbc(color))
+            .id("notice-card")
+            .shadow_lg()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.notice = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgbc(theme.foreground))
+                    .child(notice.message.clone()),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for XcordApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync(cx);
+        self.apply_pending_focus(window, cx);
+
+        if let Some(notice) = &self.notice {
+            if notice.at.elapsed() > Duration::from_secs(6) {
+                self.notice = None;
+            }
+        }
+
+        let theme = self.theme().clone();
+        let mut root = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .relative()
+            .bg(rgbc(theme.background))
+            .text_color(rgbc(theme.foreground))
+            .font(ui_font())
+            .text_size(px(13.))
+            .on_key_down(cx.listener(Self::global_key))
+            .child(self.render_header(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .child(self.render_sidebar(cx))
+                    .child(self.render_main(cx)),
+            );
+
+        if self.session_form.is_some() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba([0, 0, 0], 0.55))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .child(self.render_session_dialog(cx)),
+            );
+        }
+        if self.plugins_panel {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba([0, 0, 0], 0.55))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .child(self.render_plugins_panel(cx)),
+            );
+        }
+        if self.settings_form.is_some() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba([0, 0, 0], 0.55))
+                    .flex()
+                    .justify_center()
+                    .items_center()
+                    .child(self.render_settings_panel(cx)),
+            );
+        }
+        if self.palette.is_some() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba([0, 0, 0], 0.35))
+                    .flex()
+                    .justify_center()
+                    .pt(px(90.))
+                    .child(self.render_palette(cx)),
+            );
+        }
+        root = root.child(self.render_notice(cx));
+        root
+    }
+}
+
+impl Drop for XcordApp {
+    fn drop(&mut self) {
+        self.kernel.shutdown();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small style helpers
+
+fn ui_font() -> Font {
+    if cfg!(windows) {
+        gpui::font("Segoe UI")
+    } else if cfg!(target_os = "macos") {
+        gpui::font("SF Pro Text")
+    } else {
+        gpui::font("Inter")
+    }
+}
+
+fn rgbc(color: [u8; 3]) -> Rgba {
+    rgb(rgb_u32(color))
+}
+
+fn rgb_u32(color: [u8; 3]) -> u32 {
+    ((color[0] as u32) << 16) | ((color[1] as u32) << 8) | color[2] as u32
+}
+
+fn rgba(color: [u8; 3], alpha: f32) -> Rgba {
+    gpui::rgba((rgb_u32(color) << 8) | (alpha.clamp(0.0, 1.0) * 255.0) as u32)
+}
+
+fn input_colors(theme: &Theme) -> (Hsla, Hsla, Hsla, Hsla) {
+    (
+        rgbc(theme.foreground).into(),
+        rgba(theme.muted, 0.75).into(),
+        rgba(theme.accent, 0.28).into(),
+        rgbc(theme.cursor).into(),
+    )
+}
+
+fn primary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+    let bg = rgbc(theme.accent);
+    let fg = rgbc(theme.background);
+    div()
+        .id(button_id("primary"))
+        .h(px(32.))
+        .px_3()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .bg(bg)
+        .text_color(fg)
+        .text_size(px(11.5))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .cursor_pointer()
+        .hover(|style| style.opacity(0.88))
+        .child(label)
+}
+
+fn secondary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(button_id("secondary"))
+        .h(px(32.))
+        .px_3()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .bg(rgbc(theme.panel_alt))
+        .border_1()
+        .border_color(rgbc(theme.border))
+        .text_color(rgbc(theme.foreground))
+        .text_size(px(11.5))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgbc(theme.background)))
+        .child(label)
+}
+
+fn small_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(button_id("small"))
+        .h(px(28.))
+        .px_2()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .bg(rgbc(theme.panel_alt))
+        .border_1()
+        .border_color(rgbc(theme.border))
+        .text_color(rgbc(theme.muted))
+        .text_size(px(10.5))
+        .cursor_pointer()
+        .hover(|style| style.text_color(rgbc(theme.foreground)))
+        .child(label)
+}
+
+fn checkbox(label: &'static str, checked: bool, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(button_id("check"))
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(14.))
+                .h(px(14.))
+                .rounded_sm()
+                .border_1()
+                .border_color(if checked {
+                    rgbc(theme.accent)
+                } else {
+                    rgbc(theme.border)
+                })
+                .bg(if checked {
+                    rgbc(theme.accent)
+                } else {
+                    rgbc(theme.background)
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(10.))
+                .text_color(rgbc(theme.background))
+                .child(if checked { "✓" } else { "" }),
+        )
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(rgbc(theme.muted))
+                .child(label),
+        )
+}
+
+fn button_id(prefix: &str) -> SharedString {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    SharedString::from(format!("{prefix}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
+fn field(label: &'static str, input: Entity<TextInput>, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .min_w(px(0.))
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgbc(theme.muted))
+                .child(label),
+        )
+        .child(
+            div()
+                .bg(rgbc(theme.background))
+                .border_1()
+                .border_color(rgbc(theme.border))
+                .rounded_md()
+                .child(input),
+        )
+}
+
+fn auth_chip(label: &'static str, selected: bool, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(button_id("auth"))
+        .h(px(28.))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded_md()
+        .bg(if selected {
+            rgba(theme.accent, 0.18)
+        } else {
+            rgbc(theme.background)
+        })
+        .border_1()
+        .border_color(if selected {
+            rgbc(theme.accent)
+        } else {
+            rgbc(theme.border)
+        })
+        .text_color(if selected {
+            rgbc(theme.accent)
+        } else {
+            rgbc(theme.muted)
+        })
+        .text_size(px(10.5))
+        .cursor_pointer()
+        .child(label)
+}

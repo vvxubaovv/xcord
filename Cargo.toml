@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cordis",
+    "crates/plugin-api",
+    "crates/vt",
+    "crates/ssh",
+    "crates/store",
+    "crates/plugins",
+    "apps/xcord",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/xcord"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+crossbeam-channel = "0.5"
+futures = "0.3"
+log = "0.4"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
+vte = "0.15"

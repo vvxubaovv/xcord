@@ -1,0 +1,17 @@
+[package]
+name = "xcord"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui = "0.2.2"
+xcord-cordis = { path = "../../crates/cordis" }
+xcord-plugin-api = { path = "../../crates/plugin-api" }
+xcord-builtins = { path = "../../crates/plugins" }
+xcord-store = { path = "../../crates/store" }
+xcord-vt = { path = "../../crates/vt" }
+async-channel = "2"
+env_logger = "0.11"
+log.workspace = true
+tokio.workspace = true
+unicode-segmentation = "1"

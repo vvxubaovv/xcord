@@ -1,0 +1,15 @@
+[package]
+name = "xcord-plugin-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xcord-cordis = { path = "../cordis" }
+xcord-vt = { path = "../vt" }
+xcord-store = { path = "../store" }
+async-channel = "2"
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "xcord-vt"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vte.workspace = true
+unicode-width.workspace = true
+serde.workspace = true
