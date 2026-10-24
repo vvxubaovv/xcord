@@ -82,6 +82,14 @@ pub struct OpenRequest {
     pub rows: u16,
 }
 
+/// Result of a connection test that does not create a tab.
+#[derive(Clone, Debug)]
+pub struct ConnectionTest {
+    pub id: u64,
+    pub ok: bool,
+    pub message: String,
+}
+
 /// Events broadcast to any number of views (tabs, overview grid, logger).
 #[derive(Clone, Debug)]
 pub enum WorkspaceEvent {
@@ -92,6 +100,7 @@ pub enum WorkspaceEvent {
     StatusChanged(TerminalId),
     Bell(TerminalId),
     Closed(TerminalId),
+    TestFinished(ConnectionTest),
     Notice {
         level: crate::ui::NoticeLevel,
         message: String,
@@ -111,6 +120,9 @@ pub trait WorkspaceService {
     fn open(&self, request: OpenRequest) -> Result<TerminalId, String>;
     fn close(&self, id: TerminalId);
     fn reconnect(&self, id: TerminalId) -> Result<TerminalId, String>;
+    /// Verify a profile without opening a tab. The result arrives as
+    /// [`WorkspaceEvent::TestFinished`] with the returned id.
+    fn test_connection(&self, request: OpenRequest) -> Result<u64, String>;
 
     fn write(&self, id: TerminalId, data: &[u8]);
     fn resize(&self, id: TerminalId, cols: u16, rows: u16);

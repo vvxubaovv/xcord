@@ -12,14 +12,14 @@ use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
     div, px, rgb, Context, Div, Entity, Font, Hsla, KeyDownEvent, MouseButton, Render, Rgba,
-    SharedString, Window,
+    SharedString, Stateful, Window,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
 use xcord_plugin_api::{
-    services, Ai, AiMessageView, AiSnapshot, Command, Commands, Highlights, McpStatus, NoticeLevel,
-    OpenRequest, Runtime, Sessions, TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand,
-    UiHost, Workspace, WorkspaceEvent,
+    services, Ai, AiMessageView, AiSnapshot, Command, Commands, ConnectionTest, Highlights,
+    McpStatus, NoticeLevel, OpenRequest, Runtime, Sessions, TabInfo, TabStatus, TerminalId, Theme,
+    Themes, Ui, UiCommand, UiHost, Workspace, WorkspaceEvent,
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings};
 
@@ -121,6 +121,9 @@ pub struct XcordApp {
     session_form: Option<SessionForm>,
     settings_form: Option<SettingsForm>,
     ai_config: Option<AiConfigForm>,
+    test_id: Option<u64>,
+    test_result: Option<ConnectionTest>,
+    test_pending: bool,
     palette: Option<PaletteState>,
     plugins_panel: bool,
     ai_open: bool,
@@ -222,6 +225,9 @@ impl XcordApp {
             session_form: None,
             settings_form: None,
             ai_config: None,
+            test_id: None,
+            test_result: None,
+            test_pending: false,
             palette: None,
             plugins_panel: false,
             ai_open: false,
@@ -386,6 +392,12 @@ impl XcordApp {
                     self.terminal.update(cx, |_, cx| cx.notify());
                 }
             }
+            WorkspaceEvent::TestFinished(result) => {
+                if self.test_id == Some(result.id) {
+                    self.test_pending = false;
+                    self.test_result = Some(result);
+                }
+            }
             WorkspaceEvent::TabsChanged
             | WorkspaceEvent::ActiveChanged(_)
             | WorkspaceEvent::Closed(_) => {}
@@ -495,13 +507,46 @@ impl XcordApp {
             logging: profile.logging,
             error: None,
         });
+        self.test_id = None;
+        self.test_result = None;
+        self.test_pending = false;
         self.pending_focus = Some(PendingFocus::DialogName);
         cx.notify();
     }
 
     fn close_session_dialog(&mut self, cx: &mut Context<Self>) {
         self.session_form = None;
+        self.test_id = None;
+        self.test_result = None;
+        self.test_pending = false;
         self.pending_focus = Some(PendingFocus::Terminal);
+        cx.notify();
+    }
+
+    fn focus_session_next(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = self.session_form.as_ref() else {
+            return;
+        };
+        let mut handles = vec![
+            form.name.read(cx).focus_handle_only(),
+            form.group.read(cx).focus_handle_only(),
+            form.host.read(cx).focus_handle_only(),
+            form.port.read(cx).focus_handle_only(),
+            form.user.read(cx).focus_handle_only(),
+        ];
+        if form.auth == AuthMode::Password {
+            handles.push(form.secret.read(cx).focus_handle_only());
+        } else {
+            handles.push(form.key_path.read(cx).focus_handle_only());
+        }
+        let current = handles.iter().position(|handle| handle.is_focused(window));
+        let next = match (current, reverse) {
+            (Some(index), false) => (index + 1) % handles.len(),
+            (Some(index), true) => (index + handles.len() - 1) % handles.len(),
+            (None, false) => 0,
+            (None, true) => handles.len() - 1,
+        };
+        window.focus(&handles[next]);
         cx.notify();
     }
 
@@ -629,6 +674,119 @@ impl XcordApp {
                     form.error = Some(error.clone());
                 }
                 self.set_notice(NoticeLevel::Error, error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn session_test_request(&self, cx: &Context<Self>) -> std::result::Result<OpenRequest, String> {
+        let Some(form) = self.session_form.as_ref() else {
+            return Err("No session form is open.".into());
+        };
+        let name = form.name.read(cx).value().trim().to_string();
+        let host = form.host.read(cx).value().trim().to_string();
+        let port_text = form.port.read(cx).value().trim().to_string();
+        let user = form.user.read(cx).value().trim().to_string();
+        let secret = form.secret.read(cx).value().to_string();
+        let key_path = form.key_path.read(cx).value().trim().to_string();
+        let auth = form.auth;
+        let save_secret = form.save_secret;
+        let logging = form.logging;
+        let group = form.group.read(cx).value().trim().to_string();
+        let editing = form.editing.clone();
+
+        if host.is_empty() {
+            return Err("Host is required.".into());
+        }
+        let port = port_text
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| "Port must be a number between 1 and 65535.".to_string())?;
+        if auth == AuthMode::PublicKey && key_path.is_empty() {
+            return Err("Choose a private key file.".into());
+        }
+
+        let existing = editing.as_ref().and_then(|id| self.sessions.get(id));
+        let mut profile = existing
+            .clone()
+            .unwrap_or_else(|| SessionProfile::new(if name.is_empty() { &host } else { &name }));
+        profile.name = if name.is_empty() { host.clone() } else { name };
+        profile.host = host;
+        profile.port = port;
+        profile.user = user;
+        profile.group = if group.is_empty() {
+            "Sessions".into()
+        } else {
+            group
+        };
+        profile.logging = logging;
+        profile.auth = match auth {
+            AuthMode::Password => AuthKind::Password {
+                save: save_secret,
+                secret_id: existing
+                    .as_ref()
+                    .and_then(|profile| match &profile.auth {
+                        AuthKind::Password { secret_id, .. } => secret_id.clone(),
+                        _ => None,
+                    })
+                    .or_else(|| Some(format!("session:{}:password", profile.id))),
+            },
+            AuthMode::PublicKey => AuthKind::PublicKey {
+                path: key_path,
+                save_passphrase: save_secret,
+                secret_id: existing.as_ref().and_then(|profile| match &profile.auth {
+                    AuthKind::PublicKey { secret_id, .. } => secret_id.clone(),
+                    _ => None,
+                }),
+            },
+        };
+        let credential = if secret.is_empty() {
+            match auth {
+                AuthMode::Password => self.sessions.password(&profile),
+                AuthMode::PublicKey => self.sessions.passphrase(&profile),
+            }
+        } else {
+            Some(secret)
+        };
+        if auth == AuthMode::Password && credential.is_none() {
+            return Err("Enter a password to test this session.".into());
+        }
+        Ok(OpenRequest {
+            profile,
+            credential,
+            cols: 80,
+            rows: 24,
+        })
+    }
+
+    fn test_session(&mut self, cx: &mut Context<Self>) {
+        if self.test_pending {
+            return;
+        }
+        let request = match self.session_test_request(cx) {
+            Ok(request) => request,
+            Err(error) => {
+                if let Some(form) = &mut self.session_form {
+                    form.error = Some(error);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        match self.workspace.test_connection(request) {
+            Ok(id) => {
+                self.test_id = Some(id);
+                self.test_result = None;
+                self.test_pending = true;
+                if let Some(form) = &mut self.session_form {
+                    form.error = None;
+                }
+            }
+            Err(error) => {
+                if let Some(form) = &mut self.session_form {
+                    form.error = Some(error);
+                }
             }
         }
         cx.notify();
@@ -2248,6 +2406,21 @@ impl XcordApp {
         let save_secret = form.save_secret;
         let logging = form.logging;
         let error = form.error.clone();
+        let (status_text, status_color) = if let Some(error) = error {
+            (error, theme.danger)
+        } else if self.test_pending {
+            ("Testing connection…".to_string(), theme.accent)
+        } else if let Some(test) = self.test_result.as_ref() {
+            (
+                test.message.clone(),
+                if test.ok { theme.success } else { theme.danger },
+            )
+        } else {
+            (
+                "Host keys are verified with trust-on-first-use.".to_string(),
+                theme.muted,
+            )
+        };
 
         let mut card = div()
             .w(px(640.))
@@ -2261,11 +2434,18 @@ impl XcordApp {
             .flex_col()
             .gap_3()
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "escape" {
+                if event.keystroke.key == "tab" {
+                    this.focus_session_next(event.keystroke.modifiers.shift, window, cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "escape" {
                     this.close_session_dialog(cx);
                     cx.stop_propagation();
                 } else if event.keystroke.key == "enter" {
-                    this.submit_session(window, cx);
+                    if event.keystroke.modifiers.control {
+                        this.test_session(cx);
+                    } else {
+                        this.submit_session(window, cx);
+                    }
                     cx.stop_propagation();
                 }
             }))
@@ -2404,19 +2584,17 @@ impl XcordApp {
                     .child(
                         div()
                             .text_size(px(10.5))
-                            .text_color(if error.is_some() {
-                                rgbc(theme.danger)
-                            } else {
-                                rgbc(theme.muted)
-                            })
-                            .child(error.unwrap_or_else(|| {
-                                "Host keys are verified with trust-on-first-use.".into()
-                            })),
+                            .text_color(rgbc(status_color))
+                            .child(status_text),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_2()
+                            .child(secondary_button("Test connection", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.test_session(cx)),
+                            ))
                             .child(secondary_button("Cancel", theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.close_session_dialog(cx)),
@@ -3067,87 +3245,31 @@ impl Render for XcordApp {
             .font(ui_font())
             .text_size(px(13.))
             .on_key_down(cx.listener(Self::global_key))
-            .child(self.render_header(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .flex()
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_main(cx))
-                    .when(self.ai_open, |body| body.child(self.render_ai_panel(cx))),
-            );
-
-        if self.session_form.is_some() {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .bg(rgba([0, 0, 0], 0.55))
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .child(self.render_session_dialog(cx)),
-            );
-        }
-        if self.plugins_panel {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .bg(rgba([0, 0, 0], 0.55))
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .child(self.render_plugins_panel(cx)),
-            );
-        }
-        if self.settings_form.is_some() {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .bg(rgba([0, 0, 0], 0.55))
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .child(self.render_settings_panel(cx)),
-            );
-        }
-        if self.ai_config.is_some() {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .bg(rgba([0, 0, 0], 0.55))
-                    .flex()
-                    .justify_center()
-                    .items_center()
-                    .child(self.render_ai_config(cx)),
-            );
-        }
-        if self.palette.is_some() {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .bg(rgba([0, 0, 0], 0.35))
-                    .flex()
-                    .justify_center()
-                    .pt(px(90.))
-                    .child(self.render_palette(cx)),
-            );
-        }
+            .child(self.render_header(cx));
+        let body = div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .child(self.render_sidebar(cx))
+            .child(self.render_main(cx))
+            .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
+        let content = if self.session_form.is_some() {
+            // Keep dialogs in normal layout flow. Absolute overlays in this
+            // GPUI version paint correctly but their children miss mouse
+            // hit-testing, which made fields and Test/Save buttons dead.
+            modal_shell(self.render_session_dialog(cx))
+        } else if self.settings_form.is_some() {
+            modal_shell(self.render_settings_panel(cx))
+        } else if self.ai_config.is_some() {
+            modal_shell(self.render_ai_config(cx))
+        } else if self.plugins_panel {
+            modal_shell(self.render_plugins_panel(cx))
+        } else if self.palette.is_some() {
+            palette_shell(self.render_palette(cx))
+        } else {
+            body
+        };
+        root = root.child(content);
         root = root.child(self.render_notice(cx));
         root
     }
@@ -3161,6 +3283,29 @@ impl Drop for XcordApp {
 
 // ---------------------------------------------------------------------------
 // Small style helpers
+
+fn modal_shell(content: Div) -> Div {
+    div()
+        .flex_1()
+        .min_h(px(0.))
+        .flex()
+        .justify_center()
+        .items_center()
+        .bg(rgba([0, 0, 0], 0.55))
+        .child(content)
+}
+
+fn palette_shell(content: Div) -> Div {
+    div()
+        .flex_1()
+        .min_h(px(0.))
+        .flex()
+        .justify_center()
+        .items_start()
+        .pt(px(90.))
+        .bg(rgba([0, 0, 0], 0.35))
+        .child(content)
+}
 
 fn render_ai_message(message: &AiMessageView, theme: &Theme) -> Div {
     let is_tool = message.role.starts_with("Tool");
@@ -3256,10 +3401,11 @@ fn input_colors(theme: &Theme) -> (Hsla, Hsla, Hsla, Hsla) {
     )
 }
 
-fn primary_button(label: &'static str, theme: &Theme) -> Div {
+fn primary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
     let bg = rgbc(theme.accent);
     let fg = rgbc(theme.background);
     div()
+        .id(SharedString::from(format!("primary-{label}")))
         .h(px(32.))
         .px_3()
         .flex()
@@ -3275,8 +3421,9 @@ fn primary_button(label: &'static str, theme: &Theme) -> Div {
         .child(label)
 }
 
-fn secondary_button(label: &'static str, theme: &Theme) -> Div {
+fn secondary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
     div()
+        .id(SharedString::from(format!("secondary-{label}")))
         .h(px(32.))
         .px_3()
         .flex()
@@ -3293,8 +3440,9 @@ fn secondary_button(label: &'static str, theme: &Theme) -> Div {
         .child(label)
 }
 
-fn small_button(label: &'static str, theme: &Theme) -> Div {
+fn small_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
     div()
+        .id(SharedString::from(format!("small-{label}")))
         .h(px(28.))
         .px_2()
         .flex()
@@ -3311,8 +3459,9 @@ fn small_button(label: &'static str, theme: &Theme) -> Div {
         .child(label)
 }
 
-fn checkbox(label: &'static str, checked: bool, theme: &Theme) -> Div {
+fn checkbox(label: &'static str, checked: bool, theme: &Theme) -> Stateful<Div> {
     div()
+        .id(SharedString::from(format!("check-{label}")))
         .flex()
         .items_center()
         .gap_2()
@@ -3370,8 +3519,9 @@ fn field(label: &'static str, input: Entity<TextInput>, theme: &Theme) -> Div {
         )
 }
 
-fn auth_chip(label: &'static str, selected: bool, theme: &Theme) -> Div {
+fn auth_chip(label: &'static str, selected: bool, theme: &Theme) -> Stateful<Div> {
     div()
+        .id(SharedString::from(format!("auth-{label}")))
         .h(px(28.))
         .px_3()
         .flex()

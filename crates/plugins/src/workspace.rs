@@ -6,10 +6,10 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use xcord_cordis::{Context, Plugin, PluginMeta, Result};
 use xcord_plugin_api::{
-    services, AuthRequest, Command, Commands, ConnectSpec, HostKeySummary, OpenRequest, Runtime,
-    RuntimeHandle, SessionService, Sessions, TabInfo, TabStatus, TerminalId, Transport,
-    TransportEvent, TransportRegistry, Transports, Ui, UiCommand, Workspace, WorkspaceEvent,
-    WorkspaceService,
+    services, AuthRequest, Command, Commands, ConnectSpec, ConnectionTest, HostKeySummary,
+    OpenRequest, Runtime, RuntimeHandle, SessionService, Sessions, TabInfo, TabStatus, TerminalId,
+    Transport, TransportEvent, TransportRegistry, Transports, Ui, UiCommand, Workspace,
+    WorkspaceEvent, WorkspaceService,
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile};
 use xcord_vt::Terminal;
@@ -196,6 +196,7 @@ pub struct WorkspaceState {
     tabs: RefCell<Vec<TabState>>,
     active: Cell<Option<TerminalId>>,
     next_id: Cell<u64>,
+    next_test_id: Cell<u64>,
     events: broadcast::Sender<WorkspaceEvent>,
 }
 
@@ -214,6 +215,7 @@ impl WorkspaceState {
             tabs: RefCell::new(Vec::new()),
             active: Cell::new(None),
             next_id: Cell::new(0),
+            next_test_id: Cell::new(0),
             events: broadcast::channel(2048).0,
         }
     }
@@ -283,6 +285,53 @@ impl WorkspaceState {
                 == HostKeyPolicy::AcceptNew,
             known_hosts: None,
         })
+    }
+
+    fn test_connection_impl(&self, request: OpenRequest) -> std::result::Result<u64, String> {
+        let spec = self.build_spec(&request.profile, request.credential.as_deref(), 80, 24)?;
+        let provider = self
+            .transports
+            .get("ssh")
+            .ok_or_else(|| "SSH transport is not loaded.".to_string())?;
+        let (sender, receiver) = async_channel::bounded(16);
+        provider.connect(spec, sender)?;
+
+        let id = self.next_test_id.get() + 1;
+        self.next_test_id.set(id);
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            let outcome = loop {
+                let event =
+                    match tokio::time::timeout(Duration::from_secs(25), receiver.recv()).await {
+                        Ok(Ok(event)) => event,
+                        Ok(Err(_)) => {
+                            break Err("connection closed before the handshake finished".into())
+                        }
+                        Err(_) => break Err("connection timed out after 25s".into()),
+                    };
+                match event {
+                    TransportEvent::Connected { transport, info } => {
+                        transport.close();
+                        break Ok(format!(
+                            "Connected to {} ({}) · {} · {}",
+                            info.server,
+                            info.kind,
+                            info.host_key.algorithm,
+                            info.host_key.fingerprint
+                        ));
+                    }
+                    TransportEvent::Error(message) => break Err(message),
+                    TransportEvent::Closed { reason, .. } => break Err(reason),
+                    TransportEvent::Output(_) => {}
+                }
+            };
+            let _ = events.send(WorkspaceEvent::TestFinished(ConnectionTest {
+                id,
+                ok: outcome.is_ok(),
+                message: outcome.unwrap_or_else(|error| error),
+            }));
+        });
+        Ok(id)
     }
 
     fn open_impl(&self, request: OpenRequest) -> std::result::Result<TerminalId, String> {
@@ -693,6 +742,10 @@ impl WorkspaceService for WorkspaceState {
 
     fn reconnect(&self, id: TerminalId) -> std::result::Result<TerminalId, String> {
         self.reconnect_impl(id)
+    }
+
+    fn test_connection(&self, request: OpenRequest) -> std::result::Result<u64, String> {
+        self.test_connection_impl(request)
     }
 
     fn write(&self, id: TerminalId, data: &[u8]) {

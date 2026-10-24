@@ -162,12 +162,14 @@ Notable contracts:
 - `TransportProvider` — `connect(spec, events) -> Result<()>`; must return
   immediately and report progress through the channel.
 - `Transport` — `Send` handle with `write`, `resize`, `close`.
-- `WorkspaceService` — tabs, open/close/reconnect, write/resize, snapshot,
-  scroll, selection text, broadcast events.
+- `WorkspaceService` — tabs, open/close/reconnect, **connection tests without a
+  tab**, write/resize, snapshot, scroll, selection text, broadcast events.
 - `UiHost` — semantic commands (`NewSession`, `OpenPalette`, `Notify`, ...).
   Plugins never construct widgets.
 - `CommandRegistry` — command handlers receive `&Context`; registration effects
   remove them on unload.
+- `WorkspaceEvent::TestFinished` carries a `ConnectionTest` result from a
+  short-lived transport that is closed after the handshake.
 - `HighlightService` — byte spans with colors, queried by the renderer per row.
 - `McpToolRegistry` / `McpResourceRegistry` — names, JSON schemas, read-only
   hints and UI-thread handlers; the shared capability surface for external MCP

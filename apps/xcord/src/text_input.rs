@@ -4,6 +4,7 @@
 //! composition on other platforms) is routed through the platform input stack.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::*;
 use gpui::{
@@ -14,9 +15,12 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+static NEXT_TEXT_INPUT: AtomicU64 = AtomicU64::new(1);
+
 /// Simple styled single-line input.
 pub struct TextInput {
     focus_handle: FocusHandle,
+    element_id: SharedString,
     content: String,
     placeholder: SharedString,
     selected_range: Range<usize>,
@@ -44,6 +48,11 @@ impl TextInput {
     ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            element_id: format!(
+                "text-input-{}",
+                NEXT_TEXT_INPUT.fetch_add(1, Ordering::Relaxed)
+            )
+            .into(),
             content: String::new(),
             placeholder: placeholder.into(),
             selected_range: 0..0,
@@ -333,7 +342,16 @@ impl TextInput {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, window: &mut Window, _: &mut Context<Self>) {
+        // Focus on mouse-up as well as mouse-down. Some GPUI/Windows paths
+        // deliver the up event when the window is activated but not the down
+        // event, which made every field except the initially-focused one
+        // impossible to click into.
+        window.focus(&self.focus_handle);
+        self.is_selecting = false;
+    }
+
+    fn on_mouse_up_out(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
     }
 
@@ -396,7 +414,7 @@ impl TextInput {
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .id("text-input")
+            .id(self.element_id.clone())
             .w_full()
             .h(px(34.))
             .px(px(10.))
@@ -409,7 +427,7 @@ impl Render for TextInput {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up_out))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(TextElement { input: cx.entity() })
     }

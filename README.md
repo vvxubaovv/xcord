@@ -58,7 +58,8 @@ guide, the threading model, and the session-open sequence.
   wide characters, combining marks, OSC title/clipboard, bracketed paste,
   application cursor keys, scrollback, selection/copy/paste.
 - **Session manager**: folders/groups, search, edit/delete, a human-readable
-  `config.toml`.
+  `config.toml`, and a **Test connection** action that verifies SSH auth without
+  opening a tab.
 - **Compose bar + snippets**: send a line without touching the shell prompt;
   one-click snippets.
 - **Command palette**: every plugin can contribute commands; `Ctrl+Shift+P`.
@@ -87,6 +88,9 @@ guide, the threading model, and the session-open sequence.
 | `Ctrl+Shift+E` | Focus compose bar |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copy selection / paste |
 | `Enter` in compose | Send line |
+| `Tab` / `Shift+Tab` in a session dialog | Move between fields |
+| `Enter` in a session dialog | Save and connect |
+| `Ctrl+Enter` in a session dialog | Test the connection |
 
 ## Xshell: what we keep, what we fix
 

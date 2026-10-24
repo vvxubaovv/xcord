@@ -46,7 +46,8 @@ pub use transport::{
 };
 pub use ui::{NoticeLevel, Ui, UiCommand, UiHost};
 pub use workspace::{
-    OpenRequest, TabInfo, TabStatus, TerminalId, Workspace, WorkspaceEvent, WorkspaceService,
+    ConnectionTest, OpenRequest, TabInfo, TabStatus, TerminalId, Workspace, WorkspaceEvent,
+    WorkspaceService,
 };
 
 /// The conventional service names. Using constants avoids typos and lets
