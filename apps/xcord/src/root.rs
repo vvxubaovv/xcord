@@ -91,6 +91,9 @@ struct NoticeState {
     level: NoticeLevel,
     message: String,
     at: Instant,
+    /// True only for the transient "connecting" status. Kept as a semantic
+    /// flag so localized messages still clear when the tab connects.
+    connecting: bool,
 }
 
 struct UiHostImpl {
@@ -453,14 +456,8 @@ impl XcordApp {
             .active
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
         {
-            if tab.status.is_connected()
-                && self
-                    .notice
-                    .as_ref()
-                    .map(|notice| notice.message.starts_with("Connecting"))
-                    .unwrap_or(false)
-            {
-                self.notice = None;
+            if tab.status.is_connected() {
+                self.clear_connecting_notice();
             }
         }
         match event {
@@ -550,7 +547,31 @@ impl XcordApp {
             level,
             message: message.into(),
             at: Instant::now(),
+            connecting: false,
         });
+    }
+
+    fn set_connecting_notice(&mut self, message: impl Into<String>) {
+        self.notice = Some(NoticeState {
+            level: NoticeLevel::Info,
+            message: message.into(),
+            at: Instant::now(),
+            connecting: true,
+        });
+        self.clear_connecting_notice();
+    }
+
+    /// Drop the transient "connecting" notice once the active tab is connected.
+    /// The check is semantic, so localized messages clear too.
+    fn clear_connecting_notice(&mut self) {
+        let connected = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map(|tab| tab.status.is_connected())
+            .unwrap_or(false);
+        if connected && self.notice.as_ref().is_some_and(|notice| notice.connecting) {
+            self.notice = None;
+        }
     }
 
     fn open_session_dialog(&mut self, profile_id: Option<String>, cx: &mut Context<Self>) {
@@ -831,13 +852,10 @@ impl XcordApp {
                 self.session_form = None;
                 self.pending_focus = Some(PendingFocus::Terminal);
                 self.sync(cx);
-                self.set_notice(
-                    NoticeLevel::Info,
-                    self.tr_args(
-                        "Connecting to {endpoint}…",
-                        &[("endpoint", profile.endpoint())],
-                    ),
-                );
+                self.set_connecting_notice(self.tr_args(
+                    "Connecting to {endpoint}…",
+                    &[("endpoint", profile.endpoint())],
+                ));
                 let _ = id;
             }
             Err(error) => {
@@ -1001,7 +1019,7 @@ impl XcordApp {
             Ok(_) => {
                 self.pending_focus = Some(PendingFocus::Terminal);
                 self.sync(cx);
-                self.set_notice(NoticeLevel::Info, self.tr("Connecting…"));
+                self.set_connecting_notice(self.tr("Connecting…"));
             }
             Err(error) => {
                 self.set_notice(NoticeLevel::Error, error);
