@@ -10,6 +10,14 @@ use xcord_store::{HighlightRule, SessionProfile, Settings, Snippet};
 pub trait SessionService {
     fn list(&self) -> Vec<SessionProfile>;
     fn groups(&self) -> Vec<String>;
+    fn create_group(&self, name: &str) -> Result<(), String>;
+    fn move_session(
+        &self,
+        id: &str,
+        group: &str,
+        target: Option<&str>,
+        after: bool,
+    ) -> Result<(), String>;
     fn get(&self, id: &str) -> Option<SessionProfile>;
     fn save(&self, profile: SessionProfile) -> Result<(), String>;
     fn delete(&self, id: &str) -> Result<(), String>;

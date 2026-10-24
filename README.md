@@ -65,10 +65,11 @@ guide, the threading model, and the session-open sequence.
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
   protected from typing during a transfer.
 - **Session manager**: folders/groups, search, edit/delete, a right-click menu
-  (edit, duplicate, connect), a human-readable `config.toml`, a **Browse…** file
-  picker for private keys, and a **Test connection** action that verifies SSH
-  auth without opening a tab. Duplicating a session creates a new profile with a
-  unique auto-numbered name.
+  (edit, duplicate, connect, move to group, new group), drag to reorder sessions
+  or drop a session onto a group header, a human-readable `config.toml`, a
+  **Browse…** file picker for private keys, and a **Test connection** action that
+  verifies SSH auth without opening a tab. Duplicating a session creates a new
+  profile with a unique auto-numbered name.
 - **Compose bar + snippets**: send a line without touching the shell prompt;
   one-click snippets.
 - **Command palette**: every plugin can contribute commands; `Ctrl+Shift+P`.

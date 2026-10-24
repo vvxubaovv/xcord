@@ -63,6 +63,53 @@ impl SessionService for SessionManager {
         self.store.config().groups
     }
 
+    fn create_group(&self, name: &str) -> std::result::Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Group name cannot be empty.".to_string());
+        }
+        if self.store.config().groups.iter().any(|group| group == name) {
+            return Ok(());
+        }
+        let name = name.to_string();
+        self.store
+            .update(|config| config.groups.push(name))
+            .map_err(|error| error.to_string())
+    }
+
+    fn move_session(
+        &self,
+        id: &str,
+        group: &str,
+        target: Option<&str>,
+        after: bool,
+    ) -> std::result::Result<(), String> {
+        if group.trim().is_empty() {
+            return Err("Group name cannot be empty.".to_string());
+        }
+        let mut sessions = self.store.sessions();
+        let Some(index) = sessions.iter().position(|session| session.id == id) else {
+            return Err("Session no longer exists.".to_string());
+        };
+        let mut session = sessions.remove(index);
+        session.group = group.to_string();
+        let insert_at = target
+            .and_then(|target| sessions.iter().position(|session| session.id == target))
+            .map(|index| if after { index + 1 } else { index })
+            .unwrap_or(sessions.len())
+            .min(sessions.len());
+        sessions.insert(insert_at, session);
+        let group = group.to_string();
+        self.store
+            .update(|config| {
+                config.sessions = sessions;
+                if !config.groups.iter().any(|existing| existing == &group) {
+                    config.groups.push(group);
+                }
+            })
+            .map_err(|error| error.to_string())
+    }
+
     fn get(&self, id: &str) -> Option<SessionProfile> {
         self.store.session(id)
     }

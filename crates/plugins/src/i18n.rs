@@ -167,6 +167,12 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Send a command to the active session…", "向当前会话发送命令…"),
     ("Ask about this session…", "询问当前会话…"),
     ("New session", "新建会话"),
+    ("New group", "新建分组"),
+    ("Group name", "分组名称"),
+    ("Create", "创建"),
+    ("Move to group", "移动到分组"),
+    ("Group name cannot be empty.", "分组名称不能为空。"),
+    ("Group created: {name}", "已创建分组：{name}"),
     ("Edit session", "编辑会话"),
     ("SESSIONS", "会话"),
     (

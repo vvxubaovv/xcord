@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, ClipboardItem, Context, Div, Entity, Font, Hsla, KeyDownEvent, MouseButton,
-    PathPromptOptions, Render, Rgba, ScrollHandle, SharedString, Stateful, Window,
+    div, px, rgb, ClipboardItem, Context, Div, DragMoveEvent, Entity, Font, Hsla, KeyDownEvent,
+    MouseButton, PathPromptOptions, Render, Rgba, ScrollHandle, SharedString, Stateful, Window,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -47,6 +47,43 @@ struct SessionForm {
     save_secret: bool,
     logging: bool,
     error: Option<String>,
+}
+
+struct GroupForm {
+    name: Entity<TextInput>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct DraggedSession {
+    id: String,
+    name: String,
+}
+
+struct DragHover {
+    group: String,
+    target: Option<String>,
+    after: bool,
+}
+
+struct SessionDragPreview {
+    name: String,
+    theme: Theme,
+}
+
+impl Render for SessionDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(self.theme.accent))
+            .bg(rgbc(self.theme.panel_alt))
+            .text_size(px(11.5))
+            .text_color(rgbc(self.theme.foreground))
+            .child(self.name.clone())
+    }
 }
 
 struct SettingsForm {
@@ -136,6 +173,8 @@ pub struct XcordApp {
 
     session_form: Option<SessionForm>,
     session_menu: Option<String>,
+    group_form: Option<GroupForm>,
+    drag_hover: RefCell<Option<DragHover>>,
     settings_form: Option<SettingsForm>,
     ai_config: Option<AiConfigForm>,
     test_id: Option<u64>,
@@ -262,6 +301,8 @@ impl XcordApp {
             ai_selection_owner: Rc::new(Cell::new(None)),
             session_form: None,
             session_menu: None,
+            group_form: None,
+            drag_hover: RefCell::new(None),
             settings_form: None,
             ai_config: None,
             test_id: None,
@@ -574,6 +615,110 @@ impl XcordApp {
         if connected && self.notice.as_ref().is_some_and(|notice| notice.connecting) {
             self.notice = None;
         }
+    }
+
+    fn open_group_dialog(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme.clone();
+        let name = Self::make_input(&theme, &self.tr("Group name"), false, cx);
+        self.group_form = Some(GroupForm { name, error: None });
+        self.session_menu = None;
+        cx.notify();
+    }
+
+    fn save_group(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.group_form.as_ref() else {
+            return;
+        };
+        let name = form.name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            let error = self.tr("Group name cannot be empty.");
+            if let Some(form) = &mut self.group_form {
+                form.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.sessions.create_group(&name) {
+            if let Some(form) = &mut self.group_form {
+                form.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+        self.group_form = None;
+        self.sync(cx);
+        self.set_notice(
+            NoticeLevel::Info,
+            self.tr_args("Group created: {name}", &[("name", name)]),
+        );
+        cx.notify();
+    }
+
+    fn render_group_dialog(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(form) = self.group_form.as_ref() else {
+            return div();
+        };
+        div()
+            .w(px(360.))
+            .p_4()
+            .rounded_lg()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .bg(rgbc(theme.panel))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.foreground))
+                    .child(self.tr("New group")),
+            )
+            .child(
+                div()
+                    .h(px(34.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "enter" {
+                            this.save_group(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(form.name.clone()),
+            )
+            .when_some(form.error.clone(), |panel, error| {
+                panel.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgbc(theme.danger))
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(secondary_button(self.tr("Cancel"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.group_form = None;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(primary_button(self.tr("Create"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.save_group(cx)),
+                    )),
+            )
     }
 
     fn open_session_dialog(&mut self, profile_id: Option<String>, cx: &mut Context<Self>) {
@@ -1047,7 +1192,6 @@ impl XcordApp {
                         .any(|tag| tag.to_lowercase().contains(&query))
             });
         }
-        sessions.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         sessions
     }
 
@@ -2474,6 +2618,10 @@ impl XcordApp {
                 self.palette = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.group_form.is_some() {
+                self.group_form = None;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.session_form.is_some() {
                 self.close_session_dialog(cx);
                 cx.stop_propagation();
@@ -2576,7 +2724,14 @@ impl XcordApp {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let sessions = self.filtered_sessions(cx);
+        let query = self.search.read(cx).value();
         let mut groups: BTreeMap<String, Vec<SessionProfile>> = BTreeMap::new();
+        if query.trim().is_empty() {
+            for group in self.sessions.groups() {
+                groups.entry(group).or_default();
+            }
+            groups.entry("Sessions".to_string()).or_default();
+        }
         for profile in sessions {
             let group = if profile.group.trim().is_empty() {
                 "Sessions".to_string()
@@ -2605,14 +2760,41 @@ impl XcordApp {
             );
         }
         for (group, profiles) in groups {
+            let group_drag = group.clone();
+            let group_drop = group.clone();
+            let header_hover = self
+                .drag_hover
+                .borrow()
+                .as_ref()
+                .is_some_and(|hover| hover.target.is_none() && hover.group == group);
             list = list.child(
                 div()
+                    .id(SharedString::from(format!("group-{group}")))
                     .px_2()
                     .pt_3()
                     .pb_1()
                     .text_size(px(9.5))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgbc(theme.muted))
+                    .text_color(if header_hover {
+                        rgbc(theme.accent)
+                    } else {
+                        rgbc(theme.muted)
+                    })
+                    .on_drag_move::<DraggedSession>(cx.listener(
+                        move |this, _event: &DragMoveEvent<DraggedSession>, _, cx| {
+                            this.drag_hover.replace(Some(DragHover {
+                                group: group_drag.clone(),
+                                target: None,
+                                after: true,
+                            }));
+                            cx.notify();
+                        },
+                    ))
+                    .on_drop::<DraggedSession>(cx.listener(
+                        move |this, drag: &DraggedSession, _, cx| {
+                            this.move_session_to_group(&drag.id, &group_drop, cx);
+                        },
+                    ))
                     .child(self.tr(&group).to_uppercase()),
             );
             for profile in profiles {
@@ -2707,15 +2889,32 @@ impl XcordApp {
                 TabStatus::Closed => rgbc(theme.muted),
             })
             .unwrap_or(rgba(theme.muted, 0.35));
-        let row_bg = if active {
+        let drop_hover = self
+            .drag_hover
+            .borrow()
+            .as_ref()
+            .is_some_and(|hover| hover.target.as_deref() == Some(profile.id.as_str()));
+        let row_bg = if drop_hover {
+            rgba(theme.accent, 0.18)
+        } else if active {
             rgbc(theme.panel_alt)
         } else {
             rgba(theme.panel_alt, 0.0)
         };
         let hover_bg = rgba(theme.accent, 0.1);
         let id = profile.id.clone();
-        let edit_id = profile.id.clone();
         let menu_id = profile.id.clone();
+        let target_id = profile.id.clone();
+        let target_group = if profile.group.trim().is_empty() {
+            "Sessions".to_string()
+        } else {
+            profile.group.clone()
+        };
+        let drag_id = profile.id.clone();
+        let drag_name = profile.name.clone();
+        let drag_theme = theme.clone();
+        let hover_target = target_id.clone();
+        let hover_group = target_group.clone();
         let subtitle = if profile.user.is_empty() {
             profile.host.clone()
         } else {
@@ -2749,6 +2948,45 @@ impl XcordApp {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover_bg))
+                    .on_drag(
+                        DraggedSession {
+                            id: drag_id,
+                            name: drag_name,
+                        },
+                        move |drag, _, _, cx| {
+                            let theme = drag_theme.clone();
+                            cx.new(|_| SessionDragPreview {
+                                name: drag.name.clone(),
+                                theme,
+                            })
+                        },
+                    )
+                    .on_drag_move::<DraggedSession>(cx.listener(
+                        move |this, event: &DragMoveEvent<DraggedSession>, _, cx| {
+                            let after = event.event.position.y >= event.bounds.center().y;
+                            this.drag_hover.replace(Some(DragHover {
+                                group: hover_group.clone(),
+                                target: Some(hover_target.clone()),
+                                after,
+                            }));
+                            cx.notify();
+                        },
+                    ))
+                    .on_drop::<DraggedSession>(cx.listener(
+                        move |this, drag: &DraggedSession, _, cx| {
+                            let (group, after) = {
+                                let hover = this.drag_hover.borrow();
+                                hover
+                                    .as_ref()
+                                    .filter(|hover| {
+                                        hover.target.as_deref() == Some(target_id.as_str())
+                                    })
+                                    .map(|hover| (hover.group.clone(), hover.after))
+                                    .unwrap_or((target_group.clone(), true))
+                            };
+                            this.drop_session(drag, &group, Some(&target_id), after, cx);
+                        },
+                    ))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
@@ -2780,24 +3018,6 @@ impl XcordApp {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .id(SharedString::from(format!("edit-{}", edit_id)))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_size(px(10.))
-                    .text_color(rgbc(theme.muted))
-                    .cursor_pointer()
-                    .hover(move |style| style.text_color(rgbc(theme.accent)))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.open_session_dialog(Some(edit_id.clone()), cx);
-                        }),
-                    )
-                    .child(self.tr("edit")),
-            )
     }
 
     fn render_session_menu(&self, profile_id: &str, cx: &mut Context<Self>) -> Div {
@@ -2823,43 +3043,164 @@ impl XcordApp {
                 .hover(|style| style.bg(rgbc(theme.panel)))
                 .child(label)
         };
+        let groups = self.sessions.groups();
+        let current_group = self
+            .sessions
+            .get(profile_id)
+            .map(|profile| {
+                if profile.group.trim().is_empty() {
+                    "Sessions".to_string()
+                } else {
+                    profile.group
+                }
+            })
+            .unwrap_or_else(|| "Sessions".to_string());
+        let mut group_row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("Move to group")),
+            );
+        for group in groups {
+            let target = group.clone();
+            let session = profile_id.to_string();
+            let selected = group == current_group;
+            group_row = group_row.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "session-menu-group-{profile_id}-{group}"
+                    )))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(if selected {
+                        rgbc(theme.accent)
+                    } else {
+                        rgbc(theme.border)
+                    })
+                    .bg(if selected {
+                        rgba(theme.accent, 0.16)
+                    } else {
+                        rgbc(theme.background)
+                    })
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.foreground))
+                    .cursor_pointer()
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.move_session_to_group(&session, &target, cx);
+                        }),
+                    )
+                    .child(self.tr(&group)),
+            );
+        }
+        group_row = group_row.child(
+            div()
+                .id(SharedString::from(format!(
+                    "session-menu-new-group-{profile_id}"
+                )))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgbc(theme.border))
+                .bg(rgbc(theme.background))
+                .text_size(px(9.5))
+                .text_color(rgbc(theme.accent))
+                .cursor_pointer()
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_group_dialog(cx);
+                    }),
+                )
+                .child(self.tr("New group")),
+        );
         div()
             .mx_2()
             .mb_1()
             .p_1()
             .flex()
+            .flex_col()
             .gap_1()
             .rounded_md()
             .border_1()
             .border_color(rgbc(theme.border))
             .bg(rgbc(theme.panel_alt))
-            .child(button("edit", self.tr("edit"), theme).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.open_session_dialog(Some(edit_id.clone()), cx);
-                }),
-            ))
             .child(
-                button("duplicate", self.tr("Duplicate"), theme).on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.duplicate_session(&duplicate_id, cx);
-                    }),
-                ),
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(button("edit", self.tr("edit"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_session_dialog(Some(edit_id.clone()), cx);
+                        }),
+                    ))
+                    .child(
+                        button("duplicate", self.tr("Duplicate"), theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.duplicate_session(&duplicate_id, cx);
+                            }),
+                        ),
+                    )
+                    .child(button("connect", self.tr("connect"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.connect_profile(connect_id.clone(), window, cx);
+                        }),
+                    ))
+                    .child(button("cancel", self.tr("Cancel"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.session_menu = None;
+                            cx.notify();
+                        }),
+                    )),
             )
-            .child(button("connect", self.tr("connect"), theme).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    this.connect_profile(connect_id.clone(), window, cx);
-                }),
-            ))
-            .child(button("cancel", self.tr("Cancel"), theme).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.session_menu = None;
-                    cx.notify();
-                }),
-            ))
+            .child(group_row)
+    }
+
+    fn drop_session(
+        &mut self,
+        drag: &DraggedSession,
+        group: &str,
+        target: Option<&str>,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if target == Some(drag.id.as_str()) {
+            self.drag_hover.replace(None);
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.sessions.move_session(&drag.id, group, target, after) {
+            self.set_notice(NoticeLevel::Error, error);
+            return;
+        }
+        self.drag_hover.replace(None);
+        self.sync(cx);
+        cx.notify();
+    }
+
+    fn move_session_to_group(&mut self, id: &str, group: &str, cx: &mut Context<Self>) {
+        if let Err(error) = self.sessions.move_session(id, group, None, true) {
+            self.set_notice(NoticeLevel::Error, error);
+            return;
+        }
+        self.session_menu = None;
+        self.drag_hover.replace(None);
+        self.sync(cx);
+        cx.notify();
     }
 
     fn copied_session_name(&self, base: &str) -> String {
@@ -4270,7 +4611,9 @@ impl Render for XcordApp {
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
-        let content = if self.session_form.is_some() {
+        let content = if self.group_form.is_some() {
+            modal_shell(self.render_group_dialog(cx))
+        } else if self.session_form.is_some() {
             // Keep dialogs in normal layout flow. Absolute overlays in this
             // GPUI version paint correctly but their children miss mouse
             // hit-testing, which made fields and Test/Save buttons dead.
