@@ -143,6 +143,14 @@ impl SessionProfile {
         }
     }
 
+    /// Clone this profile for a new session, with a fresh id and the given name.
+    pub fn duplicate(&self, name: impl Into<String>) -> Self {
+        let mut copy = self.clone();
+        copy.id = uuid::Uuid::new_v4().to_string();
+        copy.name = name.into();
+        copy
+    }
+
     pub fn endpoint(&self) -> String {
         format!("{}@{}:{}", self.user, self.host, self.port)
     }
@@ -699,6 +707,17 @@ impl fmt::Debug for Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_session_gets_new_id_and_name() {
+        let mut original = SessionProfile::new("web");
+        original.host = "example.com".into();
+        let copy = original.duplicate("web copy");
+        assert_ne!(copy.id, original.id);
+        assert_eq!(copy.name, "web copy");
+        assert_eq!(copy.host, original.host);
+        assert_eq!(copy.auth, original.auth);
+    }
 
     #[test]
     fn roundtrip_workspace() {

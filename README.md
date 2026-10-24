@@ -64,9 +64,11 @@ guide, the threading model, and the session-open sequence.
   (unique names, no overwrite); `rz` opens a multi-file picker and uploads the
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
   protected from typing during a transfer.
-- **Session manager**: folders/groups, search, edit/delete, a human-readable
-  `config.toml`, a **Browse…** file picker for private keys, and a **Test
-  connection** action that verifies SSH auth without opening a tab.
+- **Session manager**: folders/groups, search, edit/delete, a right-click menu
+  (edit, duplicate, connect), a human-readable `config.toml`, a **Browse…** file
+  picker for private keys, and a **Test connection** action that verifies SSH
+  auth without opening a tab. Duplicating a session creates a new profile with a
+  unique auto-numbered name.
 - **Compose bar + snippets**: send a line without touching the shell prompt;
   one-click snippets.
 - **Command palette**: every plugin can contribute commands; `Ctrl+Shift+P`.

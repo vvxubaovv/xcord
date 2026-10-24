@@ -174,6 +174,10 @@ const APP_ZH: &[(&str, &str)] = &[
         "没有匹配的会话。新建一个开始使用。",
     ),
     ("edit", "编辑"),
+    ("Duplicate", "复制会话"),
+    ("{name} copy", "{name} 副本"),
+    ("{name} copy {index}", "{name} 副本 {index}"),
+    ("Copied session to {name}", "已复制为 {name}"),
     ("Ctrl+Shift+P palette", "Ctrl+Shift+P 命令面板"),
     ("ready", "就绪"),
     (

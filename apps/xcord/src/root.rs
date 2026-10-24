@@ -135,6 +135,7 @@ pub struct XcordApp {
     ai_selection_owner: Rc<Cell<Option<usize>>>,
 
     session_form: Option<SessionForm>,
+    session_menu: Option<String>,
     settings_form: Option<SettingsForm>,
     ai_config: Option<AiConfigForm>,
     test_id: Option<u64>,
@@ -260,6 +261,7 @@ impl XcordApp {
             ai_text_entities: RefCell::new(Vec::new()),
             ai_selection_owner: Rc::new(Cell::new(None)),
             session_form: None,
+            session_menu: None,
             settings_form: None,
             ai_config: None,
             test_id: None,
@@ -575,6 +577,7 @@ impl XcordApp {
     }
 
     fn open_session_dialog(&mut self, profile_id: Option<String>, cx: &mut Context<Self>) {
+        self.session_menu = None;
         let existing = profile_id.as_ref().and_then(|id| self.sessions.get(id));
         let is_new = existing.is_none();
         let profile = existing.clone().unwrap_or_else(|| SessionProfile::new(""));
@@ -984,6 +987,7 @@ impl XcordApp {
     }
 
     fn connect_profile(&mut self, profile_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.session_menu = None;
         if let Some(tab) = self.tabs.iter().find(|tab| tab.profile_id == profile_id) {
             self.workspace.select(tab.id);
             self.pending_focus = Some(PendingFocus::Terminal);
@@ -2477,6 +2481,10 @@ impl XcordApp {
                 self.settings_form = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.session_menu.is_some() {
+                self.session_menu = None;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.plugins_panel {
                 self.plugins_panel = false;
                 cx.notify();
@@ -2608,7 +2616,11 @@ impl XcordApp {
                     .child(self.tr(&group).to_uppercase()),
             );
             for profile in profiles {
+                let profile_id = profile.id.clone();
                 list = list.child(self.render_session_row(profile, cx));
+                if self.session_menu.as_deref() == Some(profile_id.as_str()) {
+                    list = list.child(self.render_session_menu(&profile_id, cx));
+                }
             }
         }
 
@@ -2703,6 +2715,7 @@ impl XcordApp {
         let hover_bg = rgba(theme.accent, 0.1);
         let id = profile.id.clone();
         let edit_id = profile.id.clone();
+        let menu_id = profile.id.clone();
         let subtitle = if profile.user.is_empty() {
             profile.host.clone()
         } else {
@@ -2715,6 +2728,14 @@ impl XcordApp {
             .gap_1()
             .rounded_md()
             .bg(row_bg)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.session_menu = Some(menu_id.clone());
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .id(SharedString::from(format!("session-{}", profile.id)))
@@ -2777,6 +2798,137 @@ impl XcordApp {
                     )
                     .child(self.tr("edit")),
             )
+    }
+
+    fn render_session_menu(&self, profile_id: &str, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let edit_id = profile_id.to_string();
+        let duplicate_id = profile_id.to_string();
+        let connect_id = profile_id.to_string();
+        let button = |suffix: &str, label: String, theme: &Theme| {
+            div()
+                .id(SharedString::from(format!(
+                    "session-menu-{suffix}-{profile_id}"
+                )))
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(rgbc(theme.background))
+                .text_size(px(10.5))
+                .text_color(rgbc(theme.foreground))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel)))
+                .child(label)
+        };
+        div()
+            .mx_2()
+            .mb_1()
+            .p_1()
+            .flex()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel_alt))
+            .child(button("edit", self.tr("edit"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.open_session_dialog(Some(edit_id.clone()), cx);
+                }),
+            ))
+            .child(
+                button("duplicate", self.tr("Duplicate"), theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.duplicate_session(&duplicate_id, cx);
+                    }),
+                ),
+            )
+            .child(button("connect", self.tr("connect"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.connect_profile(connect_id.clone(), window, cx);
+                }),
+            ))
+            .child(button("cancel", self.tr("Cancel"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.session_menu = None;
+                    cx.notify();
+                }),
+            ))
+    }
+
+    fn copied_session_name(&self, base: &str) -> String {
+        let names = self
+            .sessions
+            .list()
+            .into_iter()
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>();
+        let first = self.tr_args("{name} copy", &[("name", base.to_string())]);
+        if !names.iter().any(|name| name == &first) {
+            return first;
+        }
+        for index in 2..10_000 {
+            let candidate = self.tr_args(
+                "{name} copy {index}",
+                &[("name", base.to_string()), ("index", index.to_string())],
+            );
+            if !names.iter().any(|name| name == &candidate) {
+                return candidate;
+            }
+        }
+        first
+    }
+
+    fn duplicate_session(&mut self, profile_id: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self.sessions.get(profile_id) else {
+            self.set_notice(NoticeLevel::Error, self.tr("Session no longer exists."));
+            return;
+        };
+        let name = self.copied_session_name(&profile.name);
+        let mut copy = profile.duplicate(name.clone());
+        let secret = match &profile.auth {
+            AuthKind::Password { .. } => self
+                .sessions
+                .password(&profile)
+                .map(|password| (true, password)),
+            AuthKind::PublicKey { .. } => self
+                .sessions
+                .passphrase(&profile)
+                .map(|passphrase| (false, passphrase)),
+            _ => None,
+        };
+        let result = match secret {
+            Some((true, password)) => {
+                if let AuthKind::Password { secret_id, .. } = &mut copy.auth {
+                    *secret_id = None;
+                }
+                self.sessions.store_password(&copy, &password)
+            }
+            Some((false, passphrase)) => {
+                if let AuthKind::PublicKey { secret_id, .. } = &mut copy.auth {
+                    *secret_id = None;
+                }
+                self.sessions.store_passphrase(&copy, &passphrase)
+            }
+            None => self.sessions.save(copy.clone()),
+        };
+        if let Err(error) = result {
+            self.set_notice(NoticeLevel::Error, error);
+            return;
+        }
+        self.session_menu = None;
+        self.sync(cx);
+        self.set_notice(
+            NoticeLevel::Info,
+            self.tr_args("Copied session to {name}", &[("name", name)]),
+        );
+        self.open_session_dialog(Some(copy.id), cx);
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> Div {
