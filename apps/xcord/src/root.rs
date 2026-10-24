@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, Context, Div, Entity, Font, Hsla, KeyDownEvent, MouseButton, Render, Rgba,
-    SharedString, Stateful, Window,
+    div, px, rgb, Context, Div, Entity, Font, Hsla, KeyDownEvent, MouseButton, PathPromptOptions,
+    Render, Rgba, SharedString, Stateful, Window,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -521,6 +521,32 @@ impl XcordApp {
         self.test_pending = false;
         self.pending_focus = Some(PendingFocus::Terminal);
         cx.notify();
+    }
+
+    fn pick_private_key(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select a private key".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path = path.to_string_lossy().into_owned();
+            let _ = this.update(cx, |this, cx| {
+                if let Some(form) = &this.session_form {
+                    form.key_path
+                        .update(cx, |input, cx| input.set_value(path, cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn focus_session_next(&mut self, reverse: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -2532,13 +2558,44 @@ impl XcordApp {
         if auth == AuthMode::Password {
             card = card.child(field("Password", form.secret.clone(), theme));
         } else {
-            card = card
-                .child(field("Private key file", form.key_path.clone(), theme))
-                .child(field(
-                    "Key passphrase (optional)",
-                    form.secret.clone(),
-                    theme,
-                ));
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.muted))
+                            .child("Private key file"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .bg(rgbc(theme.background))
+                                    .border_1()
+                                    .border_color(rgbc(theme.border))
+                                    .rounded_md()
+                                    .child(form.key_path.clone()),
+                            )
+                            .child(secondary_button("Browse…", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.pick_private_key(window, cx)
+                                }),
+                            )),
+                    ),
+            );
+            card = card.child(field(
+                "Key passphrase (optional)",
+                form.secret.clone(),
+                theme,
+            ));
         }
 
         card = card

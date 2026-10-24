@@ -58,8 +58,8 @@ guide, the threading model, and the session-open sequence.
   wide characters, combining marks, OSC title/clipboard, bracketed paste,
   application cursor keys, scrollback, selection/copy/paste.
 - **Session manager**: folders/groups, search, edit/delete, a human-readable
-  `config.toml`, and a **Test connection** action that verifies SSH auth without
-  opening a tab.
+  `config.toml`, a **Browse…** file picker for private keys, and a **Test
+  connection** action that verifies SSH auth without opening a tab.
 - **Compose bar + snippets**: send a line without touching the shell prompt;
   one-click snippets.
 - **Command palette**: every plugin can contribute commands; `Ctrl+Shift+P`.
