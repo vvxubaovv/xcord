@@ -1495,8 +1495,7 @@ impl XcordApp {
         );
         for tab in &self.tabs {
             let id = tab.id;
-            let selected =
-                !snapshot.context_follows_active && snapshot.context_terminal == Some(id);
+            let selected = snapshot.context_terminal == Some(id);
             let label = if tab.title.is_empty() {
                 format!("#{}", id.raw())
             } else {
