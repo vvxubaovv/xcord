@@ -13,7 +13,8 @@ use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
     div, px, rgb, ClipboardItem, Context, Div, DragMoveEvent, Entity, Font, Hsla, KeyDownEvent,
-    MouseButton, PathPromptOptions, Render, Rgba, ScrollHandle, SharedString, Stateful, Window,
+    MouseButton, MouseUpEvent, PathPromptOptions, Render, Rgba, ScrollHandle, SharedString,
+    Stateful, Window,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -205,6 +206,7 @@ pub struct XcordApp {
     collapsed_groups: RefCell<HashSet<String>>,
     drag_hover: RefCell<Option<DragHover>>,
     group_drag_hover: RefCell<Option<(String, bool)>>,
+    last_session_open: RefCell<Option<(String, Instant)>>,
     settings_form: Option<SettingsForm>,
     ai_config: Option<AiConfigForm>,
     test_id: Option<u64>,
@@ -336,6 +338,7 @@ impl XcordApp {
             collapsed_groups: RefCell::new(HashSet::new()),
             drag_hover: RefCell::new(None),
             group_drag_hover: RefCell::new(None),
+            last_session_open: RefCell::new(None),
             settings_form: None,
             ai_config: None,
             test_id: None,
@@ -358,7 +361,7 @@ impl XcordApp {
         window.set_window_title(&window_title);
         if let Ok(session_id) = std::env::var("XCORD_AUTOCONNECT") {
             if !session_id.trim().is_empty() {
-                app.connect_profile(session_id, window, cx);
+                app.connect_profile(session_id, window, cx, false);
             }
         }
         if let Ok(prompt) = std::env::var("XCORD_AI_PROMPT") {
@@ -1221,14 +1224,22 @@ impl XcordApp {
         cx.notify();
     }
 
-    fn connect_profile(&mut self, profile_id: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn connect_profile(
+        &mut self,
+        profile_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        force_new: bool,
+    ) {
         self.session_menu = None;
-        if let Some(tab) = self.tabs.iter().find(|tab| tab.profile_id == profile_id) {
-            self.workspace.select(tab.id);
-            self.pending_focus = Some(PendingFocus::Terminal);
-            self.sync(cx);
-            cx.notify();
-            return;
+        if !force_new {
+            if let Some(tab) = self.tabs.iter().find(|tab| tab.profile_id == profile_id) {
+                self.workspace.select(tab.id);
+                self.pending_focus = Some(PendingFocus::Terminal);
+                self.sync(cx);
+                cx.notify();
+                return;
+            }
         }
         let Some(profile) = self.sessions.get(&profile_id) else {
             self.set_notice(NoticeLevel::Error, self.tr("Session no longer exists."));
@@ -1249,6 +1260,7 @@ impl XcordApp {
             cx.notify();
             return;
         }
+        let opened_id = profile_id.clone();
         match self.workspace.open(OpenRequest {
             profile,
             credential,
@@ -1256,6 +1268,8 @@ impl XcordApp {
             rows: 24,
         }) {
             Ok(_) => {
+                self.last_session_open
+                    .replace(Some((opened_id, Instant::now())));
                 self.pending_focus = Some(PendingFocus::Terminal);
                 self.sync(cx);
                 self.set_connecting_notice(self.tr("Connecting…"));
@@ -1288,7 +1302,7 @@ impl XcordApp {
     fn connect_first_filtered(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(profile) = self.filtered_sessions(cx).first() {
             let id = profile.id.clone();
-            self.connect_profile(id, window, cx);
+            self.connect_profile(id, window, cx, false);
         }
     }
 
@@ -3166,8 +3180,14 @@ impl XcordApp {
                     ))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            this.connect_profile(id.clone(), window, cx);
+                        cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                            let recent = this.last_session_open.borrow().as_ref().is_some_and(
+                                |(opened, at)| {
+                                    opened == &id && at.elapsed() < Duration::from_millis(800)
+                                },
+                            );
+                            let force_new = event.click_count >= 2 && !recent;
+                            this.connect_profile(id.clone(), window, cx, force_new);
                         }),
                     )
                     .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(status_color))
@@ -3333,7 +3353,7 @@ impl XcordApp {
                     .child(button("connect", self.tr("connect"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
-                            this.connect_profile(connect_id.clone(), window, cx);
+                            this.connect_profile(connect_id.clone(), window, cx, true);
                         }),
                     ))
                     .child(button("cancel", self.tr("Cancel"), theme).on_mouse_up(
@@ -3829,7 +3849,7 @@ impl XcordApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
-                            this.connect_profile(id.clone(), window, cx);
+                            this.connect_profile(id.clone(), window, cx, false);
                         }),
                     )
                     .child(

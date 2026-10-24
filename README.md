@@ -70,7 +70,8 @@ guide, the threading model, and the session-open sequence.
   rename and drag-to-reorder, a human-readable `config.toml`, a **Browse…** file
   picker for private keys, and a **Test connection** action that verifies SSH
   auth without opening a tab. Duplicating a session creates a new profile with a
-  unique auto-numbered name.
+  unique auto-numbered name. Double-click a session (or use right-click →
+  **Connect**) to open another independent terminal tab for the same profile.
 - **Compose bar + snippets**: send a line without touching the shell prompt;
   one-click snippets.
 - **Command palette**: every plugin can contribute commands; `Ctrl+Shift+P`.
