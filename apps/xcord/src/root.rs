@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, Context, Div, Entity, Font, Hsla, KeyDownEvent, MouseButton, PathPromptOptions,
-    Render, Rgba, ScrollHandle, SharedString, Stateful, Window,
+    div, px, rgb, ClipboardItem, Context, Div, Entity, Font, Hsla, KeyDownEvent, MouseButton,
+    PathPromptOptions, Render, Rgba, ScrollHandle, SharedString, Stateful, Window,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -1016,8 +1016,13 @@ impl XcordApp {
     }
 
     fn open_settings(&mut self, cx: &mut Context<Self>) {
+        let theme_id = if self.settings.theme.is_empty() {
+            self.themes.active_id().to_string()
+        } else {
+            self.settings.theme.clone()
+        };
         self.settings_form = Some(SettingsForm {
-            theme_id: self.themes.active_id().to_string(),
+            theme_id,
             language: self.settings.language.clone(),
             font_size: self.settings.font_size,
             scrollback: self.settings.scrollback,
@@ -1028,6 +1033,35 @@ impl XcordApp {
             strict_host_keys: self.settings.host_key_policy == HostKeyPolicy::Strict,
             error: None,
         });
+        cx.notify();
+    }
+
+    fn apply_theme(&mut self, id: String, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.settings_form {
+            form.theme_id = id.clone();
+        }
+        if !self.themes.set_active(&id) {
+            if let Some(form) = &mut self.settings_form {
+                form.error = Some(format!("Unknown theme `{id}`."));
+            }
+            return;
+        }
+        let mut settings = self.settings.clone();
+        settings.theme = id;
+        if let Err(error) = self.sessions.save_settings(settings.clone()) {
+            if let Some(form) = &mut self.settings_form {
+                form.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+        self.settings = settings.clone();
+        self.theme = self.themes.active();
+        self.terminal
+            .update(cx, |view, cx| view.set_settings(settings, cx));
+        if let Some(form) = &mut self.settings_form {
+            form.error = None;
+        }
         cx.notify();
     }
 
@@ -1248,6 +1282,12 @@ impl XcordApp {
             self.ai_jump_target.set(None);
             self.ai_scroll.scroll_to_bottom();
         }
+        let transcript = snapshot
+            .messages
+            .iter()
+            .map(|message| format!("{}:\n{}\n", message.role, message.text))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut messages = div()
             .id("ai-messages")
             .flex()
@@ -1305,8 +1345,10 @@ impl XcordApp {
                     ),
                 );
         } else {
-            for message in &snapshot.messages {
-                messages = messages.child(render_ai_message(message, theme));
+            let copy_label = self.tr("Copy");
+            for (index, message) in snapshot.messages.iter().enumerate() {
+                messages =
+                    messages.child(render_ai_message(index, message, theme, &copy_label, cx));
             }
         }
 
@@ -1378,6 +1420,9 @@ impl XcordApp {
                     .child(
                         div()
                             .text_size(px(9.5))
+                            .max_w(px(110.))
+                            .overflow_hidden()
+                            .text_ellipsis()
                             .text_color(rgbc(theme.muted))
                             .child(snapshot.model.clone()),
                     ),
@@ -1411,7 +1456,9 @@ impl XcordApp {
 
         div()
             .w(px(400.))
+            .min_w(px(0.))
             .h_full()
+            .overflow_hidden()
             .flex()
             .flex_col()
             .bg(rgbc(theme.panel))
@@ -1460,6 +1507,17 @@ impl XcordApp {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .child(small_button(self.tr("Copy chat"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let transcript = transcript.clone();
+                                    move |_, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            transcript.clone(),
+                                        ));
+                                    }
+                                }),
+                            ))
                             .child(small_button(self.tr("Settings"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.open_ai_config(cx)),
@@ -1721,6 +1779,9 @@ impl XcordApp {
             .child(
                 div()
                     .text_size(px(9.5))
+                    .max_w_full()
+                    .overflow_hidden()
+                    .text_ellipsis()
                     .text_color(rgbc(theme.muted))
                     .child(title),
             )
@@ -3361,10 +3422,7 @@ impl XcordApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            if let Some(form) = &mut this.settings_form {
-                                form.theme_id = id.clone();
-                            }
-                            cx.notify();
+                            this.apply_theme(id.clone(), cx);
                         }),
                     )
                     .child(
@@ -3864,9 +3922,15 @@ fn palette_shell(content: Div) -> Div {
         .child(content)
 }
 
-fn render_ai_message(message: &AiMessageView, theme: &Theme) -> Div {
+fn render_ai_message(
+    index: usize,
+    message: &AiMessageView,
+    theme: &Theme,
+    copy_label: &str,
+    cx: &mut Context<XcordApp>,
+) -> Div {
     let is_tool = message.role.starts_with("Tool");
-    let mut card = div().w_full().flex().flex_col().gap_1();
+    let mut card = div().w_full().min_w(px(0.)).flex().flex_col().gap_1();
     if is_tool {
         card = card
             .p_2()
@@ -3879,17 +3943,40 @@ fn render_ai_message(message: &AiMessageView, theme: &Theme) -> Div {
         (Some(tool), _) => format!("{} · {tool}", message.role),
         _ => message.role.clone(),
     };
+    let text = message.text.clone();
     card.child(
         div()
-            .text_size(px(9.5))
-            .text_color(if message.role == "You" {
-                rgbc(theme.accent)
-            } else if message.role == "AI" {
-                rgbc(theme.success)
-            } else {
-                rgbc(theme.muted)
-            })
-            .child(role),
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(if message.role == "You" {
+                        rgbc(theme.accent)
+                    } else if message.role == "AI" {
+                        rgbc(theme.success)
+                    } else {
+                        rgbc(theme.muted)
+                    })
+                    .child(role),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("ai-copy-{index}")))
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgbc(theme.accent)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        }),
+                    )
+                    .child(copy_label.to_string()),
+            ),
     )
     .child(text_block(
         &message.text,
@@ -3903,11 +3990,15 @@ fn render_ai_message(message: &AiMessageView, theme: &Theme) -> Div {
 }
 
 fn text_block(text: &str, color: Rgba, size: f32) -> Div {
-    let mut column = div().w_full().flex().flex_col().gap_1();
+    let mut column = div().w_full().min_w(px(0.)).flex().flex_col().gap_1();
     for line in text.lines() {
         column = column.child(
             div()
+                .w_full()
+                .min_w(px(0.))
                 .min_h(px(15.))
+                .overflow_hidden()
+                .whitespace_normal()
                 .text_size(px(size))
                 .text_color(color)
                 .child(if line.is_empty() {

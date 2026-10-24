@@ -359,7 +359,8 @@ and toggles settings. The MCP/AI service state is not duplicated in the shell.
 It also owns a `ScrollHandle` for the conversation: new messages/stream deltas
 scroll to the bottom while follow mode is on. Wheel input pauses follow; the
 right-side rail has an ↑ jump to the last user prompt, one dot per user prompt,
-and ↓ to resume following the latest output.
+and ↓ to resume following the latest output. Each message has a copy action and
+the header copies the whole transcript as plain text.
 
 ## 9. Writing a plugin
 

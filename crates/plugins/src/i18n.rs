@@ -270,6 +270,8 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Why did the last command fail?", "上一条命令为什么失败？"),
     ("Summarize open tabs", "汇总当前标签页"),
     ("Terminal context", "终端上下文"),
+    ("Copy", "复制"),
+    ("Copy chat", "复制对话"),
     ("Conversation terminal", "对话终端"),
     (
         "Conversation terminal · {title}",
