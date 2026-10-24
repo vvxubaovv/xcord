@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/xcord-icon-256.png" width="96" alt="Xcord app icon"></p>
+
 # Xcord
 
 **A plugin-first SSH workspace for Windows, macOS and Linux — written in Rust with GPUI.**
@@ -75,6 +77,9 @@ guide, the threading model, and the session-open sequence.
   and persists immediately.
 - **Plugin manager**: live plugin states, diagnostics, and hot reload of the
   highlighter.
+- **Native packaging**: on Windows the executable uses the GUI subsystem (no
+  console window) and embeds the Xcord icon for the taskbar, title bar and
+  Explorer.
 - **Localization**: Simplified Chinese by default, English available in Settings;
   every plugin can register its own locale catalogs and unregister them on
   unload. Command titles and plugin metadata are localized automatically.
