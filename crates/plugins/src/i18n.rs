@@ -274,6 +274,8 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Copy chat", "复制对话"),
     ("Selected message", "已选择消息"),
     ("Whole conversation", "整个对话"),
+    ("Select files to send with rz", "选择要通过 rz 发送的文件"),
+    ("Sending files to remote rz…", "正在向远端 rz 发送文件…"),
     ("Conversation terminal", "对话终端"),
     (
         "Conversation terminal · {title}",

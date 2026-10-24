@@ -101,6 +101,11 @@ pub enum WorkspaceEvent {
     Bell(TerminalId),
     Closed(TerminalId),
     TestFinished(ConnectionTest),
+    /// A remote `rz` is waiting for files. The UI should ask for paths and call
+    /// [`WorkspaceService::zmodem_upload`].
+    ZmodemUploadRequested {
+        terminal: TerminalId,
+    },
     Notice {
         level: crate::ui::NoticeLevel,
         message: String,
@@ -126,6 +131,11 @@ pub trait WorkspaceService {
 
     fn write(&self, id: TerminalId, data: &[u8]);
     fn resize(&self, id: TerminalId, cols: u16, rows: u16);
+
+    /// Send local files to a remote `rz` that is already waiting.
+    fn zmodem_upload(&self, id: TerminalId, paths: Vec<String>) -> Result<(), String>;
+    /// Cancel a pending/receiving ZMODEM session.
+    fn zmodem_cancel(&self, id: TerminalId);
 
     fn snapshot(&self, id: TerminalId) -> Option<Snapshot>;
     /// Current grid size without cloning the whole viewport.

@@ -206,6 +206,19 @@ Closing a tab drops `Box<dyn Transport>`; `SshTransport::drop` closes the channe
 and aborts the session task. The workspace emits `Closed`, and the tab is
 removed.
 
+### ZMODEM
+
+ZMODEM is handled in the workspace output path, before the emulator. Each tab
+can hold a `zmodem2` receiver/sender state machine. The output pump looks for a
+ZRQINIT/ZRINIT header (`**\x18B00` / `**\x18B01`), feeds the protocol bytes to
+the state machine instead of the terminal, and forwards `WriteWire` actions to
+the SSH transport. Downloads are written to the user's `Downloads` folder with
+collision-safe names. `rz` emits `WorkspaceEvent::ZmodemUploadRequested`; the
+shell opens a multi-file picker and calls `WorkspaceService::zmodem_upload`.
+Terminal keystrokes are dropped while a transfer owns the stream. On
+`SessionCompleted` the pump drains the final acknowledgement before clearing the
+session, so the remote shell prompt returns cleanly.
+
 ## 6. Terminal
 
 `crates/vt` is UI-independent:

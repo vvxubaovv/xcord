@@ -20,6 +20,7 @@ mod ssh_transport;
 mod themes;
 mod transports;
 mod workspace;
+mod zmodem;
 
 pub use highlights::HighlightMatcher;
 pub use logging::TerminalOutputEvent;

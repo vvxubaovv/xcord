@@ -184,6 +184,7 @@ struct TabState {
     credential: Option<String>,
     server: Option<String>,
     last_title: String,
+    zmodem: Option<crate::zmodem::Session>,
 }
 
 /// The concrete workspace state. Public so the crate's test modules can use it,
@@ -365,6 +366,7 @@ impl WorkspaceState {
                 credential: request.credential,
                 server: None,
                 last_title: title,
+                zmodem: None,
             });
         }
         self.active.set(Some(id));
@@ -451,10 +453,52 @@ impl WorkspaceState {
             }
             TransportEvent::Output(data) => {
                 let mut raw = None;
+                let mut upload_requested = false;
                 {
                     let mut tabs = self.tabs.borrow_mut();
                     if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) {
-                        tab.terminal.feed(&data);
+                        let mut zmodem_notices = Vec::new();
+                        let mut transfer = tab.zmodem.is_some();
+                        let mut done = false;
+                        if let Some(session) = tab.zmodem.as_mut() {
+                            done =
+                                session.feed(&data, tab.transport.as_deref(), &mut zmodem_notices);
+                        } else if let Some((index, start)) = crate::zmodem::detect(&data) {
+                            tab.terminal.feed(&data[..index]);
+                            transfer = true;
+                            match start {
+                                crate::zmodem::Start::Receive => {
+                                    let mut session = crate::zmodem::Session::receiving();
+                                    done = session.feed(
+                                        &data[index..],
+                                        tab.transport.as_deref(),
+                                        &mut zmodem_notices,
+                                    );
+                                    if !done {
+                                        tab.zmodem = Some(session);
+                                    }
+                                }
+                                crate::zmodem::Start::Upload => {
+                                    tab.zmodem = Some(crate::zmodem::Session::upload_pending(
+                                        data[index..].to_vec(),
+                                    ));
+                                    upload_requested = true;
+                                    zmodem_notices.push(
+                                        "ZMODEM remote rz is waiting; choose files to upload."
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        if !transfer {
+                            tab.terminal.feed(&data);
+                        }
+                        for message in zmodem_notices {
+                            feed_notice(&mut tab.terminal, &message, false);
+                        }
+                        if done {
+                            tab.zmodem = None;
+                        }
                         let bells = tab.terminal.bell_count();
                         if bells > tab.bells {
                             tab.bells = bells;
@@ -472,13 +516,18 @@ impl WorkspaceState {
                             tab.last_title = title;
                             tabs_changed = true;
                         }
-                        raw = Some((
-                            tab.profile.id.clone(),
-                            tab.profile.name.clone(),
-                            tab.profile.logging,
-                            data.clone(),
-                        ));
+                        if !transfer {
+                            raw = Some((
+                                tab.profile.id.clone(),
+                                tab.profile.name.clone(),
+                                tab.profile.logging,
+                                data.clone(),
+                            ));
+                        }
                     }
+                }
+                if upload_requested {
+                    self.emit(WorkspaceEvent::ZmodemUploadRequested { terminal: id });
                 }
                 if let Some((profile_id, profile_name, logging, data)) = raw {
                     self.ctx.emit(&TerminalOutputEvent {
@@ -751,11 +800,49 @@ impl WorkspaceService for WorkspaceState {
     fn write(&self, id: TerminalId, data: &[u8]) {
         let tabs = self.tabs.borrow();
         if let Some(tab) = tabs.iter().find(|tab| tab.id == id) {
+            if tab.zmodem.is_some() {
+                return;
+            }
             if let Some(transport) = &tab.transport {
                 if let Err(error) = transport.write(data) {
                     drop(tabs);
                     self.fail(id, &error);
                 }
+            }
+        }
+    }
+
+    fn zmodem_upload(&self, id: TerminalId, paths: Vec<String>) -> std::result::Result<(), String> {
+        let mut tabs = self.tabs.borrow_mut();
+        let tab = tabs
+            .iter_mut()
+            .find(|tab| tab.id == id)
+            .ok_or_else(|| "Terminal is not open.".to_string())?;
+        let mut notices = Vec::new();
+        if let Some(session) = tab.zmodem.as_mut() {
+            if let Err(error) = session.start_upload(&paths) {
+                session.cancel(tab.transport.as_deref());
+                return Err(error);
+            }
+            let done = session.feed(&[], tab.transport.as_deref(), &mut notices);
+            for message in notices {
+                feed_notice(&mut tab.terminal, &message, false);
+            }
+            if done {
+                tab.zmodem = None;
+            }
+        } else {
+            return Err("No remote rz is waiting for an upload.".to_string());
+        }
+        Ok(())
+    }
+
+    fn zmodem_cancel(&self, id: TerminalId) {
+        let mut tabs = self.tabs.borrow_mut();
+        if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) {
+            if let Some(mut session) = tab.zmodem.take() {
+                session.cancel(tab.transport.as_deref());
+                feed_notice(&mut tab.terminal, "ZMODEM transfer cancelled.", true);
             }
         }
     }

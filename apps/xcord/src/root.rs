@@ -483,6 +483,9 @@ impl XcordApp {
                     self.test_result = Some(result);
                 }
             }
+            WorkspaceEvent::ZmodemUploadRequested { terminal } => {
+                self.pick_zmodem_uploads(terminal, cx);
+            }
             WorkspaceEvent::TabsChanged
             | WorkspaceEvent::ActiveChanged(_)
             | WorkspaceEvent::Closed(_) => {}
@@ -620,6 +623,42 @@ impl XcordApp {
         self.test_pending = false;
         self.pending_focus = Some(PendingFocus::Terminal);
         cx.notify();
+    }
+
+    fn pick_zmodem_uploads(&mut self, terminal: TerminalId, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(self.tr("Select files to send with rz").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => paths,
+                _ => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.workspace.zmodem_cancel(terminal);
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let paths = paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let _ = this.update(cx, |this, cx| {
+                match this.workspace.zmodem_upload(terminal, paths) {
+                    Ok(()) => {
+                        let message = this.tr("Sending files to remote rz…");
+                        this.set_notice(NoticeLevel::Info, message);
+                    }
+                    Err(error) => this.set_notice(NoticeLevel::Error, error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn pick_private_key(&mut self, _window: &mut Window, cx: &mut Context<Self>) {

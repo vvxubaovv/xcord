@@ -58,6 +58,10 @@ guide, the threading model, and the session-open sequence.
 - **Terminal**: xterm-256color, truecolor, alt screen, scroll regions, SGR,
   wide characters, combining marks, OSC title/clipboard, bracketed paste,
   application cursor keys, scrollback, selection/copy/paste.
+- **ZMODEM (`lrzsz`)**: `sz file` downloads automatically into `Downloads`
+  (unique names, no overwrite); `rz` opens a multi-file picker and uploads the
+  chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
+  protected from typing during a transfer.
 - **Session manager**: folders/groups, search, edit/delete, a human-readable
   `config.toml`, a **Browse…** file picker for private keys, and a **Test
   connection** action that verifies SSH auth without opening a tab.
@@ -105,6 +109,20 @@ guide, the threading model, and the session-open sequence.
 | `Tab` / `Shift+Tab` in a session dialog | Move between fields |
 | `Enter` in a session dialog | Save and connect |
 | `Ctrl+Enter` in a session dialog | Test the connection |
+
+### ZMODEM / `lrzsz`
+
+Install `lrzsz` on the remote host (`sz`/`rz`). Then:
+
+```bash
+sz report.tar.gz      # Xcord downloads into %USERPROFILE%\Downloads
+rz -y                 # Xcord opens a file picker and uploads the selection
+```
+
+Downloads never overwrite an existing file (`name-1.ext`, `name-2.ext`, …).
+The protocol bytes are hidden from the terminal, keyboard input is ignored while
+the transfer owns the stream, and cancelling the upload picker aborts the
+remote `rz`. Multi-file `sz`/`rz` batches are supported.
 
 ## Xshell: what we keep, what we fix
 

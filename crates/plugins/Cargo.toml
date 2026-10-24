@@ -21,3 +21,4 @@ serde_json.workspace = true
 tiny_http = "0.12"
 tokio.workspace = true
 uuid = { version = "1", features = ["v4"] }
+zmodem2 = "0.7.3"
