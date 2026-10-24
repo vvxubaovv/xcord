@@ -34,6 +34,8 @@ pub enum SshError {
     HostKey(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("SFTP error: {0}")]
+    Sftp(String),
     #[error("session is closed")]
     Closed,
 }
@@ -172,6 +174,25 @@ impl SshTransport {
         let _ = self.control.send(Control::Close);
     }
 
+    pub fn host_key(&self) -> &HostKeyInfo {
+        &self.host_key
+    }
+
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+}
+
+/// A live SFTP subsystem connection. The inner session must stay alive while
+/// the SFTP session is used, so both are kept together.
+pub struct SftpClient {
+    pub sftp: russh_sftp::client::SftpSession,
+    _session: Handle<SshHandler>,
+    host_key: HostKeyInfo,
+    server: String,
+}
+
+impl SftpClient {
     pub fn host_key(&self) -> &HostKeyInfo {
         &self.host_key
     }
@@ -356,6 +377,59 @@ pub async fn connect(
     Ok(SshTransport {
         control: control_tx,
         abort: task.abort_handle(),
+        host_key,
+        server,
+    })
+}
+
+/// Open an SFTP subsystem connection using the same host-key and auth policy
+/// as the interactive transport.
+pub async fn connect_sftp(options: SshOptions) -> Result<SftpClient, SshError> {
+    let record = Arc::new(Mutex::new(None));
+    let failure = Arc::new(Mutex::new(None));
+    let config = client::Config {
+        keepalive_interval: options.keepalive,
+        inactivity_timeout: None,
+        nodelay: true,
+        ..Default::default()
+    };
+    let handler = SshHandler {
+        host: options.host.clone(),
+        port: options.port,
+        policy: options.host_key_policy,
+        known_hosts: options.known_hosts.clone(),
+        record: record.clone(),
+        failure: failure.clone(),
+    };
+    let connect_future = client::connect(
+        Arc::new(config),
+        (options.host.as_str(), options.port),
+        handler,
+    );
+    let mut session: Handle<SshHandler> =
+        timeout(options.connect_timeout, connect_future)
+            .await
+            .map_err(|_| SshError::Timeout(options.connect_timeout))??;
+    authenticate(&mut session, &options).await?;
+
+    let host_key = record.lock().unwrap().clone().unwrap_or_default();
+    if !host_key.accepted {
+        let message = failure
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "host key was rejected".to_string());
+        return Err(SshError::HostKey(message));
+    }
+    let server = format!("{}@{}:{}", options.user, options.host, options.port);
+    let channel = session.channel_open_session().await?;
+    channel.request_subsystem(true, "sftp").await?;
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|error| SshError::Sftp(error.to_string()))?;
+    Ok(SftpClient {
+        sftp,
+        _session: session,
         host_key,
         server,
     })

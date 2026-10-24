@@ -43,6 +43,7 @@ thin — it renders services and forwards user intent.
 | `i18n` | `i18n` plugin | Locale catalogs shared by shell and plugins |
 | `mcp-tools` / `mcp-resources` | `mcp` plugin | Capability registry exposed over MCP |
 | `ai` | `ai` plugin | Streaming copilot + tool-calling loop |
+| `ftp` | `ftp` plugin | SFTP connections, remote/local panes, transfers |
 | `ui-host` | **the shell** | Semantic commands from plugins to GPUI |
 
 Plugins declare `inject = ["runtime", "transports"]`; the kernel starts them when
@@ -69,6 +70,9 @@ guide, the threading model, and the session-open sequence.
   (unique names, no overwrite); `rz` opens a multi-file picker and uploads the
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
   protected from typing during a transfer.
+- **SFTP file manager (Xftp-style)**: the `ftp` plugin opens an independent
+  SFTP subsystem for the active session, with local/remote panes, path
+  navigation, recursive upload/download, folder creation and remote deletion.
 - **Session manager**: folders/groups, search, edit/delete, a right-click menu
   (edit, duplicate, connect, move to group, new group), drag to reorder sessions
   or drop a session onto a group header, collapsible/expandable groups, group

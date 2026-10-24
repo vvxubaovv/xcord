@@ -19,6 +19,7 @@ pub enum UiCommand {
     Paste,
     ToggleAi,
     OpenAiSettings,
+    ToggleFtp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

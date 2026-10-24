@@ -22,6 +22,7 @@
 
 pub mod ai;
 pub mod commands;
+pub mod ftp;
 pub mod highlight;
 pub mod i18n;
 pub mod mcp;
@@ -34,6 +35,7 @@ pub mod workspace;
 
 pub use ai::{Ai, AiAssistant, AiMessageView, AiSnapshot};
 pub use commands::{Command, CommandRegistry, Commands};
+pub use ftp::{Ftp, FtpEntry, FtpEvent, FtpService, FtpSnapshot};
 pub use highlight::{HighlightService, HighlightSpan, Highlights};
 pub use i18n::{I18n, LocaleInfo, LocalizationService};
 pub use mcp::{
@@ -69,4 +71,5 @@ pub mod services {
     pub const MCP_RESOURCES: &str = "mcp-resources";
     pub const MCP_STATUS: &str = "mcp-status";
     pub const AI: &str = "ai";
+    pub const FTP: &str = "ftp";
 }

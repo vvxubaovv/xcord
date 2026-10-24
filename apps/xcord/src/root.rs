@@ -19,9 +19,10 @@ use gpui::{
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
 use xcord_plugin_api::{
-    services, Ai, AiMessageView, AiSnapshot, Command, Commands, ConnectionTest, Highlights, I18n,
-    McpStatus, NoticeLevel, OpenRequest, Runtime, Sessions, TabInfo, TabStatus, TerminalId, Theme,
-    Themes, Ui, UiCommand, UiHost, Workspace, WorkspaceEvent,
+    services, Ai, AiMessageView, AiSnapshot, Command, Commands, ConnectionTest, Ftp, FtpEntry,
+    FtpEvent, FtpSnapshot, Highlights, I18n, McpStatus, NoticeLevel, OpenRequest, Runtime,
+    Sessions, TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand, UiHost, Workspace,
+    WorkspaceEvent,
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings};
 
@@ -221,6 +222,7 @@ pub struct XcordApp {
     highlights: Highlights,
     i18n: I18n,
     ai: Ai,
+    ftp: Ftp,
     mcp: McpStatus,
 
     ui_rx: Receiver<UiCommand>,
@@ -237,6 +239,15 @@ pub struct XcordApp {
     ai_last_chars: Cell<usize>,
     ai_text_entities: RefCell<Vec<Entity<SelectableText>>>,
     ai_selection_owner: Rc<Cell<Option<usize>>>,
+
+    ftp_open: bool,
+    ftp_profile: Option<String>,
+    ftp_snapshot: Option<FtpSnapshot>,
+    ftp_remote_selected: Option<String>,
+    ftp_local_selected: Option<String>,
+    ftp_remote_input: Entity<TextInput>,
+    ftp_local_input: Entity<TextInput>,
+    ftp_new_dir: Entity<TextInput>,
 
     session_form: Option<SessionForm>,
     session_menu: Option<String>,
@@ -318,6 +329,10 @@ impl XcordApp {
             .require::<Ai>(services::AI)
             .expect("ai plugin did not start"))
         .clone();
+        let ftp = (*ctx
+            .require::<Ftp>(services::FTP)
+            .expect("ftp plugin did not start"))
+        .clone();
         let mcp = (*ctx
             .require::<McpStatus>(services::MCP_STATUS)
             .expect("mcp plugin did not start"))
@@ -339,6 +354,9 @@ impl XcordApp {
         );
         let ai_input =
             Self::make_input(&theme, &i18n.t("app", "Ask about this session…"), false, cx);
+        let ftp_remote_input = Self::make_input(&theme, "/", false, cx);
+        let ftp_local_input = Self::make_input(&theme, &i18n.t("app", "Local folder"), false, cx);
+        let ftp_new_dir = Self::make_input(&theme, &i18n.t("app", "New folder"), false, cx);
         let terminal = cx.new(|cx| {
             TerminalView::new(
                 workspace.clone(),
@@ -361,6 +379,7 @@ impl XcordApp {
             highlights,
             i18n,
             ai,
+            ftp,
             mcp,
             ui_rx,
             terminal,
@@ -376,6 +395,14 @@ impl XcordApp {
             ai_last_chars: Cell::new(0),
             ai_text_entities: RefCell::new(Vec::new()),
             ai_selection_owner: Rc::new(Cell::new(None)),
+            ftp_open: false,
+            ftp_profile: None,
+            ftp_snapshot: None,
+            ftp_remote_selected: None,
+            ftp_local_selected: None,
+            ftp_remote_input,
+            ftp_local_input,
+            ftp_new_dir,
             session_form: None,
             session_menu: None,
             group_menu: None,
@@ -546,6 +573,34 @@ impl XcordApp {
         })
         .detach();
 
+        // SFTP file-transfer notifications.
+        let mut ftp_events = self.ftp.subscribe();
+        cx.spawn(async move |this, cx| loop {
+            match ftp_events.recv().await {
+                Ok(event) => {
+                    if this
+                        .update(cx, |app, cx| app.on_ftp_event(event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    if this
+                        .update(cx, |app, cx| {
+                            app.refresh_ftp_snapshot(cx);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            }
+        })
+        .detach();
+
         // Commands sent by plugins.
         let ui_rx = self.ui_rx.clone();
         cx.spawn(async move |this, cx| {
@@ -689,6 +744,7 @@ impl XcordApp {
                 }
             }
             UiCommand::OpenAiSettings => self.open_ai_config(cx),
+            UiCommand::ToggleFtp => self.toggle_ftp(cx),
         }
         cx.notify();
     }
@@ -886,6 +942,83 @@ impl XcordApp {
             }
         }
         cx.notify();
+    }
+
+    fn toggle_ftp(&mut self, cx: &mut Context<Self>) {
+        if self.ftp_open {
+            self.ftp_open = false;
+            self.ftp_snapshot = None;
+            cx.notify();
+            return;
+        }
+        let Some(profile_id) = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map(|tab| tab.profile_id.clone())
+        else {
+            self.set_notice(
+                NoticeLevel::Warning,
+                self.tr("Open a terminal session before using file transfer."),
+            );
+            return;
+        };
+        self.ftp_profile = Some(profile_id.clone());
+        match self.ftp.connect(&profile_id) {
+            Ok(()) => {
+                self.ftp_open = true;
+                self.ftp_snapshot = self.ftp.snapshot(&profile_id);
+                self.refresh_ftp_snapshot(cx);
+            }
+            Err(error) => self.set_notice(NoticeLevel::Error, error),
+        }
+        cx.notify();
+    }
+
+    fn on_ftp_event(&mut self, event: FtpEvent, cx: &mut Context<Self>) {
+        match event {
+            FtpEvent::Changed { profile_id } => {
+                if self.ftp_open
+                    && (profile_id == "*"
+                        || self.ftp_profile.as_deref() == Some(profile_id.as_str()))
+                {
+                    self.refresh_ftp_snapshot(cx);
+                }
+            }
+            FtpEvent::Notice { level, message } => self.set_notice(level, message),
+        }
+        cx.notify();
+    }
+
+    fn refresh_ftp_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(profile_id) = self.ftp_profile.clone() else {
+            return;
+        };
+        let Some(snapshot) = self.ftp.snapshot(&profile_id) else {
+            return;
+        };
+        self.ftp_snapshot = Some(snapshot.clone());
+        self.ftp_remote_input.update(cx, |input, cx| {
+            input.set_value(snapshot.remote_path.clone(), cx)
+        });
+        self.ftp_local_input.update(cx, |input, cx| {
+            input.set_value(snapshot.local_path.clone(), cx)
+        });
+        if self.ftp_remote_selected.as_ref().is_some_and(|selected| {
+            !snapshot
+                .remote_entries
+                .iter()
+                .any(|entry| &entry.path == selected)
+        }) {
+            self.ftp_remote_selected = None;
+        }
+        if self.ftp_local_selected.as_ref().is_some_and(|selected| {
+            !snapshot
+                .local_entries
+                .iter()
+                .any(|entry| &entry.path == selected)
+        }) {
+            self.ftp_local_selected = None;
+        }
     }
 
     fn open_group_dialog(&mut self, cx: &mut Context<Self>) {
@@ -2967,6 +3100,11 @@ impl XcordApp {
                 self.palette = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.ftp_open {
+                self.ftp_open = false;
+                self.ftp_snapshot = None;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.tab_group_form.is_some() {
                 self.tab_group_form = None;
                 cx.notify();
@@ -3043,6 +3181,7 @@ impl XcordApp {
                 }
                 cx.notify();
             }))
+            .child(self.header_button(self.tr("Files"), cx, |this, cx| this.toggle_ftp(cx)))
             .child(self.header_button(self.tr("Palette"), cx, |this, cx| this.open_palette(cx)))
             .child(self.header_button(self.tr("Plugins"), cx, |this, cx| {
                 this.plugins_panel = true;
@@ -4353,6 +4492,493 @@ impl XcordApp {
         main
     }
 
+    fn render_ftp_panel(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(snapshot) = self.ftp_snapshot.clone() else {
+            return div()
+                .p_6()
+                .text_color(rgbc(theme.muted))
+                .child(self.tr("Select a terminal tab first."));
+        };
+        let profile_id = snapshot.profile_id.clone();
+        let local_pane = self.render_ftp_pane(
+            self.tr("Local"),
+            self.ftp_local_input.clone(),
+            &snapshot.local_entries,
+            self.ftp_local_selected.as_deref(),
+            false,
+            &profile_id,
+            cx,
+        );
+        let remote_pane = self.render_ftp_pane(
+            self.tr("Remote"),
+            self.ftp_remote_input.clone(),
+            &snapshot.remote_entries,
+            self.ftp_remote_selected.as_deref(),
+            true,
+            &profile_id,
+            cx,
+        );
+        let upload_id = profile_id.clone();
+        let download_id = profile_id.clone();
+        let delete_id = profile_id.clone();
+        div()
+            .w(px(1060.))
+            .h(px(680.))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel))
+            .child(
+                div()
+                    .h(px(48.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgbc(theme.border))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child(self.tr("File transfer")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(format!("{} · {}", snapshot.profile_name, snapshot.host)),
+                    )
+                    .child(div().flex_1())
+                    .when(snapshot.loading, |header| {
+                        header.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgbc(theme.accent))
+                                .child(self.tr("Connecting…")),
+                        )
+                    })
+                    .when_some(snapshot.error.clone(), |header, error| {
+                        header.child(
+                            div()
+                                .max_w(px(360.))
+                                .text_size(px(10.5))
+                                .text_color(rgbc(theme.danger))
+                                .child(error),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("ftp-close")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.ftp_open = false;
+                                    this.ftp_snapshot = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .p_3()
+                    .flex()
+                    .gap_3()
+                    .overflow_hidden()
+                    .child(local_pane)
+                    .child(remote_pane),
+            )
+            .child(
+                div()
+                    .h(px(52.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(rgbc(theme.border))
+                    .child(primary_button(self.tr("Upload"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            let Some(path) = this.ftp_local_selected.clone() else {
+                                return;
+                            };
+                            if let Err(error) = this.ftp.upload(&upload_id, vec![path]) {
+                                this.set_notice(NoticeLevel::Error, error);
+                            }
+                            cx.notify();
+                        }),
+                    ))
+                    .child(primary_button(self.tr("Download"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            let Some(path) = this.ftp_remote_selected.clone() else {
+                                return;
+                            };
+                            if let Err(error) = this.ftp.download(&download_id, vec![path]) {
+                                this.set_notice(NoticeLevel::Error, error);
+                            }
+                            cx.notify();
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .id("ftp-upload-picker")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgbc(theme.border))
+                            .text_size(px(10.5))
+                            .text_color(rgbc(theme.foreground))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.pick_ftp_uploads(cx)),
+                            )
+                            .child(self.tr("Upload files…")),
+                    )
+                    .child(small_button(self.tr("Delete"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            let Some(path) = this.ftp_remote_selected.clone() else {
+                                return;
+                            };
+                            if let Err(error) = this.ftp.delete_remote(&delete_id, vec![path]) {
+                                this.set_notice(NoticeLevel::Error, error);
+                            }
+                            cx.notify();
+                        }),
+                    ))
+                    .child(div().flex_1())
+                    .when_some(snapshot.busy.clone(), |footer, busy| {
+                        footer.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgbc(theme.accent))
+                                .child(busy),
+                        )
+                    }),
+            )
+    }
+
+    fn render_ftp_pane(
+        &self,
+        title: String,
+        path_input: Entity<TextInput>,
+        entries: &[FtpEntry],
+        selected: Option<&str>,
+        remote: bool,
+        profile_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = self.theme();
+        let path = if remote {
+            self.ftp_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.remote_path.clone())
+                .unwrap_or_default()
+        } else {
+            self.ftp_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.local_path.clone())
+                .unwrap_or_default()
+        };
+        let up_path = if remote {
+            remote_parent(&path)
+        } else {
+            local_parent(&path)
+        };
+        let up_profile = profile_id.to_string();
+        let refresh_profile = profile_id.to_string();
+        let refresh_path = path.clone();
+        let enter_profile = profile_id.to_string();
+        let mut toolbar = div()
+            .h(px(32.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id(if remote {
+                        "ftp-up-remote"
+                    } else {
+                        "ftp-up-local"
+                    })
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .text_size(px(11.))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgbc(theme.accent)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if remote {
+                                this.ftp.navigate_remote(&up_profile, &up_path);
+                            } else {
+                                this.ftp.navigate_local(&up_path);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child("↑"),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h(px(28.))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "enter" {
+                            let value = if remote {
+                                this.ftp_remote_input.read(cx).value()
+                            } else {
+                                this.ftp_local_input.read(cx).value()
+                            };
+                            if remote {
+                                this.ftp.navigate_remote(&enter_profile, &value);
+                            } else {
+                                this.ftp.navigate_local(&value);
+                            }
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(path_input.clone()),
+            )
+            .child(
+                div()
+                    .id(if remote {
+                        "ftp-refresh-remote"
+                    } else {
+                        "ftp-refresh-local"
+                    })
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .text_size(px(11.))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgbc(theme.accent)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if remote {
+                                this.ftp.refresh(&refresh_profile);
+                            } else {
+                                this.ftp.navigate_local(&refresh_path);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child("⟳"),
+            );
+        if remote {
+            let create_profile = profile_id.to_string();
+            toolbar = toolbar
+                .child(
+                    div()
+                        .w(px(118.))
+                        .h(px(28.))
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .bg(rgbc(theme.panel_alt))
+                        .border_1()
+                        .border_color(rgbc(theme.border))
+                        .child(self.ftp_new_dir.clone()),
+                )
+                .child(
+                    div()
+                        .id("ftp-create-dir")
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_size(px(10.))
+                        .text_color(rgbc(theme.muted))
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(rgbc(theme.accent)))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                let name = this.ftp_new_dir.read(cx).value();
+                                if let Err(error) = this.ftp.create_dir(&create_profile, &name) {
+                                    this.set_notice(NoticeLevel::Error, error);
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(self.tr("New folder")),
+                );
+        }
+        let mut rows = div()
+            .id(if remote {
+                "ftp-rows-remote"
+            } else {
+                "ftp-rows-local"
+            })
+            .flex()
+            .flex_col()
+            .gap_1()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .pt_2();
+        if entries.is_empty() {
+            rows = rows.child(
+                div()
+                    .p_2()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("Empty folder")),
+            );
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            let path = entry.path.clone();
+            let is_dir = entry.is_dir;
+            let name = entry.name.clone();
+            let size = if is_dir {
+                String::new()
+            } else {
+                format_size(entry.size)
+            };
+            let is_selected = selected == Some(path.as_str());
+            let entry_profile = profile_id.to_string();
+            rows = rows.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "ftp-{}-{index}",
+                        if remote { "remote" } else { "local" }
+                    )))
+                    .h(px(26.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_sm()
+                    .bg(if is_selected {
+                        rgba(theme.accent, 0.16)
+                    } else {
+                        rgba(theme.panel_alt, 0.0)
+                    })
+                    .text_size(px(11.))
+                    .text_color(if is_dir {
+                        rgbc(theme.accent)
+                    } else {
+                        rgbc(theme.foreground)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            if remote {
+                                this.ftp_remote_selected = Some(path.clone());
+                            } else {
+                                this.ftp_local_selected = Some(path.clone());
+                            }
+                            if event.click_count >= 2 && is_dir {
+                                if remote {
+                                    this.ftp.navigate_remote(&entry_profile, &path);
+                                } else {
+                                    this.ftp.navigate_local(&path);
+                                }
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(if is_dir { "▸" } else { "·" })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(size),
+                    ),
+            );
+        }
+        div()
+            .w(px(500.))
+            .h(px(550.))
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .px_2()
+                    .pt_2()
+                    .text_size(px(10.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.muted))
+                    .child(title),
+            )
+            .child(div().px_2().pb_1().child(toolbar))
+            .child(div().px_2().flex_1().min_h(px(0.)).child(rows))
+    }
+
+    fn pick_ftp_uploads(&mut self, cx: &mut Context<Self>) {
+        let Some(profile_id) = self.ftp_profile.clone() else {
+            return;
+        };
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(self.tr("Select files to upload").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let paths = paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let _ = this.update(cx, |this, cx| {
+                if let Err(error) = this.ftp.upload(&profile_id, paths) {
+                    this.set_notice(NoticeLevel::Error, error);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_session_dialog(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let Some(form) = self.session_form.as_ref() else {
@@ -5300,7 +5926,9 @@ impl Render for XcordApp {
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
-        let content = if self.tab_group_form.is_some() {
+        let content = if self.ftp_open {
+            modal_shell(self.render_ftp_panel(cx))
+        } else if self.tab_group_form.is_some() {
             modal_shell(self.render_tab_group_dialog(cx))
         } else if self.group_form.is_some() {
             modal_shell(self.render_group_dialog(cx))
@@ -5451,6 +6079,40 @@ fn render_ai_message(
             ),
     )
     .child(text)
+}
+
+fn remote_parent(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    match trimmed.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(index) => trimmed[..index].to_string(),
+    }
+}
+
+fn local_parent(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    path.parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .filter(|parent| !parent.is_empty())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn mask_token(token: &str) -> String {

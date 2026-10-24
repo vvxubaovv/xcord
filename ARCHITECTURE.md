@@ -219,8 +219,18 @@ Terminal keystrokes are dropped while a transfer owns the stream. On
 `SessionCompleted` the pump drains the final acknowledgement before clearing the
 session, so the remote shell prompt returns cleanly.
 
-## 6. Terminal
+### SFTP (`ftp` plugin)
 
+The Xftp-style manager is a plugin, not part of the terminal emulator. It opens
+its own SSH connection, authenticates through the same keychain/host-key policy,
+and requests the `sftp` subsystem. The plugin owns per-profile SFTP connections
+and exposes the `ftp` service; the shell renders local/remote snapshots and only
+sends commands (connect, navigate, upload, download, mkdir, delete). I/O runs on
+the Tokio runtime and publishes `FtpEvent::Changed` notifications; the shell
+refreshes from a cheap snapshot. This keeps SFTP independent of terminal tabs
+and allows the browser to stay open while sessions come and go.
+
+## 6. Terminal
 `crates/vt` is UI-independent:
 
 - `vte::Parser` drives a `Terminal` implementing `Perform`.

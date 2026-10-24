@@ -10,6 +10,7 @@
 
 mod ai;
 mod commands_plugin;
+mod ftp;
 mod highlights;
 mod i18n;
 mod logging;
@@ -46,4 +47,5 @@ pub fn install(ctx: &Context) {
     ctx.plugin(logging::LoggingPlugin);
     ctx.plugin(mcp::McpPlugin);
     ctx.plugin(ai::AiPlugin);
+    ctx.plugin(ftp::FtpPlugin);
 }
