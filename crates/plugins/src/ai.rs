@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use xcord_cordis::{Context, Plugin, PluginMeta, Result};
 use xcord_plugin_api::{
     services, Ai, AiAssistant, AiMessageView, AiSnapshot, Command, Commands, I18n, McpTools,
-    PostOffice, Runtime, RuntimeHandle, Sessions, ToolSpec, Ui, UiCommand, Workspace,
+    PostOffice, Runtime, RuntimeHandle, Sessions, TerminalId, ToolSpec, Ui, UiCommand, Workspace,
 };
 
 const INTERNAL_AI: &str = "ai/internal";
@@ -85,6 +85,7 @@ impl Plugin for AiPlugin {
             status: RefCell::new(String::new()),
             error: RefCell::new(None),
             has_key: Cell::new(false),
+            context_terminal: Cell::new(None),
         });
         service.refresh_key();
 
@@ -202,6 +203,7 @@ pub struct AiService {
     status: RefCell<String>,
     error: RefCell<Option<String>>,
     has_key: Cell<bool>,
+    context_terminal: Cell<Option<TerminalId>>,
 }
 
 impl AiService {
@@ -256,13 +258,17 @@ impl AiService {
         if !settings.ai_include_terminal {
             return None;
         }
-        let active = self.workspace.active()?;
-        let tab = self
-            .workspace
-            .tabs()
-            .into_iter()
-            .find(|tab| tab.id == active)?;
-        let text = self.workspace.terminal_text(active, 220)?;
+        let tabs = self.workspace.tabs();
+        let explicit = self
+            .context_terminal
+            .get()
+            .filter(|id| tabs.iter().any(|tab| tab.id == *id));
+        if self.context_terminal.get().is_some() && explicit.is_none() {
+            self.context_terminal.set(None);
+        }
+        let id = explicit.or_else(|| self.workspace.active())?;
+        let tab = tabs.into_iter().find(|tab| tab.id == id)?;
+        let text = self.workspace.terminal_text(id, 220)?;
         let text = if text.len() > 9000 {
             let mut start = text.len() - 9000;
             while !text.is_char_boundary(start) {
@@ -273,7 +279,12 @@ impl AiService {
             &text
         };
         Some(format!(
-            "Current tab: id={} title={:?} {}@{}:{} status={}.\nRecent terminal output (may include stale text):\n```\n{}\n```",
+            "{}: id={} title={:?} {}@{}:{} status={}.\nRecent terminal output (may include stale text):\n```\n{}\n```",
+            if explicit.is_some() {
+                "User-pinned conversation tab"
+            } else {
+                "Current active tab"
+            },
             tab.id.raw(),
             tab.title,
             tab.user,
@@ -425,6 +436,18 @@ impl AiAssistant for AiService {
                 });
             }
         }
+        let tabs = self.workspace.tabs();
+        let explicit = self
+            .context_terminal
+            .get()
+            .filter(|id| tabs.iter().any(|tab| tab.id == *id));
+        if self.context_terminal.get().is_some() && explicit.is_none() {
+            self.context_terminal.set(None);
+        }
+        let context = explicit.or_else(|| self.workspace.active());
+        let context_title = context
+            .and_then(|id| tabs.into_iter().find(|tab| tab.id == id))
+            .map(|tab| tab.title);
         AiSnapshot {
             messages,
             streaming: self.streaming.get(),
@@ -435,7 +458,18 @@ impl AiAssistant for AiService {
             has_key: self.has_key.get(),
             allow_writes: settings.ai_allow_writes,
             include_terminal: settings.ai_include_terminal,
+            context_terminal: context,
+            context_title,
+            context_follows_active: explicit.is_none(),
         }
+    }
+
+    fn set_context_terminal(&self, id: Option<TerminalId>) {
+        self.context_terminal.set(id);
+    }
+
+    fn context_terminal(&self) -> Option<TerminalId> {
+        self.context_terminal.get()
     }
 
     fn send(&self, prompt: &str) -> std::result::Result<(), String> {

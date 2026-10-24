@@ -76,9 +76,11 @@ guide, the threading model, and the session-open sequence.
 - **MCP server**: 12 tools and 3 resources (plus a terminal template) over
   localhost JSON-RPC, with a stdio bridge for Claude Desktop, Cursor, and other
   MCP clients.
-- **AI copilot**: streaming chat, terminal context, and tool calling through the
-  MCP registry. It works with OpenAI, DeepSeek, Ollama/vLLM, and any compatible
-  endpoint. Terminal writes are blocked unless explicitly enabled.
+- **AI copilot**: streaming chat, selectable terminal context, and tool calling
+  through the MCP registry. Pick the conversation terminal from the chips above
+  the chat; **Follow active tab** is the default. It works with OpenAI, DeepSeek,
+  Ollama/vLLM, and any compatible endpoint. Terminal writes are blocked unless
+  explicitly enabled.
 
 ### Keyboard shortcuts
 
@@ -238,8 +240,9 @@ Ollama) or enter any OpenAI-compatible base URL, and store an API key in the
 platform vault. The key can also come from `XCORD_AI_API_KEY`,
 `DEEPSEEK_API_KEY`, or `OPENAI_API_KEY`.
 
-- **Terminal context** sends the active tab's recent output to the model. Disable
-  it for sensitive hosts.
+- **Terminal context** sends the selected tab's recent output to the model. Use
+  the chips above the chat to pin a tab or follow the active one. Disable it for
+  sensitive hosts.
 - **Writes blocked** is the default. Enable it only when you want the model to
   call `terminal_send`, `open_session`, `close_tab`, or `run_command`.
 - Streaming, tool calls, tool results, and errors appear inline. `Ctrl+Shift+I`

@@ -270,6 +270,13 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Why did the last command fail?", "上一条命令为什么失败？"),
     ("Summarize open tabs", "汇总当前标签页"),
     ("Terminal context", "终端上下文"),
+    ("Conversation terminal", "对话终端"),
+    (
+        "Conversation terminal · {title}",
+        "对话终端 · {title}",
+    ),
+    ("Follow active tab", "跟随活动标签"),
+    ("No open terminals", "暂无打开的终端"),
     ("Writes allowed", "允许写入"),
     ("Writes blocked", "禁止写入"),
     ("Send", "发送"),
@@ -431,6 +438,9 @@ const STATUS_ZH: &[(&str, &str)] = &[
     ("failed", "失败"),
     ("unloaded", "已卸载"),
     ("unloading", "卸载中"),
+    ("connected", "已连接"),
+    ("connecting", "连接中"),
+    ("closed", "已关闭"),
 ];
 
 #[cfg(test)]

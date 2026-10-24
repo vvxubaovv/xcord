@@ -346,6 +346,9 @@ Key properties:
 - Mutating tools return a descriptive policy error unless the user enables
   **Writes allowed**; the default is read-only.
 - Terminal context is truncated on char boundaries and can be disabled per user.
+  The AI panel pins a conversation tab (`AiAssistant::set_context_terminal`);
+  without a pin it follows the active tab. Closing the pinned tab falls back to
+  the active one.
 - API keys come from the platform vault or `XCORD_AI_API_KEY` /
   `DEEPSEEK_API_KEY` / `OPENAI_API_KEY`.
 - Providers are plain OpenAI-compatible endpoints (OpenAI, DeepSeek, Ollama,

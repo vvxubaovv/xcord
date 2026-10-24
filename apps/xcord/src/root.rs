@@ -424,6 +424,11 @@ impl XcordApp {
 
     fn on_workspace_event(&mut self, event: WorkspaceEvent, cx: &mut Context<Self>) {
         self.sync(cx);
+        if let Some(id) = self.ai.context_terminal() {
+            if !self.tabs.iter().any(|tab| tab.id == id) {
+                self.ai.set_context_terminal(None);
+            }
+        }
         if let Some(tab) = self
             .active
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
@@ -1435,8 +1440,133 @@ impl XcordApp {
                             ),
                     ),
             )
+            .child(self.render_ai_context_bar(&snapshot, cx))
             .child(messages)
             .child(footer)
+    }
+
+    fn render_ai_context_bar(&self, snapshot: &AiSnapshot, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let title = match &snapshot.context_title {
+            Some(title) => self.tr_args(
+                "Conversation terminal · {title}",
+                &[("title", title.clone())],
+            ),
+            None => self.tr("Conversation terminal"),
+        };
+        let mut tabs = div()
+            .id("ai-context-tabs")
+            .flex()
+            .gap_1()
+            .overflow_x_scroll()
+            .pb_1();
+        tabs = tabs.child(
+            div()
+                .id("ai-context-follow")
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(if snapshot.context_follows_active {
+                    rgbc(theme.accent)
+                } else {
+                    rgbc(theme.border)
+                })
+                .bg(if snapshot.context_follows_active {
+                    rgba(theme.accent, 0.18)
+                } else {
+                    rgba(theme.panel_alt, 0.0)
+                })
+                .text_size(px(10.))
+                .text_color(if snapshot.context_follows_active {
+                    rgbc(theme.accent)
+                } else {
+                    rgbc(theme.muted)
+                })
+                .cursor_pointer()
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.ai.set_context_terminal(None);
+                        cx.notify();
+                    }),
+                )
+                .child(self.tr("Follow active tab")),
+        );
+        for tab in &self.tabs {
+            let id = tab.id;
+            let selected =
+                !snapshot.context_follows_active && snapshot.context_terminal == Some(id);
+            let label = if tab.title.is_empty() {
+                format!("#{}", id.raw())
+            } else {
+                tab.title.clone()
+            };
+            tabs = tabs.child(
+                div()
+                    .id(SharedString::from(format!("ai-context-{}", id.raw())))
+                    .px_2()
+                    .py_1()
+                    .max_w(px(150.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if selected {
+                        rgbc(theme.accent)
+                    } else {
+                        rgbc(theme.border)
+                    })
+                    .bg(if selected {
+                        rgba(theme.accent, 0.18)
+                    } else {
+                        rgba(theme.panel_alt, 0.0)
+                    })
+                    .text_size(px(10.))
+                    .text_color(if selected {
+                        rgbc(theme.accent)
+                    } else {
+                        rgbc(theme.muted)
+                    })
+                    .cursor_pointer()
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.ai.set_context_terminal(Some(id));
+                            this.workspace.select(id);
+                            this.sync(cx);
+                            this.pending_focus = Some(PendingFocus::AiInput);
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+        if self.tabs.is_empty() {
+            tabs = tabs.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(10.))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("No open terminals")),
+            );
+        }
+        div()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(rgbc(theme.border))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(title),
+            )
+            .child(tabs)
     }
 
     fn render_ai_config(&self, cx: &mut Context<Self>) -> Div {
