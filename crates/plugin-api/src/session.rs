@@ -11,6 +11,8 @@ pub trait SessionService {
     fn list(&self) -> Vec<SessionProfile>;
     fn groups(&self) -> Vec<String>;
     fn create_group(&self, name: &str) -> Result<(), String>;
+    fn rename_group(&self, old: &str, new: &str) -> Result<(), String>;
+    fn move_group(&self, name: &str, target: Option<&str>, after: bool) -> Result<(), String>;
     fn move_session(
         &self,
         id: &str,

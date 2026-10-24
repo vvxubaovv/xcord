@@ -77,6 +77,57 @@ impl SessionService for SessionManager {
             .map_err(|error| error.to_string())
     }
 
+    fn rename_group(&self, old: &str, new: &str) -> std::result::Result<(), String> {
+        let new = new.trim();
+        if new.is_empty() {
+            return Err("Group name cannot be empty.".to_string());
+        }
+        if old == new {
+            return Ok(());
+        }
+        if self.store.config().groups.iter().any(|group| group == new) {
+            return Err("A group with that name already exists.".to_string());
+        }
+        let old = old.to_string();
+        let new = new.to_string();
+        self.store
+            .update(|config| {
+                for group in &mut config.groups {
+                    if group == &old {
+                        *group = new.clone();
+                    }
+                }
+                for session in &mut config.sessions {
+                    if session.group == old {
+                        session.group = new.clone();
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn move_group(
+        &self,
+        name: &str,
+        target: Option<&str>,
+        after: bool,
+    ) -> std::result::Result<(), String> {
+        let mut groups = self.store.config().groups;
+        let Some(index) = groups.iter().position(|group| group == name) else {
+            return Err("Group no longer exists.".to_string());
+        };
+        let name = groups.remove(index);
+        let insert_at = target
+            .and_then(|target| groups.iter().position(|group| group == target))
+            .map(|index| if after { index + 1 } else { index })
+            .unwrap_or(groups.len())
+            .min(groups.len());
+        groups.insert(insert_at, name);
+        self.store
+            .update(|config| config.groups = groups)
+            .map_err(|error| error.to_string())
+    }
+
     fn move_session(
         &self,
         id: &str,

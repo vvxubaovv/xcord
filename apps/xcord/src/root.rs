@@ -5,7 +5,7 @@
 //! commands. Plugins can be reloaded without touching this file.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,7 @@ struct SessionForm {
 
 struct GroupForm {
     name: Entity<TextInput>,
+    editing: Option<String>,
     error: Option<String>,
 }
 
@@ -69,6 +70,32 @@ struct DragHover {
 struct SessionDragPreview {
     name: String,
     theme: Theme,
+}
+
+#[derive(Clone)]
+struct DraggedGroup {
+    name: String,
+}
+
+struct GroupDragPreview {
+    name: String,
+    theme: Theme,
+}
+
+impl Render for GroupDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(self.theme.accent))
+            .bg(rgbc(self.theme.panel_alt))
+            .text_size(px(10.))
+            .font_weight(gpui::FontWeight::BOLD)
+            .text_color(rgbc(self.theme.foreground))
+            .child(self.name.clone())
+    }
 }
 
 impl Render for SessionDragPreview {
@@ -173,8 +200,11 @@ pub struct XcordApp {
 
     session_form: Option<SessionForm>,
     session_menu: Option<String>,
+    group_menu: Option<String>,
     group_form: Option<GroupForm>,
+    collapsed_groups: RefCell<HashSet<String>>,
     drag_hover: RefCell<Option<DragHover>>,
+    group_drag_hover: RefCell<Option<(String, bool)>>,
     settings_form: Option<SettingsForm>,
     ai_config: Option<AiConfigForm>,
     test_id: Option<u64>,
@@ -301,8 +331,11 @@ impl XcordApp {
             ai_selection_owner: Rc::new(Cell::new(None)),
             session_form: None,
             session_menu: None,
+            group_menu: None,
             group_form: None,
+            collapsed_groups: RefCell::new(HashSet::new()),
             drag_hover: RefCell::new(None),
+            group_drag_hover: RefCell::new(None),
             settings_form: None,
             ai_config: None,
             test_id: None,
@@ -620,8 +653,27 @@ impl XcordApp {
     fn open_group_dialog(&mut self, cx: &mut Context<Self>) {
         let theme = self.theme.clone();
         let name = Self::make_input(&theme, &self.tr("Group name"), false, cx);
-        self.group_form = Some(GroupForm { name, error: None });
+        self.group_form = Some(GroupForm {
+            name,
+            editing: None,
+            error: None,
+        });
         self.session_menu = None;
+        self.group_menu = None;
+        cx.notify();
+    }
+
+    fn open_rename_group_dialog(&mut self, group: &str, cx: &mut Context<Self>) {
+        let theme = self.theme.clone();
+        let name = Self::make_input(&theme, &self.tr("Group name"), false, cx);
+        name.update(cx, |input, cx| input.set_value(group.to_string(), cx));
+        self.group_form = Some(GroupForm {
+            name,
+            editing: Some(group.to_string()),
+            error: None,
+        });
+        self.session_menu = None;
+        self.group_menu = None;
         cx.notify();
     }
 
@@ -630,11 +682,35 @@ impl XcordApp {
             return;
         };
         let name = form.name.read(cx).value().trim().to_string();
+        let editing = form.editing.clone();
         if name.is_empty() {
             let error = self.tr("Group name cannot be empty.");
             if let Some(form) = &mut self.group_form {
                 form.error = Some(error);
             }
+            cx.notify();
+            return;
+        }
+        if let Some(old) = editing.clone() {
+            if let Err(error) = self.sessions.rename_group(&old, &name) {
+                if let Some(form) = &mut self.group_form {
+                    form.error = Some(error);
+                }
+                cx.notify();
+                return;
+            }
+            {
+                let mut collapsed = self.collapsed_groups.borrow_mut();
+                if collapsed.remove(&old) {
+                    collapsed.insert(name.clone());
+                }
+            }
+            self.group_form = None;
+            self.sync(cx);
+            self.set_notice(
+                NoticeLevel::Info,
+                self.tr_args("Group renamed to {name}", &[("name", name)]),
+            );
             cx.notify();
             return;
         }
@@ -674,7 +750,11 @@ impl XcordApp {
                     .text_size(px(15.))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(rgbc(theme.foreground))
-                    .child(self.tr("New group")),
+                    .child(self.tr(if form.editing.is_some() {
+                        "Rename group"
+                    } else {
+                        "New group"
+                    })),
             )
             .child(
                 div()
@@ -714,10 +794,20 @@ impl XcordApp {
                             cx.notify();
                         }),
                     ))
-                    .child(primary_button(self.tr("Create"), theme).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.save_group(cx)),
-                    )),
+                    .child(
+                        primary_button(
+                            self.tr(if form.editing.is_some() {
+                                "Save"
+                            } else {
+                                "Create"
+                            }),
+                            theme,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.save_group(cx)),
+                        ),
+                    ),
             )
     }
 
@@ -2633,6 +2723,10 @@ impl XcordApp {
                 self.session_menu = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.group_menu.is_some() {
+                self.group_menu = None;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.plugins_panel {
                 self.plugins_panel = false;
                 cx.notify();
@@ -2725,20 +2819,35 @@ impl XcordApp {
         let theme = self.theme();
         let sessions = self.filtered_sessions(cx);
         let query = self.search.read(cx).value();
-        let mut groups: BTreeMap<String, Vec<SessionProfile>> = BTreeMap::new();
-        if query.trim().is_empty() {
-            for group in self.sessions.groups() {
-                groups.entry(group).or_default();
-            }
-            groups.entry("Sessions".to_string()).or_default();
+        let search_active = !query.trim().is_empty();
+        let mut order = self.sessions.groups();
+        if !order.iter().any(|group| group == "Sessions") {
+            order.push("Sessions".to_string());
         }
+        for profile in &sessions {
+            let group = if profile.group.trim().is_empty() {
+                "Sessions".to_string()
+            } else {
+                profile.group.clone()
+            };
+            if !order.iter().any(|existing| existing == &group) {
+                order.push(group);
+            }
+        }
+        let mut groups: Vec<(String, Vec<SessionProfile>)> =
+            order.into_iter().map(|group| (group, Vec::new())).collect();
         for profile in sessions {
             let group = if profile.group.trim().is_empty() {
                 "Sessions".to_string()
             } else {
                 profile.group.clone()
             };
-            groups.entry(group).or_default().push(profile);
+            if let Some((_, profiles)) = groups.iter_mut().find(|(name, _)| name == &group) {
+                profiles.push(profile);
+            }
+        }
+        if search_active {
+            groups.retain(|(_, profiles)| !profiles.is_empty());
         }
 
         let mut list = div()
@@ -2762,28 +2871,88 @@ impl XcordApp {
         for (group, profiles) in groups {
             let group_drag = group.clone();
             let group_drop = group.clone();
+            let group_session_drop = group.clone();
+            let group_session_hover = group.clone();
+            let group_toggle = group.clone();
+            let group_menu_target = group.clone();
+            let collapsed = self.collapsed_groups.borrow().contains(&group);
             let header_hover = self
                 .drag_hover
                 .borrow()
                 .as_ref()
                 .is_some_and(|hover| hover.target.is_none() && hover.group == group);
+            let group_hover = self
+                .group_drag_hover
+                .borrow()
+                .as_ref()
+                .is_some_and(|(target, _)| target == &group);
+            let group_drag_theme = theme.clone();
             list = list.child(
                 div()
                     .id(SharedString::from(format!("group-{group}")))
                     .px_2()
                     .pt_3()
                     .pb_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .text_size(px(9.5))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(if header_hover {
+                    .text_color(if header_hover || group_hover {
                         rgbc(theme.accent)
                     } else {
                         rgbc(theme.muted)
                     })
+                    .cursor_pointer()
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.toggle_group(&group_toggle, cx)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.group_menu = Some(group_menu_target.clone());
+                            this.session_menu = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_drag(
+                        DraggedGroup {
+                            name: group_drag.clone(),
+                        },
+                        move |drag, _, _, cx| {
+                            let theme = group_drag_theme.clone();
+                            cx.new(|_| GroupDragPreview {
+                                name: drag.name.clone(),
+                                theme,
+                            })
+                        },
+                    )
+                    .on_drag_move::<DraggedGroup>(cx.listener(
+                        move |this, event: &DragMoveEvent<DraggedGroup>, _, cx| {
+                            let after = event.event.position.y >= event.bounds.center().y;
+                            this.group_drag_hover
+                                .replace(Some((group_drag.clone(), after)));
+                            cx.notify();
+                        },
+                    ))
+                    .on_drop::<DraggedGroup>(cx.listener(
+                        move |this, drag: &DraggedGroup, _, cx| {
+                            let after = this
+                                .group_drag_hover
+                                .borrow()
+                                .as_ref()
+                                .filter(|(target, _)| target == &group_drop)
+                                .map(|(_, after)| *after)
+                                .unwrap_or(true);
+                            this.drop_group(drag, &group_drop, after, cx);
+                        },
+                    ))
                     .on_drag_move::<DraggedSession>(cx.listener(
                         move |this, _event: &DragMoveEvent<DraggedSession>, _, cx| {
                             this.drag_hover.replace(Some(DragHover {
-                                group: group_drag.clone(),
+                                group: group_session_hover.clone(),
                                 target: None,
                                 after: true,
                             }));
@@ -2792,11 +2961,19 @@ impl XcordApp {
                     ))
                     .on_drop::<DraggedSession>(cx.listener(
                         move |this, drag: &DraggedSession, _, cx| {
-                            this.move_session_to_group(&drag.id, &group_drop, cx);
+                            this.move_session_to_group(&drag.id, &group_session_drop, cx);
                         },
                     ))
-                    .child(self.tr(&group).to_uppercase()),
+                    .child(div().w(px(9.)).child(if collapsed { "▸" } else { "▾" }))
+                    .child(div().flex_1().child(self.tr(&group).to_uppercase()))
+                    .child(format!("{}", profiles.len())),
             );
+            if self.group_menu.as_deref() == Some(group.as_str()) {
+                list = list.child(self.render_group_menu(&group, cx));
+            }
+            if collapsed {
+                continue;
+            }
             for profile in profiles {
                 let profile_id = profile.id.clone();
                 list = list.child(self.render_session_row(profile, cx));
@@ -3199,6 +3376,107 @@ impl XcordApp {
         }
         self.session_menu = None;
         self.drag_hover.replace(None);
+        self.sync(cx);
+        cx.notify();
+    }
+
+    fn render_group_menu(&self, group: &str, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let rename_group = group.to_string();
+        let collapse_group = group.to_string();
+        let collapsed = self.collapsed_groups.borrow().contains(group);
+        let button = |suffix: &str, label: String, theme: &Theme| {
+            div()
+                .id(SharedString::from(format!("group-menu-{suffix}-{group}")))
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(rgbc(theme.background))
+                .text_size(px(10.5))
+                .text_color(rgbc(theme.foreground))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel)))
+                .child(label)
+        };
+        div()
+            .mx_2()
+            .mb_1()
+            .p_1()
+            .flex()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel_alt))
+            .child(
+                button("rename", self.tr("Rename group"), theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_rename_group_dialog(&rename_group, cx);
+                    }),
+                ),
+            )
+            .child(button("new", self.tr("New group"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.open_group_dialog(cx);
+                }),
+            ))
+            .child(
+                button(
+                    "collapse",
+                    self.tr(if collapsed { "Expand" } else { "Collapse" }),
+                    theme,
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.toggle_group(&collapse_group, cx);
+                        this.group_menu = None;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(button("cancel", self.tr("Cancel"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.group_menu = None;
+                    cx.notify();
+                }),
+            ))
+    }
+
+    fn toggle_group(&mut self, group: &str, cx: &mut Context<Self>) {
+        {
+            let mut collapsed = self.collapsed_groups.borrow_mut();
+            if !collapsed.remove(group) {
+                collapsed.insert(group.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    fn drop_group(
+        &mut self,
+        drag: &DraggedGroup,
+        target: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if drag.name == target {
+            self.group_drag_hover.replace(None);
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.sessions.move_group(&drag.name, Some(target), after) {
+            self.set_notice(NoticeLevel::Error, error);
+            return;
+        }
+        self.group_drag_hover.replace(None);
+        self.group_menu = None;
         self.sync(cx);
         cx.notify();
     }
