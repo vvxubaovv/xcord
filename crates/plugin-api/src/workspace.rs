@@ -121,6 +121,8 @@ pub trait WorkspaceService {
     fn select(&self, id: TerminalId);
     fn select_next(&self);
     fn select_previous(&self);
+    /// Reorder a tab before/after another tab in the tab bar.
+    fn move_tab(&self, id: TerminalId, target: TerminalId, after: bool);
 
     fn open(&self, request: OpenRequest) -> Result<TerminalId, String>;
     fn close(&self, id: TerminalId);

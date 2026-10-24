@@ -5,7 +5,7 @@
 //! commands. Plugins can be reloaded without touching this file.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -81,6 +81,32 @@ struct DraggedGroup {
 struct GroupDragPreview {
     name: String,
     theme: Theme,
+}
+
+#[derive(Clone)]
+struct DraggedTab {
+    id: TerminalId,
+    name: String,
+}
+
+struct TabDragPreview {
+    name: String,
+    theme: Theme,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(self.theme.accent))
+            .bg(rgbc(self.theme.panel_alt))
+            .text_size(px(11.))
+            .text_color(rgbc(self.theme.foreground))
+            .child(self.name.clone())
+    }
 }
 
 impl Render for GroupDragPreview {
@@ -206,6 +232,7 @@ pub struct XcordApp {
     collapsed_groups: RefCell<HashSet<String>>,
     drag_hover: RefCell<Option<DragHover>>,
     group_drag_hover: RefCell<Option<(String, bool)>>,
+    tab_drag_hover: RefCell<Option<(TerminalId, bool)>>,
     last_session_open: RefCell<Option<(String, Instant)>>,
     settings_form: Option<SettingsForm>,
     ai_config: Option<AiConfigForm>,
@@ -338,6 +365,7 @@ impl XcordApp {
             collapsed_groups: RefCell::new(HashSet::new()),
             drag_hover: RefCell::new(None),
             group_drag_hover: RefCell::new(None),
+            tab_drag_hover: RefCell::new(None),
             last_session_open: RefCell::new(None),
             settings_form: None,
             ai_config: None,
@@ -514,6 +542,21 @@ impl XcordApp {
 
     fn sync(&mut self, cx: &mut Context<Self>) {
         self.tabs = self.workspace.tabs();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for tab in &mut self.tabs {
+            let count = counts.entry(tab.profile_id.clone()).or_insert(0);
+            *count += 1;
+            let base = if tab.profile_name.trim().is_empty() {
+                tab.title.clone()
+            } else {
+                tab.profile_name.clone()
+            };
+            tab.title = if *count == 1 {
+                base
+            } else {
+                format!("{base} ({count})")
+            };
+        }
         self.active = self.workspace.active();
         self.theme = self.themes.active();
         if self.terminal_active != self.active {
@@ -3579,81 +3622,172 @@ impl XcordApp {
             .flex_1()
             .overflow_hidden()
             .px_2();
+        let mut groups = self.sessions.groups();
+        if !groups.iter().any(|group| group == "Sessions") {
+            groups.push("Sessions".to_string());
+        }
+        let group_for = |profile_id: &str| {
+            self.sessions
+                .get(profile_id)
+                .map(|profile| {
+                    if profile.group.trim().is_empty() {
+                        "Sessions".to_string()
+                    } else {
+                        profile.group
+                    }
+                })
+                .unwrap_or_else(|| "Sessions".to_string())
+        };
         for tab in &self.tabs {
-            let active = Some(tab.id) == self.active;
-            let tab_id = tab.id;
-            let dot = match &tab.status {
-                TabStatus::Connected => rgbc(theme.success),
-                TabStatus::Connecting => rgbc(theme.accent),
-                TabStatus::Failed(_) => rgbc(theme.danger),
-                TabStatus::Closed => rgbc(theme.muted),
-            };
+            let group = group_for(&tab.profile_id);
+            if !groups.iter().any(|existing| existing == &group) {
+                groups.push(group);
+            }
+        }
+        for group in groups {
+            let group_tabs = self
+                .tabs
+                .iter()
+                .filter(|tab| group_for(&tab.profile_id) == group)
+                .cloned()
+                .collect::<Vec<_>>();
+            if group_tabs.is_empty() {
+                continue;
+            }
             tabs = tabs.child(
                 div()
-                    .id(SharedString::from(format!("tab-{}", tab.id)))
-                    .h(px(34.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .rounded_md()
-                    .bg(if active {
-                        rgbc(theme.background)
-                    } else {
-                        rgba(theme.panel_alt, 0.0)
-                    })
-                    .border_1()
-                    .border_color(if active {
-                        rgbc(theme.border)
-                    } else {
-                        rgba(theme.border, 0.0)
-                    })
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            this.workspace.select(tab_id);
-                            this.pending_focus = Some(PendingFocus::Terminal);
-                            let _ = window;
-                            this.sync(cx);
-                            cx.notify();
-                        }),
-                    )
-                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(dot))
-                    .child(
-                        div()
-                            .max_w(px(180.))
-                            .text_size(px(12.))
-                            .text_color(if active {
-                                rgbc(theme.foreground)
-                            } else {
-                                rgbc(theme.muted)
-                            })
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(tab.title.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("close-{}", tab.id)))
-                            .px_1()
-                            .rounded_sm()
-                            .text_size(px(12.))
-                            .text_color(rgbc(theme.muted))
-                            .cursor_pointer()
-                            .hover(|style| style.text_color(rgbc(theme.danger)))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.workspace.close(tab_id);
-                                    this.sync(cx);
-                                    cx.notify();
-                                }),
-                            )
-                            .child("×"),
-                    ),
+                    .px_2()
+                    .text_size(px(8.5))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.muted))
+                    .border_r_1()
+                    .border_color(rgbc(theme.border))
+                    .child(self.tr(&group).to_uppercase()),
             );
+            for tab in group_tabs {
+                let active = Some(tab.id) == self.active;
+                let tab_id = tab.id;
+                let dot = match &tab.status {
+                    TabStatus::Connected => rgbc(theme.success),
+                    TabStatus::Connecting => rgbc(theme.accent),
+                    TabStatus::Failed(_) => rgbc(theme.danger),
+                    TabStatus::Closed => rgbc(theme.muted),
+                };
+                let tab_theme = theme.clone();
+                let drag_name = tab.title.clone();
+                let drop_target = tab.id;
+                let hover = self
+                    .tab_drag_hover
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(target, _)| *target == tab.id);
+                tabs = tabs.child(
+                    div()
+                        .id(SharedString::from(format!("tab-{}", tab.id)))
+                        .h(px(34.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .rounded_md()
+                        .bg(if hover {
+                            rgba(theme.accent, 0.16)
+                        } else if active {
+                            rgbc(theme.background)
+                        } else {
+                            rgba(theme.panel_alt, 0.0)
+                        })
+                        .border_1()
+                        .border_color(if active {
+                            rgbc(theme.border)
+                        } else {
+                            rgba(theme.border, 0.0)
+                        })
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                        .on_drag(
+                            DraggedTab {
+                                id: tab.id,
+                                name: drag_name,
+                            },
+                            move |drag, _, _, cx| {
+                                let theme = tab_theme.clone();
+                                cx.new(|_| TabDragPreview {
+                                    name: drag.name.clone(),
+                                    theme,
+                                })
+                            },
+                        )
+                        .on_drag_move::<DraggedTab>(cx.listener(
+                            move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                                let after = event.event.position.y >= event.bounds.center().y;
+                                this.tab_drag_hover.replace(Some((drop_target, after)));
+                                cx.notify();
+                            },
+                        ))
+                        .on_drop::<DraggedTab>(cx.listener(
+                            move |this, drag: &DraggedTab, _, cx| {
+                                if drag.id != drop_target {
+                                    let after = this
+                                        .tab_drag_hover
+                                        .borrow()
+                                        .as_ref()
+                                        .filter(|(target, _)| *target == drop_target)
+                                        .map(|(_, after)| *after)
+                                        .unwrap_or(true);
+                                    this.workspace.move_tab(drag.id, drop_target, after);
+                                    this.sync(cx);
+                                }
+                                this.tab_drag_hover.replace(None);
+                                cx.notify();
+                            },
+                        ))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.workspace.select(tab_id);
+                                this.pending_focus = Some(PendingFocus::Terminal);
+                                let _ = window;
+                                this.sync(cx);
+                                cx.notify();
+                            }),
+                        )
+                        .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(dot))
+                        .child(
+                            div()
+                                .max_w(px(180.))
+                                .text_size(px(12.))
+                                .text_color(if active {
+                                    rgbc(theme.foreground)
+                                } else {
+                                    rgbc(theme.muted)
+                                })
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(tab.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("close-{}", tab.id)))
+                                .px_1()
+                                .rounded_sm()
+                                .text_size(px(12.))
+                                .text_color(rgbc(theme.muted))
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(rgbc(theme.danger)))
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.workspace.close(tab_id);
+                                        this.tab_drag_hover.replace(None);
+                                        this.sync(cx);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child("×"),
+                        ),
+                );
+            }
         }
 
         div()
@@ -3664,6 +3798,22 @@ impl XcordApp {
             .border_b_1()
             .border_color(rgbc(theme.border))
             .child(tabs)
+            .child(
+                div()
+                    .id("new-tab-group")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_size(px(10.))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgbc(theme.accent)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.open_group_dialog(cx)),
+                    )
+                    .child(self.tr("Group")),
+            )
             .child(
                 div()
                     .id("new-tab")

@@ -781,6 +781,26 @@ impl WorkspaceService for WorkspaceState {
         self.select(previous);
     }
 
+    fn move_tab(&self, id: TerminalId, target: TerminalId, after: bool) {
+        if id == target {
+            return;
+        }
+        let mut tabs = self.tabs.borrow_mut();
+        let Some(index) = tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let tab = tabs.remove(index);
+        let insert_at = tabs
+            .iter()
+            .position(|tab| tab.id == target)
+            .map(|index| if after { index + 1 } else { index })
+            .unwrap_or(tabs.len())
+            .min(tabs.len());
+        tabs.insert(insert_at, tab);
+        drop(tabs);
+        self.emit(WorkspaceEvent::TabsChanged);
+    }
+
     fn open(&self, request: OpenRequest) -> std::result::Result<TerminalId, String> {
         self.open_impl(request)
     }

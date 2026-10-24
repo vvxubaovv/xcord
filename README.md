@@ -60,6 +60,10 @@ guide, the threading model, and the session-open sequence.
 - **Terminal**: xterm-256color, truecolor, alt screen, scroll regions, SGR,
   wide characters, combining marks, OSC title/clipboard, bracketed paste,
   application cursor keys, scrollback, selection/copy/paste.
+- **Tab bar**: tabs use the configuration name; repeated connections to one
+  profile are auto-numbered (`wsl`, `wsl (2)`, …). Drag tabs left/right to
+  reorder, and use the **Group** button to create a session group. Tabs are
+  grouped under their session group labels.
 - **ZMODEM (`lrzsz`)**: `sz file` downloads automatically into `Downloads`
   (unique names, no overwrite); `rz` opens a multi-file picker and uploads the
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
