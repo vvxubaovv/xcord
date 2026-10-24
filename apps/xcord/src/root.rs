@@ -2892,6 +2892,13 @@ impl XcordApp {
             )
     }
 
+    fn snippet_label(&self, name: &str) -> String {
+        match name {
+            "List files" | "Disk usage" | "Tail syslog" => self.tr(name),
+            _ => name.to_string(),
+        }
+    }
+
     fn render_compose(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let snippets = self.sessions.snippets();
@@ -2917,7 +2924,7 @@ impl XcordApp {
                             this.send_snippet(&command, enter, cx);
                         }),
                     )
-                    .child(snippet.name.clone()),
+                    .child(self.snippet_label(&snippet.name)),
             );
         }
 
@@ -2946,7 +2953,7 @@ impl XcordApp {
                     .rounded_md()
                     .child(self.compose.clone()),
             )
-            .child(primary_button("Send", theme).on_mouse_up(
+            .child(primary_button(self.tr("Send"), theme).on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.send_compose(window, cx)),
             ))

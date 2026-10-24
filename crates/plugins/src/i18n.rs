@@ -275,6 +275,9 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Selected message", "已选择消息"),
     ("Whole conversation", "整个对话"),
     ("Select files to send with rz", "选择要通过 rz 发送的文件"),
+    ("List files", "列出文件"),
+    ("Disk usage", "磁盘使用"),
+    ("Tail syslog", "跟踪系统日志"),
     ("Sending files to remote rz…", "正在向远端 rz 发送文件…"),
     ("Conversation terminal", "对话终端"),
     (
