@@ -917,6 +917,13 @@ fn encode_key(keystroke: &Keystroke, application_cursor: bool) -> Option<Vec<u8>
         "f11" => Some(tilde(23)),
         "f12" => Some(tilde(24)),
         "space" if control => Some(vec![0x00]),
+        "space" => {
+            if alt {
+                Some(b"\x1b ".to_vec())
+            } else {
+                Some(b" ".to_vec())
+            }
+        }
         _ => {
             if control && !alt {
                 let byte = key.as_bytes().first().copied()?;
@@ -960,5 +967,31 @@ fn function_key(number: u8, modifier: u8) -> Vec<u8> {
         format!("\x1b[1;{modifier}{code}").into_bytes()
     } else {
         format!("\x1bO{code}").into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::Modifiers;
+
+    fn key(name: &str) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: name.to_string(),
+            key_char: None,
+        }
+    }
+
+    #[test]
+    fn encodes_plain_space() {
+        assert_eq!(encode_key(&key("space"), false), Some(b" ".to_vec()));
+    }
+
+    #[test]
+    fn encodes_alt_space() {
+        let mut stroke = key("space");
+        stroke.modifiers.alt = true;
+        assert_eq!(encode_key(&stroke, false), Some(b"\x1b ".to_vec()));
     }
 }
