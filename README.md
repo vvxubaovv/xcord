@@ -76,8 +76,10 @@ guide, the threading model, and the session-open sequence.
 - **MCP server**: 12 tools and 3 resources (plus a terminal template) over
   localhost JSON-RPC, with a stdio bridge for Claude Desktop, Cursor, and other
   MCP clients.
-- **AI copilot**: streaming chat, selectable terminal context, and tool calling
-  through the MCP registry. Pick the conversation terminal from the chips above
+- **AI copilot**: streaming chat, selectable terminal context, auto-scroll, and
+  tool calling through the MCP registry. The chat follows new output until you
+  scroll up; use the right-side timeline (↑ last prompt, dots for each prompt,
+  ↓ latest) to jump around. Pick the conversation terminal from the chips above
   the chat; **Follow active tab** is the default. It works with OpenAI, DeepSeek,
   Ollama/vLLM, and any compatible endpoint. Terminal writes are blocked unless
   explicitly enabled.

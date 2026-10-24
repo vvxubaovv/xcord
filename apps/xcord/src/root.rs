@@ -4,6 +4,7 @@
 //! service, renders the services plugins publish, and forwards user intent as
 //! commands. Plugins can be reloaded without touching this file.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ use async_channel::Receiver;
 use gpui::prelude::*;
 use gpui::{
     div, px, rgb, Context, Div, Entity, Font, Hsla, KeyDownEvent, MouseButton, PathPromptOptions,
-    Render, Rgba, SharedString, Stateful, Window,
+    Render, Rgba, ScrollHandle, SharedString, Stateful, Window,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -119,6 +120,11 @@ pub struct XcordApp {
     search: Entity<TextInput>,
     compose: Entity<TextInput>,
     ai_input: Entity<TextInput>,
+    ai_scroll: ScrollHandle,
+    ai_follow: Cell<bool>,
+    ai_jump_target: Cell<Option<usize>>,
+    ai_last_messages: Cell<usize>,
+    ai_last_chars: Cell<usize>,
 
     session_form: Option<SessionForm>,
     settings_form: Option<SettingsForm>,
@@ -236,6 +242,11 @@ impl XcordApp {
             search,
             compose,
             ai_input,
+            ai_scroll: ScrollHandle::new(),
+            ai_follow: Cell::new(true),
+            ai_jump_target: Cell::new(None),
+            ai_last_messages: Cell::new(0),
+            ai_last_chars: Cell::new(0),
             session_form: None,
             settings_form: None,
             ai_config: None,
@@ -511,6 +522,9 @@ impl XcordApp {
             UiCommand::ToggleAi => {
                 self.ai_open = !self.ai_open;
                 if self.ai_open {
+                    self.ai_follow.set(true);
+                    self.ai_jump_target.set(None);
+                    self.ai_scroll.scroll_to_bottom();
                     self.pending_focus = Some(PendingFocus::AiInput);
                 }
             }
@@ -1167,6 +1181,9 @@ impl XcordApp {
         if prompt.is_empty() {
             return;
         }
+        self.ai_follow.set(true);
+        self.ai_jump_target.set(None);
+        self.ai_scroll.scroll_to_bottom();
         match self.ai.send(&prompt) {
             Ok(()) => {
                 self.ai_input.update(cx, |input, cx| input.clear(cx));
@@ -1178,6 +1195,9 @@ impl XcordApp {
     }
 
     fn send_ai_prompt(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        self.ai_follow.set(true);
+        self.ai_jump_target.set(None);
+        self.ai_scroll.scroll_to_bottom();
         if let Err(error) = self.ai.send(prompt) {
             self.set_notice(NoticeLevel::Error, error);
         }
@@ -1210,12 +1230,35 @@ impl XcordApp {
     fn render_ai_panel(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let snapshot: AiSnapshot = self.ai.snapshot();
+        let message_count = snapshot.messages.len();
+        let char_count = snapshot
+            .messages
+            .iter()
+            .map(|message| message.text.len())
+            .sum::<usize>();
+        if message_count == 0 {
+            self.ai_follow.set(true);
+            self.ai_jump_target.set(None);
+        }
+        let changed =
+            message_count != self.ai_last_messages.get() || char_count != self.ai_last_chars.get();
+        self.ai_last_messages.set(message_count);
+        self.ai_last_chars.set(char_count);
+        if changed && self.ai_follow.get() {
+            self.ai_jump_target.set(None);
+            self.ai_scroll.scroll_to_bottom();
+        }
         let mut messages = div()
             .id("ai-messages")
             .flex()
             .flex_col()
             .gap_3()
             .flex_1()
+            .track_scroll(&self.ai_scroll)
+            .on_scroll_wheel(cx.listener(|this, _event, _, cx| {
+                this.ai_follow.set(false);
+                cx.notify();
+            }))
             .overflow_y_scroll()
             .px_3()
             .py_3();
@@ -1441,8 +1484,124 @@ impl XcordApp {
                     ),
             )
             .child(self.render_ai_context_bar(&snapshot, cx))
-            .child(messages)
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .child(messages)
+                    .child(self.render_ai_rail(&snapshot, cx)),
+            )
             .child(footer)
+    }
+
+    fn render_ai_rail(&self, snapshot: &AiSnapshot, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let user_indices = snapshot
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.role == "You")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let last_sent = user_indices.last().copied();
+        let selected = self.ai_jump_target.get();
+        let mut rail = div()
+            .w(px(26.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .py_2()
+            .border_l_1()
+            .border_color(rgbc(theme.border));
+
+        if let Some(last) = last_sent {
+            rail = rail.child(
+                div()
+                    .id("ai-jump-last-sent")
+                    .w(px(18.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .text_size(px(11.))
+                    .text_color(rgbc(theme.accent))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(theme.accent, 0.18)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.ai_follow.set(false);
+                            this.ai_jump_target.set(Some(last));
+                            this.ai_scroll.scroll_to_top_of_item(last);
+                            cx.notify();
+                        }),
+                    )
+                    .child("↑"),
+            );
+        }
+
+        for index in user_indices {
+            let is_selected = selected == Some(index);
+            let is_last = Some(index) == last_sent;
+            let size = if is_last { 9.0 } else { 7.0 };
+            rail = rail.child(
+                div()
+                    .id(SharedString::from(format!("ai-jump-{index}")))
+                    .w(px(size))
+                    .h(px(size))
+                    .rounded_full()
+                    .bg(if is_selected || (selected.is_none() && is_last) {
+                        rgbc(theme.accent)
+                    } else {
+                        rgbc(theme.border)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(theme.accent, 0.8)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.ai_follow.set(false);
+                            this.ai_jump_target.set(Some(index));
+                            this.ai_scroll.scroll_to_top_of_item(index);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+
+        rail.child(
+            div()
+                .id("ai-jump-latest")
+                .mt_auto()
+                .w(px(18.))
+                .h(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .text_size(px(12.))
+                .text_color(if self.ai_follow.get() {
+                    rgbc(theme.accent)
+                } else {
+                    rgbc(theme.muted)
+                })
+                .cursor_pointer()
+                .hover(|style| style.bg(rgba(theme.accent, 0.18)))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.ai_follow.set(true);
+                        this.ai_jump_target.set(None);
+                        this.ai_scroll.scroll_to_bottom();
+                        cx.notify();
+                    }),
+                )
+                .child("↓"),
+        )
     }
 
     fn render_ai_context_bar(&self, snapshot: &AiSnapshot, cx: &mut Context<Self>) -> Div {
@@ -2060,6 +2219,9 @@ impl XcordApp {
             .child(self.header_button(self.tr("AI"), cx, |this, cx| {
                 this.ai_open = !this.ai_open;
                 if this.ai_open {
+                    this.ai_follow.set(true);
+                    this.ai_jump_target.set(None);
+                    this.ai_scroll.scroll_to_bottom();
                     this.pending_focus = Some(PendingFocus::AiInput);
                 }
                 cx.notify();
