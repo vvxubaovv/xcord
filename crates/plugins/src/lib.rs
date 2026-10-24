@@ -11,6 +11,7 @@
 mod ai;
 mod commands_plugin;
 mod highlights;
+mod i18n;
 mod logging;
 mod mcp;
 mod runtime_plugin;
@@ -37,6 +38,7 @@ pub fn install(ctx: &Context) {
     ctx.plugin(transports::TransportsPlugin);
     ctx.plugin(ssh_transport::SshTransportPlugin);
     ctx.plugin(sessions::SessionsPlugin);
+    ctx.plugin(i18n::I18nPlugin);
     ctx.plugin(themes::ThemesPlugin);
     ctx.plugin(workspace::WorkspacePlugin);
     ctx.plugin(highlights::HighlightsPlugin);

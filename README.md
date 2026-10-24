@@ -38,6 +38,7 @@ thin — it renders services and forwards user intent.
 | `highlights` | `highlights` plugin | Regex coloring of output |
 | `commands` | `commands` plugin | Command-palette contributions |
 | `logging` | `logging` plugin | Per-session log files |
+| `i18n` | `i18n` plugin | Locale catalogs shared by shell and plugins |
 | `mcp-tools` / `mcp-resources` | `mcp` plugin | Capability registry exposed over MCP |
 | `ai` | `ai` plugin | Streaming copilot + tool-calling loop |
 | `ui-host` | **the shell** | Semantic commands from plugins to GPUI |
@@ -69,6 +70,9 @@ guide, the threading model, and the session-open sequence.
 - **Themes**: Xcord Dark, Midnight Blue, Paper Light.
 - **Plugin manager**: live plugin states, diagnostics, and hot reload of the
   highlighter.
+- **Localization**: Simplified Chinese by default, English available in Settings;
+  every plugin can register its own locale catalogs and unregister them on
+  unload. Command titles and plugin metadata are localized automatically.
 - **MCP server**: 12 tools and 3 resources (plus a terminal template) over
   localhost JSON-RPC, with a stdio bridge for Claude Desktop, Cursor, and other
   MCP clients.
@@ -140,6 +144,7 @@ registry.
 - macOS: `~/Library/Application Support/xcord/config.toml`
 - Linux: `$XDG_CONFIG_HOME/xcord/config.toml` (or `~/.config/xcord/config.toml`)
 - Override with `XCORD_CONFIG_DIR=/path/to/dir`.
+- `language` defaults to `zh-CN`; set it to `en-US` for English.
 
 Passwords are **never** written to `config.toml`. On Windows they are stored in
 Credential Manager under `xcord` / `session:<id>:password`; other platforms
@@ -149,6 +154,44 @@ keychain backend is enabled. `known_hosts` uses the standard OpenSSH file
 
 For automation, `XCORD_AUTOCONNECT=<session-id>` connects to a stored session on
 launch, and `XCORD_AI_PROMPT="..."` sends a copilot prompt on startup.
+
+### Localization
+
+The UI defaults to **Simplified Chinese**. Switch between `中文（简体）` and
+`English` under **Settings → Language**; the choice is stored as
+`language = "zh-CN"` / `"en-US"` in `config.toml`, and the window title and input
+placeholders update immediately.
+
+Translation catalogs are namespaced by domain and locale. The shell, command
+palette, plugin metadata and AI panel use these built-in domains:
+
+| Domain | Contents |
+|---|---|
+| `app` | shell labels, dialogs, status bar, settings |
+| `commands` | command titles keyed by command id |
+| `categories` | command categories |
+| `plugin` | plugin names/descriptions keyed by plugin id |
+| `status` | connection/plugin state labels |
+
+Plugins can contribute their own domain during `apply` and clean it up with a
+scoped effect:
+
+```rust
+let i18n = ctx.require::<I18n>(services::I18N)?;
+let handle = i18n.register_pairs(
+    "my-plugin",
+    "zh-CN",
+    &[("Hello", "你好"), ("{count} files", "{count} 个文件")],
+);
+ctx.effect("my-plugin translations", move || i18n.unregister(handle));
+```
+
+Keys that look like source strings (`"New session"`) fall back to the key itself,
+so English needs no separate catalog unless the wording should differ. The
+`ai` plugin is a complete example: it registers its own `ai` catalog and uses
+`I18n::t`/`t_args` for statuses and errors.
+
+![Localized settings](docs/settings-language.png)
 
 ### MCP server and AI copilot
 
@@ -217,6 +260,8 @@ cargo test --workspace
   UTF-8-safe truncation.
 - `xcord-plugin-api`: MCP tool/resource registry registration, dispatch and
   permissions.
+- `xcord-builtins` i18n: Chinese defaults, English fallback, plugin catalog
+  registration/unregistration.
 
 There is also an end-to-end SSH probe that speaks to a public test server:
 
@@ -233,7 +278,7 @@ crates/
   ssh/          russh transport, known_hosts, async session task
   store/        TOML workspace + platform secret vault
   plugin-api/   service contracts shared by plugins and shells
-  plugins/      first-party plugins (runtime, ssh, sessions, workspace, mcp, ai, ...)
+  plugins/      first-party plugins (runtime, ssh, sessions, workspace, i18n, mcp, ai, ...)
 apps/
   xcord/        GPUI shell: sidebar, tabs, terminal canvas, AI panel, dialogs
   xcord-mcp/    stdio ↔ localhost MCP bridge
@@ -241,6 +286,7 @@ docs/
   terminal.png
   ai.png
   ai-settings.png
+  settings-language.png
 ```
 
 ## Security notes

@@ -171,6 +171,8 @@ Notable contracts:
 - `WorkspaceEvent::TestFinished` carries a `ConnectionTest` result from a
   short-lived transport that is closed after the handshake.
 - `HighlightService` — byte spans with colors, queried by the renderer per row.
+- `LocalizationService` — current locale, available locales, per-domain catalog
+  registration and translation lookup with English/source-key fallback.
 - `McpToolRegistry` / `McpResourceRegistry` — names, JSON schemas, read-only
   hints and UI-thread handlers; the shared capability surface for external MCP
   clients and the copilot.
@@ -231,13 +233,49 @@ Rendering in `terminal_view.rs`:
 rows, so only the first glyph was visible. Xcord shapes without `force_width`
 and clips via the canvas. Keep this in mind if you refactor the renderer.
 
-## 7. MCP and the AI copilot
+## 7. Localization
+
+The `i18n` plugin owns the active locale (`zh-CN` by default) and a map of
+`(domain, locale) → catalog`. Catalogs are registered at runtime, so a plugin's
+strings live and die with the plugin:
+
+```rust
+let i18n = ctx.require::<I18n>(services::I18N)?;
+let handle = i18n.register_pairs("my-plugin", "zh-CN", &[("Ready", "就绪")]);
+ctx.effect("my-plugin i18n", move || i18n.unregister(handle));
+```
+
+The shell resolves labels **during render** via `I18n::t(domain, key)`, so
+changing the locale only requires a repaint; no widgets are rebuilt. Missing
+Chinese entries fall back to the English source key, which keeps untranslated
+plugin strings readable instead of showing raw identifiers.
+
+Built-in domains:
+
+- `app` — shell labels, dialogs, settings, status bar.
+- `commands` — command titles keyed by stable command id (`session.new`), so
+  plugins do not need to change their `Command` registration.
+- `categories` — command palette categories.
+- `plugin` — plugin names/descriptions keyed by plugin id.
+- `status` — connection and plugin state labels.
+- `ai` — owned by the AI plugin and registered through the same API.
+
+The locale is persisted in `Settings::language` and loaded by the i18n plugin
+during startup. Settings writes it, calls `I18n::set_locale`, updates input
+placeholders and the window title, then notifies the shell. Because services
+hold `Rc` handles, the change is visible to every plugin immediately.
+
+Known limitation: low-level transport crates (`ssh`, `russh`) emit English error
+text that is displayed verbatim. Localizing those messages belongs at the
+transport boundary, where a plugin can register a domain and translate them.
+
+## 8. MCP and the AI copilot
 
 Xcord treats "AI capability" as a protocol, not a vendor SDK. The `mcp` plugin
 owns a capability registry and a localhost JSON-RPC endpoint; the `ai` plugin is
 just one more client of that registry.
 
-### 7.1 Capability registry
+### 8.1 Capability registry
 
 `plugin-api::mcp` defines `ToolSpec` (name, description, JSON Schema,
 `read_only`) and `ResourceSpec`. Plugins register handlers on the UI thread:
@@ -282,7 +320,7 @@ Transport details:
   small HTTP/1.1 client, and prints responses. It intentionally supports plain
   HTTP only because the endpoint is loopback.
 
-### 7.2 Copilot loop
+### 8.2 Copilot loop
 
 `AiService` keeps an OpenAI-format message history and a display-oriented
 snapshot. `send` captures the system prompt, the active terminal excerpt (if
@@ -316,7 +354,7 @@ Key properties:
 The shell's AI panel is only a renderer: it reads `AiSnapshot`, sends prompts,
 and toggles settings. The MCP/AI service state is not duplicated in the shell.
 
-## 8. Writing a plugin
+## 9. Writing a plugin
 
 A plugin crate only needs `xcord-cordis` and `xcord-plugin-api`.
 
@@ -360,12 +398,24 @@ impl Plugin for NotesPlugin {
 }
 ```
 
+Plugin labels should be localized through the `i18n` service rather than
+hard-coded:
+
+```rust
+let i18n = ctx.require::<xcord_plugin_api::I18n>(services::I18N)?;
+let handle = i18n.register_pairs("notes", "zh-CN", &[("Show session notes", "显示会话备注")]);
+ctx.effect("notes translations", move || i18n.unregister(handle));
+```
+
+The shell already localizes command titles by command id and plugin metadata by
+plugin id, so registering those catalogs is normally enough.
+
 Register it in `xcord_builtins::install` (or from your own binary) with
 `ctx.plugin(NotesPlugin)`. To replace a built-in, do not register it and provide
 the same service name from your plugin. To extend the shell, contribute a
 `Command` or send a new `UiCommand`; no GPUI dependency is required.
 
-## 9. Testing strategy
+## 10. Testing strategy
 
 - **Kernel:** deterministic single-threaded tests for ordering, cascade unload,
   effects, failures, events and reload.
@@ -381,7 +431,7 @@ the same service name from your plugin. To extend the shell, contribute a
 - **UI:** verified with live sessions and `PrintWindow` captures. A future step
   is GPUI's test context for pixel/behavior tests.
 
-## 10. Trade-offs and future work
+## 11. Trade-offs and future work
 
 - The kernel is single-threaded by design. A multi-window shell would need one
   kernel per UI thread, or a `Send` variant.

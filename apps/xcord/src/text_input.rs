@@ -85,6 +85,15 @@ impl TextInput {
         self.set_value(String::new(), cx);
     }
 
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     pub fn focus_handle_only(&self) -> FocusHandle {
         self.focus_handle.clone()
     }

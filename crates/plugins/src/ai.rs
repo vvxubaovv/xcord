@@ -13,13 +13,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use xcord_cordis::{Context, Plugin, PluginMeta, Result};
 use xcord_plugin_api::{
-    services, Ai, AiAssistant, AiMessageView, AiSnapshot, Command, Commands, McpTools, PostOffice,
-    Runtime, RuntimeHandle, Sessions, ToolSpec, Ui, UiCommand, Workspace,
+    services, Ai, AiAssistant, AiMessageView, AiSnapshot, Command, Commands, I18n, McpTools,
+    PostOffice, Runtime, RuntimeHandle, Sessions, ToolSpec, Ui, UiCommand, Workspace,
 };
 
 const INTERNAL_AI: &str = "ai/internal";
 const MAX_TOOL_ROUNDS: usize = 6;
 const MAX_TOOL_RESULT: usize = 14_000;
+
+const AI_ZH: &[(&str, &str)] = &[
+    ("Thinking…", "思考中…"),
+    ("Running {tool}…", "正在运行 {tool}…"),
+    (
+        "No API key configured. Open AI settings and store a key.",
+        "未配置 API Key。请打开 AI 设置并保存 Key。",
+    ),
+    ("The copilot is still responding.", "AI 仍在回复中。"),
+    ("Prompt is empty.", "提示词为空。"),
+    ("AI base URL is empty.", "AI 基础 URL 为空。"),
+    ("AI model is empty.", "AI 模型为空。"),
+    ("No API key — open settings", "未配置 API Key — 打开设置"),
+];
 
 #[derive(Clone)]
 pub struct AiPlugin;
@@ -40,6 +54,7 @@ impl Plugin for AiPlugin {
             services::MCP_TOOLS,
             services::COMMANDS,
             services::UI_HOST,
+            services::I18N,
         ]
     }
 
@@ -50,11 +65,19 @@ impl Plugin for AiPlugin {
         let tools = (*ctx.require::<McpTools>(services::MCP_TOOLS)?).clone();
         let commands = (*ctx.require::<Commands>(services::COMMANDS)?).clone();
         let ui = (*ctx.require::<Ui>(services::UI_HOST)?).clone();
+        let i18n = (*ctx.require::<I18n>(services::I18N)?).clone();
+
+        let translation_handle = i18n.register_pairs("ai", "zh-CN", AI_ZH);
+        let translations = i18n.clone();
+        ctx.effect("unregister ai translations", move || {
+            translations.unregister(translation_handle);
+        });
 
         let service = Rc::new(AiService {
             sessions,
             workspace,
             tools,
+            i18n,
             runtime: runtime.handle(),
             messages: RefCell::new(Vec::new()),
             streaming: Cell::new(false),
@@ -171,6 +194,7 @@ pub struct AiService {
     sessions: Sessions,
     workspace: Workspace,
     tools: McpTools,
+    i18n: I18n,
     runtime: RuntimeHandle,
     messages: RefCell<Vec<ApiMessage>>,
     streaming: Cell<bool>,
@@ -262,15 +286,18 @@ impl AiService {
 
     fn spawn_request(&self, prompt: String) -> std::result::Result<(), String> {
         if self.streaming.get() {
-            return Err("The copilot is still responding.".into());
+            return Err(self.i18n.t("ai", "The copilot is still responding."));
         }
         let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
-            return Err("Prompt is empty.".into());
+            return Err(self.i18n.t("ai", "Prompt is empty."));
         }
         let settings = self.sessions.settings();
         let Some(key) = self.api_key() else {
-            let message = "No API key configured. Open AI settings and store a key.".to_string();
+            let message = self.i18n.t(
+                "ai",
+                "No API key configured. Open AI settings and store a key.",
+            );
             *self.error.borrow_mut() = Some(message.clone());
             return Err(message);
         };
@@ -280,7 +307,7 @@ impl AiService {
             .trim_end_matches('/')
             .to_string();
         if base_url.is_empty() {
-            let message = "AI base URL is empty.".to_string();
+            let message = self.i18n.t("ai", "AI base URL is empty.");
             *self.error.borrow_mut() = Some(message.clone());
             return Err(message);
         }
@@ -291,7 +318,7 @@ impl AiService {
         };
         let model = settings.ai_model.trim().to_string();
         if model.is_empty() {
-            return Err("AI model is empty.".into());
+            return Err(self.i18n.t("ai", "AI model is empty."));
         }
 
         {
@@ -300,7 +327,7 @@ impl AiService {
         }
         self.streaming.set(true);
         self.stream_text.borrow_mut().clear();
-        *self.status.borrow_mut() = "Thinking…".into();
+        *self.status.borrow_mut() = self.i18n.t("ai", "Thinking…");
         *self.error.borrow_mut() = None;
 
         let system = match self.terminal_context() {

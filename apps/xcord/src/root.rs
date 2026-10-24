@@ -17,7 +17,7 @@ use gpui::{
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
 use xcord_plugin_api::{
-    services, Ai, AiMessageView, AiSnapshot, Command, Commands, ConnectionTest, Highlights,
+    services, Ai, AiMessageView, AiSnapshot, Command, Commands, ConnectionTest, Highlights, I18n,
     McpStatus, NoticeLevel, OpenRequest, Runtime, Sessions, TabInfo, TabStatus, TerminalId, Theme,
     Themes, Ui, UiCommand, UiHost, Workspace, WorkspaceEvent,
 };
@@ -49,6 +49,7 @@ struct SessionForm {
 
 struct SettingsForm {
     theme_id: String,
+    language: String,
     font_size: f32,
     scrollback: usize,
     copy_on_select: bool,
@@ -109,6 +110,7 @@ pub struct XcordApp {
     commands: Commands,
     themes: Themes,
     highlights: Highlights,
+    i18n: I18n,
     ai: Ai,
     mcp: McpStatus,
 
@@ -189,12 +191,23 @@ impl XcordApp {
             .require::<McpStatus>(services::MCP_STATUS)
             .expect("mcp plugin did not start"))
         .clone();
+        let i18n = (*ctx
+            .require::<I18n>(services::I18N)
+            .expect("localization plugin did not start"))
+        .clone();
 
         let settings = sessions.settings();
         let theme = themes.active();
-        let search = Self::make_input(&theme, "Search sessions", false, cx);
-        let compose = Self::make_input(&theme, "Send a command to the active session…", false, cx);
-        let ai_input = Self::make_input(&theme, "Ask about this session…", false, cx);
+        let window_title = i18n.t("app", "Xcord — plugin-first SSH");
+        let search = Self::make_input(&theme, &i18n.t("app", "Search sessions"), false, cx);
+        let compose = Self::make_input(
+            &theme,
+            &i18n.t("app", "Send a command to the active session…"),
+            false,
+            cx,
+        );
+        let ai_input =
+            Self::make_input(&theme, &i18n.t("app", "Ask about this session…"), false, cx);
         let terminal = cx.new(|cx| {
             TerminalView::new(
                 workspace.clone(),
@@ -215,6 +228,7 @@ impl XcordApp {
             commands,
             themes,
             highlights,
+            i18n,
             ai,
             mcp,
             ui_rx,
@@ -242,6 +256,7 @@ impl XcordApp {
         };
         app.sync(cx);
         app.start_pumps(cx);
+        window.set_window_title(&window_title);
         if let Ok(session_id) = std::env::var("XCORD_AUTOCONNECT") {
             if !session_id.trim().is_empty() {
                 app.connect_profile(session_id, window, cx);
@@ -276,6 +291,51 @@ impl XcordApp {
                 cx,
             )
         })
+    }
+
+    fn tr(&self, key: &str) -> String {
+        self.i18n.t("app", key)
+    }
+
+    fn tr_args(&self, key: &str, args: &[(&str, String)]) -> String {
+        self.i18n.t_args("app", key, args)
+    }
+
+    fn command_title(&self, command: &Command) -> String {
+        self.i18n.t_or("commands", &command.id, &command.title)
+    }
+
+    fn command_category(&self, command: &Command) -> String {
+        self.i18n
+            .t_or("categories", &command.category, &command.category)
+    }
+
+    fn plugin_name(&self, id: &str, fallback: &str) -> String {
+        self.i18n.t_or("plugin", &format!("{id}.name"), fallback)
+    }
+
+    fn plugin_description(&self, id: &str, fallback: &str) -> String {
+        self.i18n
+            .t_or("plugin", &format!("{id}.description"), fallback)
+    }
+
+    fn status_label(&self, label: &str) -> String {
+        self.i18n.t_or("status", label, label)
+    }
+
+    fn ai_status(&self, status: &str) -> String {
+        if status.is_empty() || status == "Thinking…" {
+            return self.i18n.t("ai", "Thinking…");
+        }
+        if let Some(tool) = status
+            .strip_prefix("Running ")
+            .and_then(|rest| rest.strip_suffix('…'))
+        {
+            return self
+                .i18n
+                .t_args("ai", "Running {tool}…", &[("tool", tool.to_string())]);
+        }
+        status.to_string()
     }
 
     fn start_pumps(&self, cx: &mut Context<Self>) {
@@ -464,18 +524,29 @@ impl XcordApp {
 
     fn open_session_dialog(&mut self, profile_id: Option<String>, cx: &mut Context<Self>) {
         let existing = profile_id.as_ref().and_then(|id| self.sessions.get(id));
+        let is_new = existing.is_none();
         let profile = existing.clone().unwrap_or_else(|| SessionProfile::new(""));
         let theme = self.theme.clone();
-        let name = Self::make_input(&theme, "Production web", false, cx);
+        let name = Self::make_input(&theme, &self.tr("Production web"), false, cx);
         let host = Self::make_input(&theme, "example.com", false, cx);
         let port = Self::make_input(&theme, "22", false, cx);
         let user = Self::make_input(&theme, "root", false, cx);
-        let secret = Self::make_input(&theme, "Leave blank to use the keychain", true, cx);
+        let secret = Self::make_input(
+            &theme,
+            &self.tr("Leave blank to use the keychain"),
+            true,
+            cx,
+        );
         let key_path = Self::make_input(&theme, "~/.ssh/id_ed25519", false, cx);
         let group = Self::make_input(&theme, "Sessions", false, cx);
 
         name.update(cx, |input, cx| input.set_value(profile.name.clone(), cx));
-        group.update(cx, |input, cx| input.set_value(profile.group.clone(), cx));
+        let group_value = if is_new {
+            self.tr("Sessions")
+        } else {
+            profile.group.clone()
+        };
+        group.update(cx, |input, cx| input.set_value(group_value, cx));
         host.update(cx, |input, cx| input.set_value(profile.host.clone(), cx));
         port.update(cx, |input, cx| {
             input.set_value(profile.port.to_string(), cx)
@@ -593,23 +664,26 @@ impl XcordApp {
         let editing = form.editing.clone();
 
         if host.is_empty() {
+            let message = self.tr("Host is required.");
             if let Some(form) = &mut self.session_form {
-                form.error = Some("Host is required.".into());
+                form.error = Some(message);
             }
             return;
         }
         let port = match port_text.parse::<u16>() {
             Ok(port) if port > 0 => port,
             _ => {
+                let message = self.tr("Port must be a number between 1 and 65535.");
                 if let Some(form) = &mut self.session_form {
-                    form.error = Some("Port must be a number between 1 and 65535.".into());
+                    form.error = Some(message);
                 }
                 return;
             }
         };
         if auth == AuthMode::PublicKey && key_path.is_empty() {
+            let message = self.tr("Choose a private key file.");
             if let Some(form) = &mut self.session_form {
-                form.error = Some("Choose a private key file.".into());
+                form.error = Some(message);
             }
             return;
         }
@@ -659,7 +733,7 @@ impl XcordApp {
             if let Err(error) = result {
                 self.set_notice(
                     NoticeLevel::Warning,
-                    format!("Secret was not saved: {error}"),
+                    self.tr_args("Secret was not saved: {error}", &[("error", error)]),
                 );
             }
         }
@@ -673,8 +747,9 @@ impl XcordApp {
             }
         };
         if auth == AuthMode::Password && credential.is_none() {
+            let message = self.tr("This session needs a password.");
             if let Some(form) = &mut self.session_form {
-                form.error = Some("This session needs a password.".into());
+                form.error = Some(message);
             }
             return;
         }
@@ -691,7 +766,10 @@ impl XcordApp {
                 self.sync(cx);
                 self.set_notice(
                     NoticeLevel::Info,
-                    format!("Connecting to {}…", profile.endpoint()),
+                    self.tr_args(
+                        "Connecting to {endpoint}…",
+                        &[("endpoint", profile.endpoint())],
+                    ),
                 );
                 let _ = id;
             }
@@ -793,8 +871,9 @@ impl XcordApp {
         let request = match self.session_test_request(cx) {
             Ok(request) => request,
             Err(error) => {
+                let message = self.tr(&error);
                 if let Some(form) = &mut self.session_form {
-                    form.error = Some(error);
+                    form.error = Some(message);
                 }
                 cx.notify();
                 return;
@@ -810,8 +889,9 @@ impl XcordApp {
                 }
             }
             Err(error) => {
+                let message = self.tr(&error);
                 if let Some(form) = &mut self.session_form {
-                    form.error = Some(error);
+                    form.error = Some(message);
                 }
             }
         }
@@ -827,7 +907,7 @@ impl XcordApp {
             return;
         }
         let Some(profile) = self.sessions.get(&profile_id) else {
-            self.set_notice(NoticeLevel::Error, "Session no longer exists.");
+            self.set_notice(NoticeLevel::Error, self.tr("Session no longer exists."));
             return;
         };
         let credential = match &profile.auth {
@@ -837,8 +917,9 @@ impl XcordApp {
         };
         if matches!(profile.auth, AuthKind::Password { .. }) && credential.is_none() {
             self.open_session_dialog(Some(profile_id), cx);
+            let message = self.tr("Enter the password for this session.");
             if let Some(form) = &mut self.session_form {
-                form.error = Some("Enter the password for this session.".into());
+                form.error = Some(message);
             }
             self.pending_focus = Some(PendingFocus::DialogSecret);
             cx.notify();
@@ -853,7 +934,7 @@ impl XcordApp {
             Ok(_) => {
                 self.pending_focus = Some(PendingFocus::Terminal);
                 self.sync(cx);
-                self.set_notice(NoticeLevel::Info, "Connecting…");
+                self.set_notice(NoticeLevel::Info, self.tr("Connecting…"));
             }
             Err(error) => {
                 self.set_notice(NoticeLevel::Error, error);
@@ -918,6 +999,7 @@ impl XcordApp {
     fn open_settings(&mut self, cx: &mut Context<Self>) {
         self.settings_form = Some(SettingsForm {
             theme_id: self.themes.active_id().to_string(),
+            language: self.settings.language.clone(),
             font_size: self.settings.font_size,
             scrollback: self.settings.scrollback,
             copy_on_select: self.settings.copy_on_select,
@@ -930,12 +1012,13 @@ impl XcordApp {
         cx.notify();
     }
 
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
+    fn save_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = self.settings_form.as_ref() else {
             return;
         };
         let mut settings = self.settings.clone();
         settings.theme = form.theme_id.clone();
+        settings.language = form.language.clone();
         settings.font_size = form.font_size.clamp(9.0, 28.0);
         settings.scrollback = form.scrollback.clamp(500, 200_000);
         settings.copy_on_select = form.copy_on_select;
@@ -956,12 +1039,30 @@ impl XcordApp {
         self.settings = settings.clone();
         self.themes.set_active(&settings.theme);
         self.theme = self.themes.active();
+        if let Err(error) = self.i18n.set_locale(&settings.language) {
+            if let Some(form) = &mut self.settings_form {
+                form.error = Some(error);
+            }
+        }
+        let window_title = self.tr("Xcord — plugin-first SSH");
+        window.set_window_title(&window_title);
+        let search_placeholder = self.tr("Search sessions");
+        self.search.update(cx, |input, cx| {
+            input.set_placeholder(search_placeholder, cx)
+        });
+        let compose_placeholder = self.tr("Send a command to the active session…");
+        self.compose.update(cx, |input, cx| {
+            input.set_placeholder(compose_placeholder, cx)
+        });
+        let ai_placeholder = self.tr("Ask about this session…");
+        self.ai_input
+            .update(cx, |input, cx| input.set_placeholder(ai_placeholder, cx));
         self.terminal
             .update(cx, |view, cx| view.set_settings(settings, cx));
         self.settings_form = None;
         self.set_notice(
             NoticeLevel::Success,
-            "Settings saved. Reload plugins to apply logging/highlighter changes.",
+            self.tr("Settings saved. Reload plugins to apply logging/highlighter changes."),
         );
         cx.notify();
     }
@@ -971,7 +1072,12 @@ impl XcordApp {
         let theme = self.theme.clone();
         let base_url = Self::make_input(&theme, "https://api.deepseek.com/v1", false, cx);
         let model = Self::make_input(&theme, "deepseek-chat", false, cx);
-        let api_key = Self::make_input(&theme, "Leave blank to keep the stored key", true, cx);
+        let api_key = Self::make_input(
+            &theme,
+            &self.tr("Leave blank to keep the stored key"),
+            true,
+            cx,
+        );
         base_url.update(cx, |input, cx| {
             input.set_value(settings.ai_base_url.clone(), cx)
         });
@@ -1000,14 +1106,16 @@ impl XcordApp {
         let allow_writes = form.allow_writes;
         let include_terminal = form.include_terminal;
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+            let message = self.tr("Base URL must start with http:// or https://");
             if let Some(form) = &mut self.ai_config {
-                form.error = Some("Base URL must start with http:// or https://".into());
+                form.error = Some(message);
             }
             return;
         }
         if model.is_empty() {
+            let message = self.tr("Model is required.");
             if let Some(form) = &mut self.ai_config {
-                form.error = Some("Model is required.".into());
+                form.error = Some(message);
             }
             return;
         }
@@ -1034,7 +1142,7 @@ impl XcordApp {
         self.ai.refresh_key();
         self.ai_config = None;
         self.pending_focus = Some(PendingFocus::AiInput);
-        self.set_notice(NoticeLevel::Success, "AI settings saved.");
+        self.set_notice(NoticeLevel::Success, self.tr("AI settings saved."));
         cx.notify();
     }
 
@@ -1042,7 +1150,7 @@ impl XcordApp {
         match self.sessions.clear_ai_api_key() {
             Ok(()) => {
                 self.ai.refresh_key();
-                self.set_notice(NoticeLevel::Success, "Stored AI API key removed.");
+                self.set_notice(NoticeLevel::Success, self.tr("Stored AI API key removed."));
             }
             Err(error) => self.set_notice(NoticeLevel::Error, error),
         }
@@ -1113,10 +1221,10 @@ impl XcordApp {
                     div()
                         .text_size(px(12.))
                         .text_color(rgbc(theme.muted))
-                        .child("Ask the copilot to inspect a session, explain output, or run a fix with tools."),
+                        .child(self.tr("Ask the copilot to inspect a session, explain output, or run a fix with tools.")),
                 )
                 .child(
-                    secondary_button("Explain this terminal", theme).on_mouse_up(
+                    secondary_button(self.tr("Explain this terminal"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.send_ai_prompt(
@@ -1127,7 +1235,7 @@ impl XcordApp {
                     ),
                 )
                 .child(
-                    secondary_button("Why did the last command fail?", theme).on_mouse_up(
+                    secondary_button(self.tr("Why did the last command fail?"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.send_ai_prompt(
@@ -1138,7 +1246,7 @@ impl XcordApp {
                     ),
                 )
                 .child(
-                    secondary_button("Summarize open tabs", theme).on_mouse_up(
+                    secondary_button(self.tr("Summarize open tabs"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.send_ai_prompt(
@@ -1160,9 +1268,9 @@ impl XcordApp {
                     .text_size(px(10.5))
                     .text_color(rgbc(theme.accent))
                     .child(if snapshot.status.is_empty() {
-                        "Thinking…".to_string()
+                        self.tr("Thinking…")
                     } else {
-                        snapshot.status.clone()
+                        self.ai_status(&snapshot.status)
                     }),
             );
         }
@@ -1194,18 +1302,23 @@ impl XcordApp {
                     .items_center()
                     .gap_3()
                     .child(
-                        checkbox("Terminal context", snapshot.include_terminal, theme).on_mouse_up(
+                        checkbox(
+                            self.tr("Terminal context"),
+                            snapshot.include_terminal,
+                            theme,
+                        )
+                        .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.toggle_ai_include_terminal(cx)),
                         ),
                     )
                     .child(
                         checkbox(
-                            if snapshot.allow_writes {
+                            self.tr(if snapshot.allow_writes {
                                 "Writes allowed"
                             } else {
                                 "Writes blocked"
-                            },
+                            }),
                             snapshot.allow_writes,
                             theme,
                         )
@@ -1236,7 +1349,7 @@ impl XcordApp {
                             .rounded_md()
                             .child(self.ai_input.clone()),
                     )
-                    .child(primary_button("Send", theme).on_mouse_up(
+                    .child(primary_button(self.tr("Send"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.send_ai(cx)),
                     )),
@@ -1274,7 +1387,7 @@ impl XcordApp {
                                     .text_size(px(13.))
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(rgbc(theme.foreground))
-                                    .child("AI Copilot"),
+                                    .child(self.tr("AI Copilot")),
                             )
                             .child(
                                 div()
@@ -1285,9 +1398,12 @@ impl XcordApp {
                                         rgbc(theme.danger)
                                     })
                                     .child(if snapshot.has_key {
-                                        format!("{} · MCP tools", snapshot.model)
+                                        self.tr_args(
+                                            "{model} · MCP tools",
+                                            &[("model", snapshot.model.clone())],
+                                        )
                                     } else {
-                                        "No API key — open settings".to_string()
+                                        self.tr("No API key — open settings")
                                     }),
                             ),
                     )
@@ -1296,7 +1412,7 @@ impl XcordApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(small_button("Settings", theme).on_mouse_up(
+                            .child(small_button(self.tr("Settings"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.open_ai_config(cx)),
                             ))
@@ -1341,15 +1457,25 @@ impl XcordApp {
                 })
             })
             .unwrap_or_else(|| "xcord-mcp".into());
-        let mcp_config = serde_json::to_string_pretty(&serde_json::json!({
-            "mcpServers": {
-                "xcord": {
-                    "command": bridge.to_string_lossy()
+        let mcp_config =
+            serde_json::to_string_pretty(&serde_json::json!({            "mcpServers": {
+                    "xcord": {
+                        "command": bridge.to_string_lossy()
+                    }
                 }
-            }
-        }))
-        .unwrap_or_default();
+            }))
+            .unwrap_or_default();
         let error = form.error.clone();
+        let mcp_hint =
+            self.tr("MCP speaks JSON-RPC on 127.0.0.1; the bridge reads mcp-token from the config directory.");
+        let endpoint = if mcp.running {
+            self.tr_args(
+                "Endpoint: {url} · token {token}",
+                &[("url", mcp.url.clone()), ("token", mask_token(&mcp.token))],
+            )
+        } else {
+            self.tr_args("Endpoint: {url}", &[("url", mcp.url.clone())])
+        };
 
         div()
             .w(px(680.))
@@ -1382,7 +1508,7 @@ impl XcordApp {
                             .text_size(px(18.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgbc(theme.foreground))
-                            .child("AI & MCP"),
+                            .child(self.tr("AI & MCP")),
                     )
                     .child(
                         div()
@@ -1401,7 +1527,7 @@ impl XcordApp {
                 div()
                     .text_size(px(10.5))
                     .text_color(rgbc(theme.muted))
-                    .child("Any OpenAI-compatible endpoint works. The key is stored in Windows Credential Manager."),
+                    .child(self.tr("Any OpenAI-compatible endpoint works. The key is stored in Windows Credential Manager.")),
             )
             .child(
                 div()
@@ -1456,14 +1582,14 @@ impl XcordApp {
                         ),
                     ),
             )
-            .child(field("Base URL", form.base_url.clone(), theme))
-            .child(field("Model", form.model.clone(), theme))
+            .child(field(self.tr("Base URL"), form.base_url.clone(), theme))
+            .child(field(self.tr("Model"), form.model.clone(), theme))
             .child(field(
-                if has_key {
+                self.tr(if has_key {
                     "API key (a key is already stored)"
                 } else {
                     "API key"
-                },
+                }),
                 form.api_key.clone(),
                 theme,
             ))
@@ -1473,7 +1599,7 @@ impl XcordApp {
                     .items_center()
                     .gap_4()
                     .child(
-                        checkbox("Send terminal context", form.include_terminal, theme).on_mouse_up(
+                        checkbox(self.tr("Send terminal context"), form.include_terminal, theme).on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.ai_config {
@@ -1484,7 +1610,7 @@ impl XcordApp {
                         ),
                     )
                     .child(
-                        checkbox("Allow terminal writes", form.allow_writes, theme).on_mouse_up(
+                        checkbox(self.tr("Allow terminal writes"), form.allow_writes, theme).on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.ai_config {
@@ -1495,7 +1621,7 @@ impl XcordApp {
                         ),
                     )
                     .child(
-                        small_button("Clear stored key", theme).on_mouse_up(
+                        small_button(self.tr("Clear stored key"), theme).on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.clear_ai_key(cx)),
                         ),
@@ -1525,16 +1651,25 @@ impl XcordApp {
                                         rgbc(theme.danger)
                                     })
                                     .child(if mcp.running {
-                                        format!("MCP server running · {} tools", mcp.tools)
+                                        self.tr_args(
+                                            "MCP server running · {tools} tools",
+                                            &[("tools", mcp.tools.to_string())],
+                                        )
                                     } else {
-                                        format!(
-                                            "MCP server unavailable: {}",
-                                            mcp.error.as_deref().unwrap_or("disabled")
+                                        self.tr_args(
+                                            "MCP server unavailable: {error}",
+                                            &[(
+                                                "error",
+                                                mcp.error
+                                                    .as_deref()
+                                                    .unwrap_or("disabled")
+                                                    .to_string(),
+                                            )],
                                         )
                                     }),
                             )
                             .child(
-                                small_button("Copy Claude/Cursor config", theme).on_mouse_up(
+                                small_button(self.tr("Copy Claude/Cursor config"), theme).on_mouse_up(
                                     MouseButton::Left,
                                     cx.listener({
                                         let config = mcp_config.clone();
@@ -1551,15 +1686,7 @@ impl XcordApp {
                         div()
                             .text_size(px(9.5))
                             .text_color(rgbc(theme.muted))
-                            .child(format!(
-                                "Endpoint: {}{}",
-                                mcp.url,
-                                if mcp.running {
-                                    format!(" · token {}", mask_token(&mcp.token))
-                                } else {
-                                    String::new()
-                                }
-                            )),
+                            .child(endpoint),
                     )
                     .child(
                         div()
@@ -1582,22 +1709,20 @@ impl XcordApp {
                             } else {
                                 rgbc(theme.muted)
                             })
-                            .child(error.unwrap_or_else(|| {
-                                "MCP speaks JSON-RPC on 127.0.0.1; the bridge reads mcp-token from the config directory.".into()
-                            })),
+                            .child(error.unwrap_or(mcp_hint)),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_2()
-                            .child(secondary_button("Cancel", theme).on_mouse_up(
+                            .child(secondary_button(self.tr("Cancel"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     this.ai_config = None;
                                     cx.notify();
                                 }),
                             ))
-                            .child(primary_button("Save", theme).on_mouse_up(
+                            .child(primary_button(self.tr("Save"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.save_ai_config(cx)),
                             )),
@@ -1607,7 +1732,7 @@ impl XcordApp {
 
     fn open_palette(&mut self, cx: &mut Context<Self>) {
         let theme = self.theme.clone();
-        let input = Self::make_input(&theme, "Type a command…", false, cx);
+        let input = Self::make_input(&theme, &self.tr("Type a command…"), false, cx);
         self.palette = Some(PaletteState { input, selected: 0 });
         self.pending_focus = Some(PendingFocus::Palette);
         cx.notify();
@@ -1624,7 +1749,12 @@ impl XcordApp {
             .filter(|command| {
                 query.is_empty()
                     || command.title.to_lowercase().contains(&query)
+                    || self.command_title(command).to_lowercase().contains(&query)
                     || command.category.to_lowercase().contains(&query)
+                    || self
+                        .command_category(command)
+                        .to_lowercase()
+                        .contains(&query)
                     || command.id.to_lowercase().contains(&query)
             })
             .collect()
@@ -1794,32 +1924,33 @@ impl XcordApp {
                         div()
                             .text_size(px(11.))
                             .text_color(rgbc(theme.muted))
-                            .child("plugin-first SSH"),
+                            .child(self.tr("plugin-first SSH")),
                     ),
             )
             .child(div().flex_1())
-            .child(self.header_button("AI", cx, |this, cx| {
+            .child(self.header_button(self.tr("AI"), cx, |this, cx| {
                 this.ai_open = !this.ai_open;
                 if this.ai_open {
                     this.pending_focus = Some(PendingFocus::AiInput);
                 }
                 cx.notify();
             }))
-            .child(self.header_button("Palette", cx, |this, cx| this.open_palette(cx)))
-            .child(self.header_button("Plugins", cx, |this, cx| {
+            .child(self.header_button(self.tr("Palette"), cx, |this, cx| this.open_palette(cx)))
+            .child(self.header_button(self.tr("Plugins"), cx, |this, cx| {
                 this.plugins_panel = true;
                 this.refresh_plugins();
                 cx.notify();
             }))
-            .child(self.header_button("Settings", cx, |this, cx| this.open_settings(cx)))
+            .child(self.header_button(self.tr("Settings"), cx, |this, cx| this.open_settings(cx)))
     }
 
     fn header_button(
         &self,
-        label: &'static str,
+        label: impl Into<SharedString>,
         cx: &mut Context<Self>,
         handler: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> Div {
+        let label = label.into();
         let theme = self.theme();
         let hover_bg = rgbc(theme.panel_alt);
         div()
@@ -1867,7 +1998,7 @@ impl XcordApp {
                     .p_3()
                     .text_size(px(11.5))
                     .text_color(rgbc(theme.muted))
-                    .child("No sessions match. Create one to get started."),
+                    .child(self.tr("No sessions match. Create one to get started.")),
             );
         }
         for (group, profiles) in groups {
@@ -1879,7 +2010,7 @@ impl XcordApp {
                     .text_size(px(9.5))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(rgbc(theme.muted))
-                    .child(group.to_uppercase()),
+                    .child(self.tr(&group).to_uppercase()),
             );
             for profile in profiles {
                 list = list.child(self.render_session_row(profile, cx));
@@ -1919,7 +2050,7 @@ impl XcordApp {
                             }))
                             .child(self.search.clone()),
                     )
-                    .child(primary_button("New session", theme).on_mouse_up(
+                    .child(primary_button(self.tr("New session"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
                     )),
@@ -1932,20 +2063,28 @@ impl XcordApp {
                     .border_color(rgbc(theme.border))
                     .flex()
                     .gap_2()
-                    .child(small_button("Plugins", theme).flex_1().on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.plugins_panel = true;
-                            this.refresh_plugins();
-                            cx.notify();
-                        }),
-                    ))
-                    .child(small_button("Settings", theme).flex_1().on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.open_settings(cx);
-                        }),
-                    )),
+                    .child(
+                        small_button(self.tr("Plugins"), theme)
+                            .flex_1()
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.plugins_panel = true;
+                                    this.refresh_plugins();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        small_button(self.tr("Settings"), theme)
+                            .flex_1()
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.open_settings(cx);
+                                }),
+                            ),
+                    ),
             )
     }
 
@@ -2041,7 +2180,7 @@ impl XcordApp {
                             this.open_session_dialog(Some(edit_id.clone()), cx);
                         }),
                     )
-                    .child("edit"),
+                    .child(self.tr("edit")),
             )
     }
 
@@ -2233,10 +2372,10 @@ impl XcordApp {
                     .text_size(px(10.5))
                     .text_color(rgbc(theme.muted))
                     .child(match &tab.status {
-                        TabStatus::Connected => "connected",
-                        TabStatus::Connecting => "connecting",
-                        TabStatus::Closed => "closed",
-                        TabStatus::Failed(_) => "failed",
+                        TabStatus::Connected => self.status_label("connected"),
+                        TabStatus::Connecting => self.status_label("connecting"),
+                        TabStatus::Closed => self.status_label("closed"),
+                        TabStatus::Failed(_) => self.status_label("failed"),
                     })
                     .child(format!("{}@{}", tab.user, tab.host))
                     .child(
@@ -2254,7 +2393,7 @@ impl XcordApp {
                                     fingerprint.strip_prefix("SHA256:").unwrap_or(&fingerprint);
                                 format!("SHA256:{}", &short[..short.len().min(22)])
                             })
-                            .unwrap_or_else(|| "no host key".into()),
+                            .unwrap_or_else(|| self.tr("no host key")),
                     )
             } else {
                 div()
@@ -2263,10 +2402,10 @@ impl XcordApp {
                     .gap_2()
                     .text_size(px(10.5))
                     .text_color(rgbc(theme.muted))
-                    .child("ready")
-                    .child(format!(
-                        "{} plugins active",
-                        this.kernel.active_plugins().len()
+                    .child(self.tr("ready"))
+                    .child(self.tr_args(
+                        "{count} plugins active",
+                        &[("count", this.kernel.active_plugins().len().to_string())],
                     ))
             }
         };
@@ -2290,7 +2429,7 @@ impl XcordApp {
                     .text_color(rgbc(theme.muted))
                     .child("UTF-8")
                     .child("xterm-256color")
-                    .child("Ctrl+Shift+P palette"),
+                    .child(self.tr("Ctrl+Shift+P palette")),
             )
     }
 
@@ -2341,7 +2480,7 @@ impl XcordApp {
                         div()
                             .text_size(px(10.))
                             .text_color(rgbc(theme.accent))
-                            .child("connect"),
+                            .child(self.tr("connect")),
                     ),
             );
         }
@@ -2366,34 +2505,42 @@ impl XcordApp {
                 div()
                     .text_size(px(14.))
                     .text_color(rgbc(theme.muted))
-                    .child("An SSH workspace where everything is a plugin."),
+                    .child(self.tr("An SSH workspace where everything is a plugin.")),
             )
             .child(
                 div()
                     .flex()
                     .gap_3()
-                    .child(primary_button("New session", theme).on_mouse_up(
+                    .child(primary_button(self.tr("New session"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
                     ))
-                    .child(secondary_button("Command palette", theme).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.open_palette(cx)),
-                    ))
-                    .child(secondary_button("Manage plugins", theme).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.plugins_panel = true;
-                            this.refresh_plugins();
-                            cx.notify();
-                        }),
-                    )),
+                    .child(
+                        secondary_button(self.tr("Command palette"), theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.open_palette(cx)),
+                        ),
+                    )
+                    .child(
+                        secondary_button(self.tr("Manage plugins"), theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.plugins_panel = true;
+                                this.refresh_plugins();
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
             .child(
                 div()
                     .text_size(px(10.))
                     .text_color(rgbc(theme.muted))
-                    .child("SSH • terminal • compose • snippets • highlight • logging • themes"),
+                    .child(
+                        self.tr(
+                            "SSH • terminal • compose • snippets • highlight • logging • themes",
+                        ),
+                    ),
             )
             .child(recent_list)
     }
@@ -2435,7 +2582,7 @@ impl XcordApp {
         let (status_text, status_color) = if let Some(error) = error {
             (error, theme.danger)
         } else if self.test_pending {
-            ("Testing connection…".to_string(), theme.accent)
+            (self.tr("Testing connection…"), theme.accent)
         } else if let Some(test) = self.test_result.as_ref() {
             (
                 test.message.clone(),
@@ -2443,7 +2590,7 @@ impl XcordApp {
             )
         } else {
             (
-                "Host keys are verified with trust-on-first-use.".to_string(),
+                self.tr("Host keys are verified with trust-on-first-use."),
                 theme.muted,
             )
         };
@@ -2486,9 +2633,9 @@ impl XcordApp {
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgbc(theme.foreground))
                             .child(if editing {
-                                "Edit session"
+                                self.tr("Edit session")
                             } else {
-                                "New session"
+                                self.tr("New session")
                             }),
                     )
                     .child(
@@ -2510,53 +2657,57 @@ impl XcordApp {
                 div()
                     .text_size(px(10.5))
                     .text_color(rgbc(theme.muted))
-                    .child("Credentials are stored in the OS keychain, never in config.toml."),
+                    .child(
+                        self.tr("Credentials are stored in the OS keychain, never in config.toml."),
+                    ),
             )
             .child(
                 div()
                     .flex()
                     .gap_3()
-                    .child(field("Name", form.name.clone(), theme).flex_1())
-                    .child(field("Group", form.group.clone(), theme).flex_1()),
+                    .child(field(self.tr("Name"), form.name.clone(), theme).flex_1())
+                    .child(field(self.tr("Group"), form.group.clone(), theme).flex_1()),
             )
             .child(
                 div()
                     .flex()
                     .gap_3()
-                    .child(field("Host", form.host.clone(), theme).flex_1())
-                    .child(field("Port", form.port.clone(), theme).w(px(100.)))
-                    .child(field("User", form.user.clone(), theme).w(px(170.))),
+                    .child(field(self.tr("Host"), form.host.clone(), theme).flex_1())
+                    .child(field(self.tr("Port"), form.port.clone(), theme).w(px(100.)))
+                    .child(field(self.tr("User"), form.user.clone(), theme).w(px(170.))),
             )
             .child(
                 div()
                     .flex()
                     .gap_2()
                     .child(
-                        auth_chip("Password", auth == AuthMode::Password, theme).on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(form) = &mut this.session_form {
-                                    form.auth = AuthMode::Password;
-                                }
-                                cx.notify();
-                            }),
-                        ),
+                        auth_chip(self.tr("Password"), auth == AuthMode::Password, theme)
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(form) = &mut this.session_form {
+                                        form.auth = AuthMode::Password;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
                     )
                     .child(
-                        auth_chip("Private key", auth == AuthMode::PublicKey, theme).on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(form) = &mut this.session_form {
-                                    form.auth = AuthMode::PublicKey;
-                                }
-                                cx.notify();
-                            }),
-                        ),
+                        auth_chip(self.tr("Private key"), auth == AuthMode::PublicKey, theme)
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(form) = &mut this.session_form {
+                                        form.auth = AuthMode::PublicKey;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
                     ),
             );
 
         if auth == AuthMode::Password {
-            card = card.child(field("Password", form.secret.clone(), theme));
+            card = card.child(field(self.tr("Password"), form.secret.clone(), theme));
         } else {
             card = card.child(
                 div()
@@ -2567,7 +2718,7 @@ impl XcordApp {
                         div()
                             .text_size(px(10.))
                             .text_color(rgbc(theme.muted))
-                            .child("Private key file"),
+                            .child(self.tr("Private key file")),
                     )
                     .child(
                         div()
@@ -2583,7 +2734,7 @@ impl XcordApp {
                                     .rounded_md()
                                     .child(form.key_path.clone()),
                             )
-                            .child(secondary_button("Browse…", theme).on_mouse_up(
+                            .child(secondary_button(self.tr("Browse…"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, window, cx| {
                                     this.pick_private_key(window, cx)
@@ -2592,7 +2743,7 @@ impl XcordApp {
                     ),
             );
             card = card.child(field(
-                "Key passphrase (optional)",
+                self.tr("Key passphrase (optional)"),
                 form.secret.clone(),
                 theme,
             ));
@@ -2605,11 +2756,11 @@ impl XcordApp {
                     .gap_5()
                     .child(
                         checkbox(
-                            if auth == AuthMode::Password {
+                            self.tr(if auth == AuthMode::Password {
                                 "Save password in keychain"
                             } else {
                                 "Save passphrase in keychain"
-                            },
+                            }),
                             save_secret,
                             theme,
                         )
@@ -2623,15 +2774,17 @@ impl XcordApp {
                             }),
                         ),
                     )
-                    .child(checkbox("Log this session", logging, theme).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            if let Some(form) = &mut this.session_form {
-                                form.logging = !form.logging;
-                            }
-                            cx.notify();
-                        }),
-                    )),
+                    .child(
+                        checkbox(self.tr("Log this session"), logging, theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.session_form {
+                                    form.logging = !form.logging;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
             .child(
                 div()
@@ -2648,18 +2801,24 @@ impl XcordApp {
                         div()
                             .flex()
                             .gap_2()
-                            .child(secondary_button("Test connection", theme).on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.test_session(cx)),
-                            ))
-                            .child(secondary_button("Cancel", theme).on_mouse_up(
+                            .child(
+                                secondary_button(self.tr("Test connection"), theme).on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.test_session(cx)),
+                                ),
+                            )
+                            .child(secondary_button(self.tr("Cancel"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.close_session_dialog(cx)),
                             ))
-                            .child(primary_button("Save & connect", theme).on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| this.submit_session(window, cx)),
-                            )),
+                            .child(
+                                primary_button(self.tr("Save & connect"), theme).on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.submit_session(window, cx)
+                                    }),
+                                ),
+                            ),
                     ),
             );
 
@@ -2682,77 +2841,89 @@ impl XcordApp {
                 PluginState::Failed => rgbc(theme.danger),
                 _ => rgbc(theme.muted),
             };
-            let is_highlighter = plugin.name == "Output Highlighter";
-            rows = rows.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgbc(theme.background))
-                    .border_1()
-                    .border_color(rgbc(theme.border))
-                    .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(color))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(rgbc(theme.foreground))
-                                            .child(plugin.name),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(9.5))
-                                            .text_color(rgbc(theme.muted))
-                                            .child(format!(
-                                                "v{} · {}",
-                                                plugin.version,
-                                                plugin.state.label()
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgbc(theme.muted))
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .child(if let Some(error) = &plugin.error {
-                                        error.clone()
-                                    } else if plugin.description.is_empty() {
-                                        plugin.id.to_string()
-                                    } else {
-                                        plugin.description.to_string()
-                                    }),
-                            ),
-                    )
-                    .child(if is_highlighter {
-                        secondary_button("Reload", theme)
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.reload_highlighter(cx)),
-                            )
-                            .into_any_element()
-                    } else {
-                        div()
-                            .text_size(px(9.5))
-                            .text_color(rgbc(theme.muted))
-                            .child("core")
-                            .into_any_element()
-                    }),
-            );
+            let is_highlighter = plugin.id.to_string() == "highlights";
+            rows =
+                rows.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgbc(theme.background))
+                        .border_1()
+                        .border_color(rgbc(theme.border))
+                        .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(color))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(rgbc(theme.foreground))
+                                                .child(self.plugin_name(
+                                                    &plugin.id.to_string(),
+                                                    &plugin.name,
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(9.5))
+                                                .text_color(rgbc(theme.muted))
+                                                .child(self.tr_args(
+                                                    "v{version} · {state}",
+                                                    &[
+                                                        ("version", plugin.version.to_string()),
+                                                        (
+                                                            "state",
+                                                            self.status_label(plugin.state.label()),
+                                                        ),
+                                                    ],
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgbc(theme.muted))
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(if let Some(error) = &plugin.error {
+                                            error.clone()
+                                        } else if plugin.description.is_empty() {
+                                            plugin.id.to_string()
+                                        } else {
+                                            self.plugin_description(
+                                                &plugin.id.to_string(),
+                                                &plugin.description,
+                                            )
+                                        }),
+                                ),
+                        )
+                        .child(if is_highlighter {
+                            secondary_button(self.tr("Reload"), theme)
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.reload_highlighter(cx)),
+                                )
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(rgbc(theme.muted))
+                                .child(self.tr("core"))
+                                .into_any_element()
+                        }),
+                );
         }
 
         let diagnostics = self.kernel.diagnostics();
@@ -2804,7 +2975,7 @@ impl XcordApp {
                             .text_size(px(18.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgbc(theme.foreground))
-                            .child("Plugins"),
+                            .child(self.tr("Plugins")),
                     )
                     .child(
                         div()
@@ -2815,10 +2986,12 @@ impl XcordApp {
                                 div()
                                     .text_size(px(10.5))
                                     .text_color(rgbc(theme.muted))
-                                    .child(format!(
-                                        "{} active / {} registered",
-                                        active,
-                                        self.plugin_infos.len()
+                                    .child(self.tr_args(
+                                        "{active} active / {total} registered",
+                                        &[
+                                            ("active", active.to_string()),
+                                            ("total", self.plugin_infos.len().to_string()),
+                                        ],
                                     )),
                             )
                             .child(
@@ -2840,14 +3013,14 @@ impl XcordApp {
                 div()
                     .text_size(px(10.5))
                     .text_color(rgbc(theme.muted))
-                    .child("Everything is a plugin. Unloading a service cascades to its dependents; effects run in reverse order."),
+                    .child(self.tr("Everything is a plugin. Unloading a service cascades to its dependents; effects run in reverse order.")),
             )
             .child(rows)
             .child(
                 div()
                     .text_size(px(10.5))
                     .text_color(rgbc(theme.muted))
-                    .child("Kernel diagnostics"),
+                    .child(self.tr("Kernel diagnostics")),
             )
             .child(log)
             .child(
@@ -2858,10 +3031,10 @@ impl XcordApp {
                         div()
                             .text_size(px(10.))
                             .text_color(rgbc(theme.muted))
-                            .child("Highlighter reload is live. Core plugins restart with the app."),
+                            .child(self.tr("Highlighter reload is live. Core plugins restart with the app.")),
                     )
                     .child(
-                        secondary_button("Reinitialize highlighter", theme).on_mouse_up(MouseButton::Left, 
+                        secondary_button(self.tr("Reinitialize highlighter"), theme).on_mouse_up(MouseButton::Left, 
                             cx.listener(|this, _, _, cx| this.reload_highlighter(cx)),
                         ),
                     ),
@@ -2873,6 +3046,8 @@ impl XcordApp {
         let Some(form) = self.settings_form.as_ref() else {
             return div();
         };
+        let settings_hint =
+            self.tr("Changes apply live. Some plugin options need a plugin reload.");
         let themes = self.themes.themes();
         let mut cards = div().flex().gap_2();
         for candidate in &themes {
@@ -2938,7 +3113,7 @@ impl XcordApp {
                             .text_size(px(18.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgbc(theme.foreground))
-                            .child("Settings"),
+                            .child(self.tr("Settings")),
                     )
                     .child(
                         div()
@@ -2961,7 +3136,40 @@ impl XcordApp {
                 div()
                     .text_size(px(11.))
                     .text_color(rgbc(theme.muted))
-                    .child("Theme"),
+                    .child(self.tr("Language")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        auth_chip("中文（简体）", form.language == "zh-CN", theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.language = "zh-CN".into();
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        auth_chip("English", form.language == "en-US", theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.language = "en-US".into();
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("Theme")),
             )
             .child(cards)
             .child(
@@ -2973,7 +3181,7 @@ impl XcordApp {
                         div()
                             .text_size(px(11.))
                             .text_color(rgbc(theme.foreground))
-                            .child("Font size"),
+                            .child(self.tr("Font size")),
                     )
                     .child(
                         div()
@@ -3012,18 +3220,19 @@ impl XcordApp {
                     .flex()
                     .gap_4()
                     .child(
-                        checkbox("Copy on select", form.copy_on_select, theme).on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(form) = &mut this.settings_form {
-                                    form.copy_on_select = !form.copy_on_select;
-                                }
-                                cx.notify();
-                            }),
-                        ),
+                        checkbox(self.tr("Copy on select"), form.copy_on_select, theme)
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(form) = &mut this.settings_form {
+                                        form.copy_on_select = !form.copy_on_select;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
                     )
                     .child(
-                        checkbox("Compose bar", form.compose_bar, theme).on_mouse_up(
+                        checkbox(self.tr("Compose bar"), form.compose_bar, theme).on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.settings_form {
@@ -3034,15 +3243,16 @@ impl XcordApp {
                         ),
                     )
                     .child(
-                        checkbox("Strict host keys", form.strict_host_keys, theme).on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(form) = &mut this.settings_form {
-                                    form.strict_host_keys = !form.strict_host_keys;
-                                }
-                                cx.notify();
-                            }),
-                        ),
+                        checkbox(self.tr("Strict host keys"), form.strict_host_keys, theme)
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(form) = &mut this.settings_form {
+                                        form.strict_host_keys = !form.strict_host_keys;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
                     ),
             )
             .child(
@@ -3050,7 +3260,7 @@ impl XcordApp {
                     .flex()
                     .gap_4()
                     .child(
-                        checkbox("Session logging", form.logging, theme).on_mouse_up(
+                        checkbox(self.tr("Session logging"), form.logging, theme).on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 if let Some(form) = &mut this.settings_form {
@@ -3061,15 +3271,16 @@ impl XcordApp {
                         ),
                     )
                     .child(
-                        checkbox("Output highlighting", form.highlight, theme).on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(form) = &mut this.settings_form {
-                                    form.highlight = !form.highlight;
-                                }
-                                cx.notify();
-                            }),
-                        ),
+                        checkbox(self.tr("Output highlighting"), form.highlight, theme)
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(form) = &mut this.settings_form {
+                                        form.highlight = !form.highlight;
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
                     ),
             )
             .child(
@@ -3080,25 +3291,23 @@ impl XcordApp {
                     } else {
                         rgbc(theme.muted)
                     })
-                    .child(error.unwrap_or_else(|| {
-                        "Changes apply live. Some plugin options need a plugin reload.".into()
-                    })),
+                    .child(error.unwrap_or(settings_hint)),
             )
             .child(
                 div()
                     .flex()
                     .justify_end()
                     .gap_2()
-                    .child(secondary_button("Cancel", theme).on_mouse_up(
+                    .child(secondary_button(self.tr("Cancel"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.settings_form = None;
                             cx.notify();
                         }),
                     ))
-                    .child(primary_button("Save", theme).on_mouse_up(
+                    .child(primary_button(self.tr("Save"), theme).on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.save_settings(cx)),
+                        cx.listener(|this, _, window, cx| this.save_settings(window, cx)),
                     )),
             )
     }
@@ -3154,13 +3363,13 @@ impl XcordApp {
                                 div()
                                     .text_size(px(12.))
                                     .text_color(rgbc(theme.foreground))
-                                    .child(command.title.clone()),
+                                    .child(self.command_title(command)),
                             )
                             .child(
                                 div()
                                     .text_size(px(9.5))
                                     .text_color(rgbc(theme.muted))
-                                    .child(command.category.to_string()),
+                                    .child(self.command_category(command)),
                             ),
                     )
                     .child(
@@ -3177,7 +3386,7 @@ impl XcordApp {
                     .p_4()
                     .text_size(px(11.))
                     .text_color(rgbc(theme.muted))
-                    .child("No matching commands."),
+                    .child(self.tr("No matching commands.")),
             );
         }
 
@@ -3234,7 +3443,7 @@ impl XcordApp {
                     .px_2()
                     .text_size(px(9.5))
                     .text_color(rgbc(theme.muted))
-                    .child("↑↓ navigate · Enter run · Esc close"),
+                    .child(self.tr("↑↓ navigate · Enter run · Esc close")),
             )
     }
 
@@ -3458,7 +3667,8 @@ fn input_colors(theme: &Theme) -> (Hsla, Hsla, Hsla, Hsla) {
     )
 }
 
-fn primary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+fn primary_button(label: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    let label = label.into();
     let bg = rgbc(theme.accent);
     let fg = rgbc(theme.background);
     div()
@@ -3478,7 +3688,8 @@ fn primary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
         .child(label)
 }
 
-fn secondary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+fn secondary_button(label: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    let label = label.into();
     div()
         .id(SharedString::from(format!("secondary-{label}")))
         .h(px(32.))
@@ -3497,7 +3708,8 @@ fn secondary_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
         .child(label)
 }
 
-fn small_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
+fn small_button(label: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    let label = label.into();
     div()
         .id(SharedString::from(format!("small-{label}")))
         .h(px(28.))
@@ -3516,7 +3728,8 @@ fn small_button(label: &'static str, theme: &Theme) -> Stateful<Div> {
         .child(label)
 }
 
-fn checkbox(label: &'static str, checked: bool, theme: &Theme) -> Stateful<Div> {
+fn checkbox(label: impl Into<SharedString>, checked: bool, theme: &Theme) -> Stateful<Div> {
+    let label = label.into();
     div()
         .id(SharedString::from(format!("check-{label}")))
         .flex()
@@ -3554,7 +3767,8 @@ fn checkbox(label: &'static str, checked: bool, theme: &Theme) -> Stateful<Div> 
         )
 }
 
-fn field(label: &'static str, input: Entity<TextInput>, theme: &Theme) -> Div {
+fn field(label: impl Into<SharedString>, input: Entity<TextInput>, theme: &Theme) -> Div {
+    let label = label.into();
     div()
         .flex()
         .flex_col()
@@ -3576,7 +3790,8 @@ fn field(label: &'static str, input: Entity<TextInput>, theme: &Theme) -> Div {
         )
 }
 
-fn auth_chip(label: &'static str, selected: bool, theme: &Theme) -> Stateful<Div> {
+fn auth_chip(label: impl Into<SharedString>, selected: bool, theme: &Theme) -> Stateful<Div> {
+    let label = label.into();
     div()
         .id(SharedString::from(format!("auth-{label}")))
         .h(px(28.))

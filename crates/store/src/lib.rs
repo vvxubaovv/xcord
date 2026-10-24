@@ -215,6 +215,8 @@ pub struct Settings {
     pub log_dir: String,
     pub sidebar_width: f32,
     pub compose_bar: bool,
+    /// UI locale. Defaults to Simplified Chinese for existing configs.
+    pub language: String,
     pub cursor_blink: bool,
     pub bell: bool,
     pub highlight: bool,
@@ -250,6 +252,7 @@ impl Default for Settings {
             log_dir: String::new(),
             sidebar_width: 260.0,
             compose_bar: true,
+            language: "zh-CN".into(),
             cursor_blink: true,
             bell: true,
             highlight: true,

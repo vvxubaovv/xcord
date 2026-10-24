@@ -12,6 +12,7 @@
 //! | `commands`    | [`Commands`]   | command palette contributions             |
 //! | `themes`      | [`Themes`]     | color schemes                             |
 //! | `highlights`  | [`Highlights`] | regex output highlighting                 |
+//! | `i18n`        | [`I18n`]       | locale catalogs for shell and plugins     |
 //! | `ui-host`     | [`Ui`]         | commands from plugins into the GPUI shell |
 //!
 //! Wrappers exist because Rust's `Any` cannot downcast to unsized trait
@@ -22,6 +23,7 @@
 pub mod ai;
 pub mod commands;
 pub mod highlight;
+pub mod i18n;
 pub mod mcp;
 pub mod runtime;
 pub mod session;
@@ -33,6 +35,7 @@ pub mod workspace;
 pub use ai::{Ai, AiAssistant, AiMessageView, AiSnapshot};
 pub use commands::{Command, CommandRegistry, Commands};
 pub use highlight::{HighlightService, HighlightSpan, Highlights};
+pub use i18n::{I18n, LocaleInfo, LocalizationService};
 pub use mcp::{
     McpResourceRegistry, McpResources, McpServerStatus, McpStatus, McpToolRegistry, McpTools,
     ResourceContent, ResourceSpec, ToolSpec,
@@ -61,6 +64,7 @@ pub mod services {
     pub const THEMES: &str = "themes";
     pub const HIGHLIGHTS: &str = "highlights";
     pub const UI_HOST: &str = "ui-host";
+    pub const I18N: &str = "i18n";
     pub const MCP_TOOLS: &str = "mcp-tools";
     pub const MCP_RESOURCES: &str = "mcp-resources";
     pub const MCP_STATUS: &str = "mcp-status";
