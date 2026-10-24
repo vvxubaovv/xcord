@@ -272,6 +272,8 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Terminal context", "终端上下文"),
     ("Copy", "复制"),
     ("Copy chat", "复制对话"),
+    ("Selected message", "已选择消息"),
+    ("Whole conversation", "整个对话"),
     ("Conversation terminal", "对话终端"),
     (
         "Conversation terminal · {title}",

@@ -264,6 +264,9 @@ impl TextInput {
                     return;
                 }
                 "c" => {
+                    if self.selected_range.is_empty() {
+                        return;
+                    }
                     self.copy(cx);
                     cx.stop_propagation();
                     return;

@@ -123,6 +123,8 @@ pub struct XcordApp {
     ai_scroll: ScrollHandle,
     ai_follow: Cell<bool>,
     ai_jump_target: Cell<Option<usize>>,
+    ai_selected_message: Cell<Option<usize>>,
+    ai_menu_open: Cell<bool>,
     ai_last_messages: Cell<usize>,
     ai_last_chars: Cell<usize>,
 
@@ -245,6 +247,8 @@ impl XcordApp {
             ai_scroll: ScrollHandle::new(),
             ai_follow: Cell::new(true),
             ai_jump_target: Cell::new(None),
+            ai_selected_message: Cell::new(None),
+            ai_menu_open: Cell::new(false),
             ai_last_messages: Cell::new(0),
             ai_last_chars: Cell::new(0),
             session_form: None,
@@ -1299,6 +1303,14 @@ impl XcordApp {
                 this.ai_follow.set(false);
                 cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.ai_selected_message.set(None);
+                    this.ai_menu_open.set(true);
+                    cx.notify();
+                }),
+            )
             .overflow_y_scroll()
             .px_3()
             .py_3();
@@ -1347,8 +1359,14 @@ impl XcordApp {
         } else {
             let copy_label = self.tr("Copy");
             for (index, message) in snapshot.messages.iter().enumerate() {
-                messages =
-                    messages.child(render_ai_message(index, message, theme, &copy_label, cx));
+                messages = messages.child(render_ai_message(
+                    index,
+                    message,
+                    theme,
+                    &copy_label,
+                    self.ai_selected_message.get() == Some(index),
+                    cx,
+                ));
             }
         }
 
@@ -1542,6 +1560,7 @@ impl XcordApp {
                     ),
             )
             .child(self.render_ai_context_bar(&snapshot, cx))
+            .child(self.render_ai_context_menu(cx))
             .child(
                 div()
                     .flex_1()
@@ -1551,6 +1570,113 @@ impl XcordApp {
                     .child(self.render_ai_rail(&snapshot, cx)),
             )
             .child(footer)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let control =
+                    event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+                if control && event.keystroke.key == "c" {
+                    this.copy_ai_selected(cx);
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    fn copy_ai_selected(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.ai.snapshot();
+        let text = match self.ai_selected_message.get() {
+            Some(index) => snapshot
+                .messages
+                .get(index)
+                .map(|message| message.text.clone()),
+            None => None,
+        }
+        .unwrap_or_else(|| {
+            snapshot
+                .messages
+                .iter()
+                .map(|message| format!("{}:\n{}\n", message.role, message.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.ai_menu_open.set(false);
+        cx.notify();
+    }
+
+    fn copy_ai_transcript(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.ai.snapshot();
+        let text = snapshot
+            .messages
+            .iter()
+            .map(|message| format!("{}:\n{}\n", message.role, message.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.ai_menu_open.set(false);
+        cx.notify();
+    }
+
+    fn render_ai_context_menu(&self, cx: &mut Context<Self>) -> Div {
+        if !self.ai_menu_open.get() {
+            return div();
+        }
+        let theme = self.theme();
+        let selected = self.ai_selected_message.get();
+        let label = if selected.is_some() {
+            self.tr("Selected message")
+        } else {
+            self.tr("Whole conversation")
+        };
+        let button = |id: &'static str, label: String, theme: &Theme| {
+            div()
+                .id(id)
+                .h(px(26.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded_md()
+                .border_1()
+                .border_color(rgbc(theme.border))
+                .bg(rgbc(theme.background))
+                .text_size(px(10.))
+                .text_color(rgbc(theme.foreground))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel)))
+                .child(label)
+        };
+        div()
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(rgba(theme.accent, 0.08))
+            .border_b_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgbc(theme.muted))
+                    .child(label),
+            )
+            .child(button("ai-menu-copy", self.tr("Copy"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.copy_ai_selected(cx)),
+            ))
+            .child(
+                button("ai-menu-copy-all", self.tr("Copy chat"), theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.copy_ai_transcript(cx)),
+                ),
+            )
+            .child(
+                button("ai-menu-cancel", self.tr("Cancel"), theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.ai_menu_open.set(false);
+                        cx.notify();
+                    }),
+                ),
+            )
     }
 
     fn render_ai_rail(&self, snapshot: &AiSnapshot, cx: &mut Context<Self>) -> Div {
@@ -3927,17 +4053,52 @@ fn render_ai_message(
     message: &AiMessageView,
     theme: &Theme,
     copy_label: &str,
+    selected: bool,
     cx: &mut Context<XcordApp>,
 ) -> Div {
     let is_tool = message.role.starts_with("Tool");
-    let mut card = div().w_full().min_w(px(0.)).flex().flex_col().gap_1();
+    let mut card = div()
+        .w_full()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(if selected {
+            rgbc(theme.accent)
+        } else {
+            rgba([0, 0, 0], 0.0)
+        })
+        .when(selected, |card| card.bg(rgba(theme.accent, 0.08)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, window, cx| {
+                this.ai_selected_message.set(Some(index));
+                this.ai_menu_open.set(false);
+                let handle = this.ai_input.read(cx).focus_handle_only();
+                window.focus(&handle);
+                cx.notify();
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, _, window, cx| {
+                this.ai_selected_message.set(Some(index));
+                this.ai_menu_open.set(true);
+                let handle = this.ai_input.read(cx).focus_handle_only();
+                window.focus(&handle);
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        );
     if is_tool {
-        card = card
-            .p_2()
-            .rounded_md()
-            .bg(rgbc(theme.panel_alt))
-            .border_1()
-            .border_color(rgbc(theme.border));
+        card = card.bg(rgbc(theme.panel_alt)).border_color(if selected {
+            rgbc(theme.accent)
+        } else {
+            rgbc(theme.border)
+        });
     }
     let role = match (&message.tool, message.role.as_str()) {
         (Some(tool), _) => format!("{} · {tool}", message.role),

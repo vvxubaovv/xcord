@@ -360,7 +360,10 @@ It also owns a `ScrollHandle` for the conversation: new messages/stream deltas
 scroll to the bottom while follow mode is on. Wheel input pauses follow; the
 right-side rail has an ↑ jump to the last user prompt, one dot per user prompt,
 and ↓ to resume following the latest output. Each message has a copy action and
-the header copies the whole transcript as plain text.
+the header copies the whole transcript as plain text. Message cards are
+selectable: right-click opens a copy menu and `Ctrl+C` copies the selected
+message or the full transcript. `TextInput` only consumes `Ctrl+C` when its own
+text selection is non-empty, so the panel can handle it otherwise.
 
 ## 9. Writing a plugin
 
