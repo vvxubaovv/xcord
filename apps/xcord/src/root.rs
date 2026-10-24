@@ -244,6 +244,7 @@ pub struct XcordApp {
     group_form: Option<GroupForm>,
     tab_groups: RefCell<Vec<TabGroupState>>,
     tab_group_of: RefCell<HashMap<TerminalId, String>>,
+    collapsed_tab_groups: RefCell<HashSet<String>>,
     tab_group_form: Option<TabGroupForm>,
     next_tab_group: Cell<u64>,
     collapsed_groups: RefCell<HashSet<String>>,
@@ -381,6 +382,7 @@ impl XcordApp {
             group_form: None,
             tab_groups: RefCell::new(Vec::new()),
             tab_group_of: RefCell::new(HashMap::new()),
+            collapsed_tab_groups: RefCell::new(HashSet::new()),
             tab_group_form: None,
             next_tab_group: Cell::new(1),
             collapsed_groups: RefCell::new(HashSet::new()),
@@ -855,6 +857,7 @@ impl XcordApp {
                     return;
                 }
                 self.tab_group_of.borrow_mut().insert(tab_id, group.clone());
+                self.collapsed_tab_groups.borrow_mut().remove(&group);
                 let last = {
                     let assigned = self.tab_group_of.borrow();
                     self.tabs
@@ -872,6 +875,16 @@ impl XcordApp {
             }
         }
         self.sync(cx);
+        cx.notify();
+    }
+
+    fn toggle_tab_group(&mut self, group: &str, cx: &mut Context<Self>) {
+        {
+            let mut collapsed = self.collapsed_tab_groups.borrow_mut();
+            if !collapsed.remove(group) {
+                collapsed.insert(group.to_string());
+            }
+        }
         cx.notify();
     }
 
@@ -3847,6 +3860,8 @@ impl XcordApp {
                 .filter(|tab| assignments.get(&tab.id) == Some(&group.id))
                 .collect::<Vec<_>>();
             let group_id = group.id.clone();
+            let toggle_id = group.id.clone();
+            let collapsed = self.collapsed_tab_groups.borrow().contains(&group.id);
             tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!("tab-group-{}", group.id)))
@@ -3859,11 +3874,26 @@ impl XcordApp {
                     .text_size(px(8.5))
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(rgbc(theme.accent))
+                    .cursor_pointer()
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_tab_group(&toggle_id, cx);
+                        }),
+                    )
                     .on_drop::<DraggedTab>(cx.listener(move |this, drag: &DraggedTab, _, cx| {
                         this.assign_tab_to_group(drag.id, Some(group_id.clone()), cx);
                     }))
-                    .child(format!("{} ({})", group.name, group_tabs.len())),
+                    .child(format!(
+                        "{} {} ({})",
+                        if collapsed { "▸" } else { "▾" },
+                        group.name,
+                        group_tabs.len()
+                    )),
             );
+            if collapsed {
+                continue;
+            }
             for tab in group_tabs {
                 tabs = tabs.child(self.render_tab_item(tab, cx));
             }

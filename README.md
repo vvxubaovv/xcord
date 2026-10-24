@@ -64,7 +64,7 @@ guide, the threading model, and the session-open sequence.
   profile are auto-numbered (`wsl`, `wsl (2)`, …). Drag tabs left/right to
   reorder. Tab groups are **independent of session groups**: use **Group** to
   create a tab group, then drag tabs onto its chip (or onto the **Ungrouped**
-  chip to remove them).
+  chip to remove them). Click a group chip to collapse/expand its tabs.
 - **ZMODEM (`lrzsz`)**: `sz file` downloads automatically into `Downloads`
   (unique names, no overwrite); `rz` opens a multi-file picker and uploads the
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
