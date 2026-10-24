@@ -4,7 +4,7 @@
 //! service, renders the services plugins publish, and forwards user intent as
 //! commands. Plugins can be reloaded without touching this file.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -24,6 +24,7 @@ use xcord_plugin_api::{
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings};
 
+use crate::selectable_text::SelectableText;
 use crate::terminal_view::TerminalView;
 use crate::text_input::TextInput;
 
@@ -127,6 +128,8 @@ pub struct XcordApp {
     ai_menu_open: Cell<bool>,
     ai_last_messages: Cell<usize>,
     ai_last_chars: Cell<usize>,
+    ai_text_entities: RefCell<Vec<Entity<SelectableText>>>,
+    ai_selection_owner: Rc<Cell<Option<usize>>>,
 
     session_form: Option<SessionForm>,
     settings_form: Option<SettingsForm>,
@@ -251,6 +254,8 @@ impl XcordApp {
             ai_menu_open: Cell::new(false),
             ai_last_messages: Cell::new(0),
             ai_last_chars: Cell::new(0),
+            ai_text_entities: RefCell::new(Vec::new()),
+            ai_selection_owner: Rc::new(Cell::new(None)),
             session_form: None,
             settings_form: None,
             ai_config: None,
@@ -1292,6 +1297,45 @@ impl XcordApp {
             .map(|message| format!("{}:\n{}\n", message.role, message.text))
             .collect::<Vec<_>>()
             .join("\n");
+        let mut entities = self.ai_text_entities.borrow_mut();
+        while entities.len() < snapshot.messages.len() {
+            let index = entities.len();
+            let message = &snapshot.messages[index];
+            let (color, size) = if message.role.starts_with("Tool") {
+                (rgbc(theme.muted), 10.0)
+            } else {
+                (rgbc(theme.foreground), 12.0)
+            };
+            let entity = cx.new(|cx| {
+                SelectableText::new(
+                    index,
+                    self.ai_selection_owner.clone(),
+                    message.text.clone(),
+                    color,
+                    size,
+                    rgba(theme.accent, 0.28),
+                    cx,
+                )
+            });
+            entities.push(entity);
+        }
+        if entities.len() > snapshot.messages.len() {
+            entities.truncate(snapshot.messages.len());
+            self.ai_selection_owner.set(None);
+        }
+        for (index, message) in snapshot.messages.iter().enumerate() {
+            let (color, size) = if message.role.starts_with("Tool") {
+                (rgbc(theme.muted), 10.0)
+            } else {
+                (rgbc(theme.foreground), 12.0)
+            };
+            entities[index].update(cx, |text, cx| {
+                text.set_style(color, size, cx);
+                text.set_text(message.text.clone(), cx);
+            });
+        }
+        let text_entities = entities.clone();
+        drop(entities);
         let mut messages = div()
             .id("ai-messages")
             .flex()
@@ -1365,6 +1409,7 @@ impl XcordApp {
                     theme,
                     &copy_label,
                     self.ai_selected_message.get() == Some(index),
+                    text_entities[index].clone(),
                     cx,
                 ));
             }
@@ -1581,6 +1626,21 @@ impl XcordApp {
     }
 
     fn copy_ai_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.ai_selected_message.get() {
+            let selected_text = self
+                .ai_text_entities
+                .borrow()
+                .get(index)
+                .and_then(|entity| entity.read(cx).selected_text());
+            if let Some(text) = selected_text {
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    self.ai_menu_open.set(false);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         let snapshot = self.ai.snapshot();
         let text = match self.ai_selected_message.get() {
             Some(index) => snapshot
@@ -4054,6 +4114,7 @@ fn render_ai_message(
     theme: &Theme,
     copy_label: &str,
     selected: bool,
+    text: Entity<SelectableText>,
     cx: &mut Context<XcordApp>,
 ) -> Div {
     let is_tool = message.role.starts_with("Tool");
@@ -4104,7 +4165,7 @@ fn render_ai_message(
         (Some(tool), _) => format!("{} · {tool}", message.role),
         _ => message.role.clone(),
     };
-    let text = message.text.clone();
+    let copy_text = message.text.clone();
     card.child(
         div()
             .flex()
@@ -4133,43 +4194,13 @@ fn render_ai_message(
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |_, _, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                         }),
                     )
                     .child(copy_label.to_string()),
             ),
     )
-    .child(text_block(
-        &message.text,
-        if is_tool {
-            rgbc(theme.muted)
-        } else {
-            rgbc(theme.foreground)
-        },
-        if is_tool { 10.0 } else { 12.0 },
-    ))
-}
-
-fn text_block(text: &str, color: Rgba, size: f32) -> Div {
-    let mut column = div().w_full().min_w(px(0.)).flex().flex_col().gap_1();
-    for line in text.lines() {
-        column = column.child(
-            div()
-                .w_full()
-                .min_w(px(0.))
-                .min_h(px(15.))
-                .overflow_hidden()
-                .whitespace_normal()
-                .text_size(px(size))
-                .text_color(color)
-                .child(if line.is_empty() {
-                    " ".to_string()
-                } else {
-                    line.to_string()
-                }),
-        );
-    }
-    column
+    .child(text)
 }
 
 fn mask_token(token: &str) -> String {

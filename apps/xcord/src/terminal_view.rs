@@ -184,6 +184,19 @@ impl TerminalView {
         let shift = keystroke.modifiers.shift;
         let key = keystroke.key.as_str();
 
+        if control && !shift && key == "c" {
+            let has_selection = self
+                .selection
+                .as_ref()
+                .map(|selection| !selection.is_empty())
+                .unwrap_or(false);
+            if has_selection {
+                self.copy_selection(cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         if control && shift {
             match key {
                 "t" => {
@@ -255,6 +268,18 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        if event.button == MouseButton::Right {
+            let has_selection = self
+                .selection
+                .as_ref()
+                .map(|selection| !selection.is_empty())
+                .unwrap_or(false);
+            if has_selection {
+                self.copy_selection(cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
         if event.button != MouseButton::Left {
             return;
         }

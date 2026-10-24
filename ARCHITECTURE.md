@@ -360,10 +360,15 @@ It also owns a `ScrollHandle` for the conversation: new messages/stream deltas
 scroll to the bottom while follow mode is on. Wheel input pauses follow; the
 right-side rail has an ↑ jump to the last user prompt, one dot per user prompt,
 and ↓ to resume following the latest output. Each message has a copy action and
-the header copies the whole transcript as plain text. Message cards are
-selectable: right-click opens a copy menu and `Ctrl+C` copies the selected
-message or the full transcript. `TextInput` only consumes `Ctrl+C` when its own
-text selection is non-empty, so the panel can handle it otherwise.
+the header copies the whole transcript as plain text. Message bodies are
+`SelectableText` views: they wrap `StyledText`, keep its `TextLayout`, map mouse
+positions with `index_for_position`, and paint per-character selection
+backgrounds with `position_for_index`. Right-click opens a copy menu and `Ctrl+C`
+copies the selected substring or the full transcript. `TextInput` only consumes
+`Ctrl+C` when its own text selection is non-empty, so the panel can handle it
+otherwise. The terminal uses its grid selection; `Ctrl+C` copies when the
+selection is non-empty and otherwise falls through to the SSH session, and a
+right-click on a non-empty selection copies it.
 
 ## 9. Writing a plugin
 
