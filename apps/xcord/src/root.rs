@@ -89,6 +89,17 @@ struct DraggedTab {
     name: String,
 }
 
+#[derive(Clone)]
+struct TabGroupState {
+    id: String,
+    name: String,
+}
+
+struct TabGroupForm {
+    name: Entity<TextInput>,
+    error: Option<String>,
+}
+
 struct TabDragPreview {
     name: String,
     theme: Theme,
@@ -172,6 +183,8 @@ enum PendingFocus {
     Terminal,
     DialogName,
     DialogSecret,
+    GroupName,
+    TabGroupName,
     Compose,
     Palette,
     AiInput,
@@ -229,6 +242,10 @@ pub struct XcordApp {
     session_menu: Option<String>,
     group_menu: Option<String>,
     group_form: Option<GroupForm>,
+    tab_groups: RefCell<Vec<TabGroupState>>,
+    tab_group_of: RefCell<HashMap<TerminalId, String>>,
+    tab_group_form: Option<TabGroupForm>,
+    next_tab_group: Cell<u64>,
     collapsed_groups: RefCell<HashSet<String>>,
     drag_hover: RefCell<Option<DragHover>>,
     group_drag_hover: RefCell<Option<(String, bool)>>,
@@ -362,6 +379,10 @@ impl XcordApp {
             session_menu: None,
             group_menu: None,
             group_form: None,
+            tab_groups: RefCell::new(Vec::new()),
+            tab_group_of: RefCell::new(HashMap::new()),
+            tab_group_form: None,
+            next_tab_group: Cell::new(1),
             collapsed_groups: RefCell::new(HashSet::new()),
             drag_hover: RefCell::new(None),
             group_drag_hover: RefCell::new(None),
@@ -558,6 +579,12 @@ impl XcordApp {
             };
         }
         self.active = self.workspace.active();
+        {
+            let live = self.tabs.iter().map(|tab| tab.id).collect::<HashSet<_>>();
+            self.tab_group_of
+                .borrow_mut()
+                .retain(|id, _| live.contains(id));
+        }
         self.theme = self.themes.active();
         if self.terminal_active != self.active {
             let active = self.active;
@@ -696,6 +723,158 @@ impl XcordApp {
         }
     }
 
+    fn open_tab_group_dialog(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme.clone();
+        let name = Self::make_input(&theme, &self.tr("Group name"), false, cx);
+        self.tab_group_form = Some(TabGroupForm { name, error: None });
+        self.pending_focus = Some(PendingFocus::TabGroupName);
+        cx.notify();
+    }
+
+    fn save_tab_group(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.tab_group_form.as_ref() else {
+            return;
+        };
+        let name = form.name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            let error = self.tr("Group name cannot be empty.");
+            if let Some(form) = &mut self.tab_group_form {
+                form.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+        if self
+            .tab_groups
+            .borrow()
+            .iter()
+            .any(|group| group.name == name)
+        {
+            let error = self.tr("A group with that name already exists.");
+            if let Some(form) = &mut self.tab_group_form {
+                form.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+        let index = self.next_tab_group.get();
+        self.next_tab_group.set(index + 1);
+        self.tab_groups.borrow_mut().push(TabGroupState {
+            id: format!("tab-group-{index}"),
+            name: name.clone(),
+        });
+        self.tab_group_form = None;
+        self.set_notice(
+            NoticeLevel::Info,
+            self.tr_args("Tab group created: {name}", &[("name", name)]),
+        );
+        cx.notify();
+    }
+
+    fn render_tab_group_dialog(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(form) = self.tab_group_form.as_ref() else {
+            return div();
+        };
+        div()
+            .w(px(360.))
+            .p_4()
+            .rounded_lg()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .bg(rgbc(theme.panel))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.foreground))
+                    .child(self.tr("New tab group")),
+            )
+            .child(
+                div()
+                    .h(px(34.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "enter" {
+                            this.save_tab_group(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(form.name.clone()),
+            )
+            .when_some(form.error.clone(), |panel, error| {
+                panel.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgbc(theme.danger))
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(secondary_button(self.tr("Cancel"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.tab_group_form = None;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(primary_button(self.tr("Create"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.save_tab_group(cx)),
+                    )),
+            )
+    }
+
+    fn assign_tab_to_group(
+        &mut self,
+        tab_id: TerminalId,
+        group: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        match group {
+            Some(group) => {
+                if !self
+                    .tab_groups
+                    .borrow()
+                    .iter()
+                    .any(|state| state.id == group)
+                {
+                    return;
+                }
+                self.tab_group_of.borrow_mut().insert(tab_id, group.clone());
+                let last = {
+                    let assigned = self.tab_group_of.borrow();
+                    self.tabs
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.id != tab_id && assigned.get(&entry.id) == Some(&group))
+                        .map(|entry| entry.id)
+                };
+                if let Some(last) = last {
+                    self.workspace.move_tab(tab_id, last, true);
+                }
+            }
+            None => {
+                self.tab_group_of.borrow_mut().remove(&tab_id);
+            }
+        }
+        self.sync(cx);
+        cx.notify();
+    }
+
     fn open_group_dialog(&mut self, cx: &mut Context<Self>) {
         let theme = self.theme.clone();
         let name = Self::make_input(&theme, &self.tr("Group name"), false, cx);
@@ -704,6 +883,7 @@ impl XcordApp {
             editing: None,
             error: None,
         });
+        self.pending_focus = Some(PendingFocus::GroupName);
         self.session_menu = None;
         self.group_menu = None;
         cx.notify();
@@ -718,6 +898,7 @@ impl XcordApp {
             editing: Some(group.to_string()),
             error: None,
         });
+        self.pending_focus = Some(PendingFocus::GroupName);
         self.session_menu = None;
         self.group_menu = None;
         cx.notify();
@@ -2710,6 +2891,14 @@ impl XcordApp {
                 .session_form
                 .as_ref()
                 .map(|form| form.secret.read(cx).focus_handle_only()),
+            PendingFocus::GroupName => self
+                .group_form
+                .as_ref()
+                .map(|form| form.name.read(cx).focus_handle_only()),
+            PendingFocus::TabGroupName => self
+                .tab_group_form
+                .as_ref()
+                .map(|form| form.name.read(cx).focus_handle_only()),
             PendingFocus::AiInput => Some(self.ai_input.read(cx).focus_handle_only()),
             PendingFocus::AiBase => self
                 .ai_config
@@ -2763,6 +2952,10 @@ impl XcordApp {
         if keystroke.key == "escape" {
             if self.palette.is_some() {
                 self.palette = None;
+                cx.notify();
+                cx.stop_propagation();
+            } else if self.tab_group_form.is_some() {
+                self.tab_group_form = None;
                 cx.notify();
                 cx.stop_propagation();
             } else if self.group_form.is_some() {
@@ -3622,171 +3815,57 @@ impl XcordApp {
             .flex_1()
             .overflow_hidden()
             .px_2();
-        let mut groups = self.sessions.groups();
-        if !groups.iter().any(|group| group == "Sessions") {
-            groups.push("Sessions".to_string());
+        let groups = self.tab_groups.borrow().clone();
+        let assignments = self.tab_group_of.borrow().clone();
+        if !groups.is_empty() {
+            tabs = tabs.child(
+                div()
+                    .id("tab-group-ungrouped")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .text_size(px(8.5))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.muted))
+                    .on_drop::<DraggedTab>(cx.listener(move |this, drag: &DraggedTab, _, cx| {
+                        this.assign_tab_to_group(drag.id, None, cx);
+                    }))
+                    .child(self.tr("Ungrouped")),
+            );
         }
-        let group_for = |profile_id: &str| {
-            self.sessions
-                .get(profile_id)
-                .map(|profile| {
-                    if profile.group.trim().is_empty() {
-                        "Sessions".to_string()
-                    } else {
-                        profile.group
-                    }
-                })
-                .unwrap_or_else(|| "Sessions".to_string())
-        };
         for tab in &self.tabs {
-            let group = group_for(&tab.profile_id);
-            if !groups.iter().any(|existing| existing == &group) {
-                groups.push(group);
+            if !assignments.contains_key(&tab.id) {
+                tabs = tabs.child(self.render_tab_item(tab, cx));
             }
         }
         for group in groups {
             let group_tabs = self
                 .tabs
                 .iter()
-                .filter(|tab| group_for(&tab.profile_id) == group)
-                .cloned()
+                .filter(|tab| assignments.get(&tab.id) == Some(&group.id))
                 .collect::<Vec<_>>();
-            if group_tabs.is_empty() {
-                continue;
-            }
+            let group_id = group.id.clone();
             tabs = tabs.child(
                 div()
+                    .id(SharedString::from(format!("tab-group-{}", group.id)))
                     .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgbc(theme.accent))
+                    .bg(rgba(theme.accent, 0.12))
                     .text_size(px(8.5))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgbc(theme.muted))
-                    .border_r_1()
-                    .border_color(rgbc(theme.border))
-                    .child(self.tr(&group).to_uppercase()),
+                    .text_color(rgbc(theme.accent))
+                    .on_drop::<DraggedTab>(cx.listener(move |this, drag: &DraggedTab, _, cx| {
+                        this.assign_tab_to_group(drag.id, Some(group_id.clone()), cx);
+                    }))
+                    .child(format!("{} ({})", group.name, group_tabs.len())),
             );
             for tab in group_tabs {
-                let active = Some(tab.id) == self.active;
-                let tab_id = tab.id;
-                let dot = match &tab.status {
-                    TabStatus::Connected => rgbc(theme.success),
-                    TabStatus::Connecting => rgbc(theme.accent),
-                    TabStatus::Failed(_) => rgbc(theme.danger),
-                    TabStatus::Closed => rgbc(theme.muted),
-                };
-                let tab_theme = theme.clone();
-                let drag_name = tab.title.clone();
-                let drop_target = tab.id;
-                let hover = self
-                    .tab_drag_hover
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|(target, _)| *target == tab.id);
-                tabs = tabs.child(
-                    div()
-                        .id(SharedString::from(format!("tab-{}", tab.id)))
-                        .h(px(34.))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .rounded_md()
-                        .bg(if hover {
-                            rgba(theme.accent, 0.16)
-                        } else if active {
-                            rgbc(theme.background)
-                        } else {
-                            rgba(theme.panel_alt, 0.0)
-                        })
-                        .border_1()
-                        .border_color(if active {
-                            rgbc(theme.border)
-                        } else {
-                            rgba(theme.border, 0.0)
-                        })
-                        .cursor_pointer()
-                        .hover(|style| style.bg(rgbc(theme.panel_alt)))
-                        .on_drag(
-                            DraggedTab {
-                                id: tab.id,
-                                name: drag_name,
-                            },
-                            move |drag, _, _, cx| {
-                                let theme = tab_theme.clone();
-                                cx.new(|_| TabDragPreview {
-                                    name: drag.name.clone(),
-                                    theme,
-                                })
-                            },
-                        )
-                        .on_drag_move::<DraggedTab>(cx.listener(
-                            move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
-                                let after = event.event.position.y >= event.bounds.center().y;
-                                this.tab_drag_hover.replace(Some((drop_target, after)));
-                                cx.notify();
-                            },
-                        ))
-                        .on_drop::<DraggedTab>(cx.listener(
-                            move |this, drag: &DraggedTab, _, cx| {
-                                if drag.id != drop_target {
-                                    let after = this
-                                        .tab_drag_hover
-                                        .borrow()
-                                        .as_ref()
-                                        .filter(|(target, _)| *target == drop_target)
-                                        .map(|(_, after)| *after)
-                                        .unwrap_or(true);
-                                    this.workspace.move_tab(drag.id, drop_target, after);
-                                    this.sync(cx);
-                                }
-                                this.tab_drag_hover.replace(None);
-                                cx.notify();
-                            },
-                        ))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                this.workspace.select(tab_id);
-                                this.pending_focus = Some(PendingFocus::Terminal);
-                                let _ = window;
-                                this.sync(cx);
-                                cx.notify();
-                            }),
-                        )
-                        .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(dot))
-                        .child(
-                            div()
-                                .max_w(px(180.))
-                                .text_size(px(12.))
-                                .text_color(if active {
-                                    rgbc(theme.foreground)
-                                } else {
-                                    rgbc(theme.muted)
-                                })
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(tab.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("close-{}", tab.id)))
-                                .px_1()
-                                .rounded_sm()
-                                .text_size(px(12.))
-                                .text_color(rgbc(theme.muted))
-                                .cursor_pointer()
-                                .hover(|style| style.text_color(rgbc(theme.danger)))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.workspace.close(tab_id);
-                                        this.tab_drag_hover.replace(None);
-                                        this.sync(cx);
-                                        cx.notify();
-                                    }),
-                                )
-                                .child("×"),
-                        ),
-                );
+                tabs = tabs.child(self.render_tab_item(tab, cx));
             }
         }
 
@@ -3810,7 +3889,7 @@ impl XcordApp {
                     .hover(|style| style.text_color(rgbc(theme.accent)))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.open_group_dialog(cx)),
+                        cx.listener(|this, _, _, cx| this.open_tab_group_dialog(cx)),
                     )
                     .child(self.tr("Group")),
             )
@@ -3830,6 +3909,138 @@ impl XcordApp {
                         cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
                     )
                     .child("+"),
+            )
+    }
+
+    fn render_tab_item(&self, tab: &TabInfo, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = self.theme();
+        let active = Some(tab.id) == self.active;
+        let tab_id = tab.id;
+        let dot = match &tab.status {
+            TabStatus::Connected => rgbc(theme.success),
+            TabStatus::Connecting => rgbc(theme.accent),
+            TabStatus::Failed(_) => rgbc(theme.danger),
+            TabStatus::Closed => rgbc(theme.muted),
+        };
+        let tab_theme = theme.clone();
+        let drag_name = tab.title.clone();
+        let drop_target = tab.id;
+        let hover = self
+            .tab_drag_hover
+            .borrow()
+            .as_ref()
+            .is_some_and(|(target, _)| *target == tab.id);
+        div()
+            .id(SharedString::from(format!("tab-{}", tab.id)))
+            .h(px(34.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .rounded_md()
+            .bg(if hover {
+                rgba(theme.accent, 0.16)
+            } else if active {
+                rgbc(theme.background)
+            } else {
+                rgba(theme.panel_alt, 0.0)
+            })
+            .border_1()
+            .border_color(if active {
+                rgbc(theme.border)
+            } else {
+                rgba(theme.border, 0.0)
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(rgbc(theme.panel_alt)))
+            .on_drag(
+                DraggedTab {
+                    id: tab.id,
+                    name: drag_name,
+                },
+                move |drag, _, _, cx| {
+                    let theme = tab_theme.clone();
+                    cx.new(|_| TabDragPreview {
+                        name: drag.name.clone(),
+                        theme,
+                    })
+                },
+            )
+            .on_drag_move::<DraggedTab>(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                    let after = event.event.position.y >= event.bounds.center().y;
+                    this.tab_drag_hover.replace(Some((drop_target, after)));
+                    cx.notify();
+                },
+            ))
+            .on_drop::<DraggedTab>(cx.listener(move |this, drag: &DraggedTab, _, cx| {
+                if drag.id != drop_target {
+                    let after = this
+                        .tab_drag_hover
+                        .borrow()
+                        .as_ref()
+                        .filter(|(target, _)| *target == drop_target)
+                        .map(|(_, after)| *after)
+                        .unwrap_or(true);
+                    let target_group = this.tab_group_of.borrow().get(&drop_target).cloned();
+                    match target_group {
+                        Some(group) => {
+                            this.tab_group_of.borrow_mut().insert(drag.id, group);
+                        }
+                        None => {
+                            this.tab_group_of.borrow_mut().remove(&drag.id);
+                        }
+                    }
+                    this.workspace.move_tab(drag.id, drop_target, after);
+                    this.sync(cx);
+                }
+                this.tab_drag_hover.replace(None);
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.workspace.select(tab_id);
+                    this.pending_focus = Some(PendingFocus::Terminal);
+                    let _ = window;
+                    this.sync(cx);
+                    cx.notify();
+                }),
+            )
+            .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(dot))
+            .child(
+                div()
+                    .max_w(px(180.))
+                    .text_size(px(12.))
+                    .text_color(if active {
+                        rgbc(theme.foreground)
+                    } else {
+                        rgbc(theme.muted)
+                    })
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(tab.title.clone()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("close-{}", tab.id)))
+                    .px_1()
+                    .rounded_sm()
+                    .text_size(px(12.))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgbc(theme.danger)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.workspace.close(tab_id);
+                            this.tab_group_of.borrow_mut().remove(&tab_id);
+                            this.tab_drag_hover.replace(None);
+                            this.sync(cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child("×"),
             )
     }
 
@@ -5059,7 +5270,9 @@ impl Render for XcordApp {
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
-        let content = if self.group_form.is_some() {
+        let content = if self.tab_group_form.is_some() {
+            modal_shell(self.render_tab_group_dialog(cx))
+        } else if self.group_form.is_some() {
             modal_shell(self.render_group_dialog(cx))
         } else if self.session_form.is_some() {
             // Keep dialogs in normal layout flow. Absolute overlays in this
