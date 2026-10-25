@@ -164,6 +164,8 @@ struct SettingsForm {
     logging: bool,
     highlight: bool,
     strict_host_keys: bool,
+    download_dir: Entity<TextInput>,
+    download_ask: bool,
     error: Option<String>,
 }
 
@@ -771,6 +773,11 @@ impl XcordApp {
             }
             WorkspaceEvent::CommandSubmitted(id) => {
                 self.on_base64_command_submitted(id, cx);
+            }
+            WorkspaceEvent::FileSaved { path, .. } => {
+                if self.settings.download_ask {
+                    self.prompt_move_saved_file(PathBuf::from(path), cx);
+                }
             }
             WorkspaceEvent::StatusChanged(id) | WorkspaceEvent::Bell(id) => {
                 if self.active == Some(id) {
@@ -1846,6 +1853,10 @@ impl XcordApp {
         } else {
             self.settings.theme.clone()
         };
+        let download_dir = Self::make_input(&self.theme, &self.tr("Downloads folder"), false, cx);
+        download_dir.update(cx, |input, cx| {
+            input.set_value(self.settings.download_dir.clone(), cx)
+        });
         self.settings_form = Some(SettingsForm {
             theme_id,
             language: self.settings.language.clone(),
@@ -1856,9 +1867,37 @@ impl XcordApp {
             logging: self.settings.logging,
             highlight: self.settings.highlight,
             strict_host_keys: self.settings.host_key_policy == HostKeyPolicy::Strict,
+            download_dir,
+            download_ask: self.settings.download_ask,
             error: None,
         });
         cx.notify();
+    }
+
+    fn pick_settings_download_dir(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.tr("Choose download folder").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |app, cx| {
+                if let Some(form) = &mut app.settings_form {
+                    form.download_dir.update(cx, |input, cx| {
+                        input.set_value(path.to_string_lossy().into_owned(), cx)
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn apply_theme(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1903,6 +1942,8 @@ impl XcordApp {
         settings.compose_bar = form.compose_bar;
         settings.logging = form.logging;
         settings.highlight = form.highlight;
+        settings.download_dir = form.download_dir.read(cx).value().trim().to_string();
+        settings.download_ask = form.download_ask;
         settings.host_key_policy = if form.strict_host_keys {
             HostKeyPolicy::Strict
         } else {
@@ -5046,6 +5087,48 @@ impl XcordApp {
             .child(input)
     }
 
+    fn prompt_move_saved_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.tr("Choose folder for the saved file").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                let _ = this.update(cx, |app, cx| {
+                    app.set_notice(
+                        NoticeLevel::Info,
+                        app.tr_args(
+                            "File saved: {path}",
+                            &[("path", path.display().to_string())],
+                        ),
+                    );
+                    cx.notify();
+                });
+                return;
+            };
+            let Some(dir) = paths.into_iter().next() else {
+                return;
+            };
+            let moved = move_saved_file(&path, &dir);
+            let _ = this.update(cx, |app, _cx| match moved {
+                Ok(new_path) => app.set_notice(
+                    NoticeLevel::Success,
+                    app.tr_args(
+                        "File moved to: {path}",
+                        &[("path", new_path.display().to_string())],
+                    ),
+                ),
+                Err(error) => app.set_notice(
+                    NoticeLevel::Error,
+                    app.tr_args("Could not move saved file: {error}", &[("error", error)]),
+                ),
+            });
+        })
+        .detach();
+    }
+
     fn toggle_base64_capture(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.active else {
             self.set_notice(
@@ -5152,20 +5235,31 @@ impl XcordApp {
             .set(self.base64_timeout_generation.get() + 1);
         let raw = self.workspace.take_output_capture(id).unwrap_or_default();
         match decode_base64_output(&raw) {
-            Ok((name, bytes)) => match save_base64_file(&name, &bytes) {
-                Ok(path) => self.set_notice(
-                    NoticeLevel::Success,
-                    self.tr_args(
-                        "Base64 file saved: {path}",
-                        &[("path", path.to_string_lossy().into_owned())],
-                    ),
-                ),
-                Err(error) => {
-                    self.base64_error = Some(
-                        self.tr_args("Could not save decoded file: {error}", &[("error", error)]),
-                    );
+            Ok((name, bytes)) => {
+                let dir = configured_download_dir(&self.settings);
+                match save_base64_file(&name, &bytes, &dir) {
+                    Ok(path) => {
+                        if self.settings.download_ask {
+                            self.prompt_move_saved_file(path, cx);
+                        } else {
+                            self.set_notice(
+                                NoticeLevel::Success,
+                                self.tr_args(
+                                    "Base64 file saved: {path}",
+                                    &[("path", path.to_string_lossy().into_owned())],
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        self.base64_error =
+                            Some(self.tr_args(
+                                "Could not save decoded file: {error}",
+                                &[("error", error)],
+                            ));
+                    }
                 }
-            },
+            }
             Err(Base64DecodeError::Empty) => {
                 self.base64_error =
                     Some(self.tr("The command produced no output. Base64 parsing failed."));
@@ -7072,6 +7166,65 @@ impl XcordApp {
             )
             .child(
                 div()
+                    .text_size(px(11.))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("Download folder")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(32.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .bg(rgbc(theme.panel))
+                            .border_1()
+                            .border_color(rgbc(theme.border))
+                            .child(form.download_dir.clone()),
+                    )
+                    .child(small_button(self.tr("Browse…"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.pick_settings_download_dir(cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        checkbox(
+                            self.tr("Choose another folder after saving"),
+                            form.download_ask,
+                            theme,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.download_ask = !form.download_ask;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(self.tr(
+                                "When enabled, the file is saved first and then moved to the folder you pick.",
+                            )),
+                    ),
+            )
+            .child(
+                div()
                     .text_size(px(10.))
                     .text_color(if error.is_some() {
                         rgbc(theme.danger)
@@ -7677,39 +7830,24 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn save_base64_file(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
-    let dir = base64_download_dir();
-    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+fn save_base64_file(name: &str, bytes: &[u8], dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     let name = sanitize_filename(name);
-    let mut path = dir.join(&name);
-    if path.exists() {
-        let stem = Path::new(&name)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("decoded");
-        let extension = Path::new(&name)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("");
-        let mut index = 1;
-        loop {
-            let candidate = if extension.is_empty() {
-                format!("{stem} ({index})")
-            } else {
-                format!("{stem} ({index}).{extension}")
-            };
-            path = dir.join(candidate);
-            if !path.exists() {
-                break;
-            }
-            index += 1;
-        }
-    }
+    let path = unique_file_path(dir, &name);
     std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
     Ok(path)
 }
 
-fn base64_download_dir() -> PathBuf {
+fn configured_download_dir(settings: &Settings) -> PathBuf {
+    let configured = settings.download_dir.trim();
+    if configured.is_empty() {
+        default_download_dir()
+    } else {
+        PathBuf::from(configured)
+    }
+}
+
+fn default_download_dir() -> PathBuf {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
@@ -7720,6 +7858,57 @@ fn base64_download_dir() -> PathBuf {
     } else {
         home
     }
+}
+
+fn unique_file_path(dir: &Path, name: &str) -> PathBuf {
+    let mut path = dir.join(name);
+    if !path.exists() {
+        return path;
+    }
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("file");
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+    let mut index = 1;
+    loop {
+        let candidate = if extension.is_empty() {
+            format!("{stem} ({index})")
+        } else {
+            format!("{stem} ({index}).{extension}")
+        };
+        path = dir.join(candidate);
+        if !path.exists() {
+            return path;
+        }
+        index += 1;
+    }
+}
+
+fn move_saved_file(source: &Path, target_dir: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(target_dir).map_err(|error| error.to_string())?;
+    if source
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(target_dir.canonicalize().ok())
+        .is_some_and(|(left, right)| left == right)
+    {
+        return Ok(source.to_path_buf());
+    }
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Invalid file name.".to_string())?;
+    let target = unique_file_path(target_dir, name);
+    if std::fs::rename(source, &target).is_ok() {
+        return Ok(target);
+    }
+    std::fs::copy(source, &target).map_err(|error| error.to_string())?;
+    std::fs::remove_file(source).map_err(|error| error.to_string())?;
+    Ok(target)
 }
 
 fn epoch_seconds() -> u64 {
@@ -8104,7 +8293,11 @@ mod quick_command_tests {
 
 #[cfg(test)]
 mod base64_capture_tests {
-    use super::{decode_base64_output, shell_quote, Base64DecodeError};
+    use super::{
+        configured_download_dir, decode_base64_output, move_saved_file, save_base64_file,
+        shell_quote, Base64DecodeError,
+    };
+    use xcord_store::Settings;
 
     #[test]
     fn decodes_command_output_and_uses_command_filename() {
@@ -8142,6 +8335,26 @@ mod base64_capture_tests {
         let output = "printf 'aGVsbG8='\r\naGVsbG8=\r\nxubao@host:~$ ";
         let (_, bytes) = decode_base64_output(output).unwrap();
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn saves_and_moves_in_configured_folder() {
+        let root = std::env::temp_dir().join(format!("xcord-download-test-{}", std::process::id()));
+        let source_dir = root.join("incoming");
+        let target_dir = root.join("chosen");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let mut settings = Settings::default();
+        settings.download_dir = source_dir.to_string_lossy().into_owned();
+        assert_eq!(configured_download_dir(&settings), source_dir);
+        let saved =
+            save_base64_file("hello.txt", b"hello", &configured_download_dir(&settings)).unwrap();
+        assert_eq!(std::fs::read(&saved).unwrap(), b"hello");
+        let moved = move_saved_file(&saved, &target_dir).unwrap();
+        assert_eq!(moved.parent().unwrap(), target_dir);
+        assert_eq!(std::fs::read(&moved).unwrap(), b"hello");
+        assert!(!saved.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

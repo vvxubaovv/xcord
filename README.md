@@ -77,13 +77,17 @@ guide, the threading model, and the session-open sequence.
   file. Large files show a time warning. The file is Base64-streamed through the
   terminal (with echo disabled), decoded into the temp file and moved into place;
   the remote shell is restored on success, failure or cancellation.
+- **Configurable download folder**: set it under **Settings → Download folder**.
+  By default received files go there directly; enable **Choose another folder
+  after saving** to keep the initial save and then move the file to a folder you
+  pick. Applies to ZMODEM and Base64-received files.
 - **One-shot Base64 capture**: click **Base64 file** in the compose bar, then
   run the next command. Its output is captured after the command is submitted;
-  a valid Base64 block is decoded and saved to `Downloads` (filename from a
+  a valid Base64 block is decoded and saved to the configured download folder (filename from a
   `FILE: name` line or a `base64 path` command, otherwise a timestamped name).
   Success and failure both disarm the feature; failures open a dialog. Base64 is
   never captured automatically.
-- **ZMODEM (`lrzsz`)**: `sz file` downloads automatically into `Downloads`
+- **ZMODEM (`lrzsz`)**: `sz file` downloads automatically into the configured download folder
   (unique names, no overwrite); `rz` opens a multi-file picker and uploads the
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
   protected from typing during a transfer.
@@ -151,7 +155,7 @@ guide, the threading model, and the session-open sequence.
 Install `lrzsz` on the remote host (`sz`/`rz`). Then:
 
 ```bash
-sz report.tar.gz      # Xcord downloads into %USERPROFILE%\Downloads
+sz report.tar.gz      # Xcord downloads into the configured folder (default Downloads)
 rz -y                 # Xcord opens a file picker and uploads the selection
 ```
 

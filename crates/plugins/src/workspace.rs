@@ -462,6 +462,7 @@ impl WorkspaceState {
             TransportEvent::Output(data) => {
                 let mut raw = None;
                 let mut upload_requested = false;
+                let mut saved_paths = Vec::new();
                 {
                     let mut tabs = self.tabs.borrow_mut();
                     if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) {
@@ -476,7 +477,14 @@ impl WorkspaceState {
                             transfer = true;
                             match start {
                                 crate::zmodem::Start::Receive => {
-                                    let mut session = crate::zmodem::Session::receiving();
+                                    let settings = self.sessions.settings();
+                                    let dir = if settings.download_dir.trim().is_empty() {
+                                        crate::zmodem::default_download_dir()
+                                    } else {
+                                        PathBuf::from(settings.download_dir.trim())
+                                    };
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    let mut session = crate::zmodem::Session::receiving(dir);
                                     done = session.feed(
                                         &data[index..],
                                         tab.transport.as_deref(),
@@ -500,6 +508,11 @@ impl WorkspaceState {
                         }
                         if !transfer {
                             tab.terminal.feed(&data);
+                        }
+                        for message in &zmodem_notices {
+                            if let Some(path) = message.strip_prefix("ZMODEM saved ") {
+                                saved_paths.push(path.to_string());
+                            }
                         }
                         for message in zmodem_notices {
                             feed_notice(&mut tab.terminal, &message, false);
@@ -536,6 +549,9 @@ impl WorkspaceState {
                 }
                 if upload_requested {
                     self.emit(WorkspaceEvent::ZmodemUploadRequested { terminal: id });
+                }
+                for path in saved_paths {
+                    self.emit(WorkspaceEvent::FileSaved { terminal: id, path });
                 }
                 if let Some(capture) = self.output_captures.borrow_mut().get_mut(&id) {
                     if capture.started {

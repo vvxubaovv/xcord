@@ -69,8 +69,8 @@ pub struct SenderState {
 }
 
 impl Session {
-    pub fn receiving() -> Self {
-        Self::Receiving(ReceiverState::new())
+    pub fn receiving(dir: PathBuf) -> Self {
+        Self::Receiving(ReceiverState::new(dir))
     }
 
     pub fn upload_pending(bytes: Vec<u8>) -> Self {
@@ -198,7 +198,7 @@ pub fn visible_name(name: &[u8]) -> String {
     }
 }
 
-fn download_dir() -> PathBuf {
+pub fn default_download_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
         let home = PathBuf::from(home);
         let downloads = home.join("Downloads");
@@ -235,12 +235,12 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 impl ReceiverState {
-    fn new() -> Self {
+    fn new(dir: PathBuf) -> Self {
         let state = Receiver::with_flow_control(0, true)
             .unwrap_or_else(|_| Receiver::new().expect("ZMODEM receiver"));
         Self {
             state,
-            dir: download_dir(),
+            dir,
             file: None,
             path: None,
             input: Vec::new(),

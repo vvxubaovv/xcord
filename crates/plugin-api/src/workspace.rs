@@ -103,6 +103,11 @@ pub enum WorkspaceEvent {
     TestFinished(ConnectionTest),
     /// A command was submitted to a terminal (Enter/newline).
     CommandSubmitted(TerminalId),
+    /// A received file was written to disk.
+    FileSaved {
+        terminal: TerminalId,
+        path: String,
+    },
     /// A remote `rz` is waiting for files. The UI should ask for paths and call
     /// [`WorkspaceService::zmodem_upload`].
     ZmodemUploadRequested {

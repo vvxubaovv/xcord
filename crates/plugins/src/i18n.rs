@@ -401,6 +401,27 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Create group", "创建分组"),
     ("Join group:", "加入分组："),
     ("Base64 file", "Base64 收文件"),
+    ("Download folder", "下载文件夹"),
+    ("Downloads folder", "默认 Downloads 文件夹"),
+    ("Choose download folder", "选择下载文件夹"),
+    (
+        "Choose another folder after saving",
+        "保存后选择其他文件夹",
+    ),
+    (
+        "When enabled, the file is saved first and then moved to the folder you pick.",
+        "启用后先保存到设置的文件夹，再移动到所选的文件夹。",
+    ),
+    (
+        "Choose folder for the saved file",
+        "选择保存文件的文件夹",
+    ),
+    ("File saved: {path}", "文件已保存：{path}"),
+    ("File moved to: {path}", "文件已移动到：{path}"),
+    (
+        "Could not move saved file: {error}",
+        "无法移动已保存文件：{error}",
+    ),
     ("Base64 send", "Base64 发送"),
     ("Base64 file transfer", "Base64 文件传输"),
     ("Local file", "本地文件"),

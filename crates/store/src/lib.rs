@@ -221,6 +221,12 @@ pub struct Settings {
     pub host_key_policy: HostKeyPolicy,
     pub logging: bool,
     pub log_dir: String,
+    /// Folder for received files. Empty uses the platform Downloads folder.
+    #[serde(default)]
+    pub download_dir: String,
+    /// Ask for another folder after a file has been received.
+    #[serde(default)]
+    pub download_ask: bool,
     pub sidebar_width: f32,
     pub compose_bar: bool,
     /// UI locale. Defaults to Simplified Chinese for existing configs.
@@ -258,6 +264,8 @@ impl Default for Settings {
             host_key_policy: HostKeyPolicy::AcceptNew,
             logging: false,
             log_dir: String::new(),
+            download_dir: String::new(),
+            download_ask: false,
             sidebar_width: 260.0,
             compose_bar: true,
             language: "zh-CN".into(),
