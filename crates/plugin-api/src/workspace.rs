@@ -101,6 +101,8 @@ pub enum WorkspaceEvent {
     Bell(TerminalId),
     Closed(TerminalId),
     TestFinished(ConnectionTest),
+    /// A command was submitted to a terminal (Enter/newline).
+    CommandSubmitted(TerminalId),
     /// A remote `rz` is waiting for files. The UI should ask for paths and call
     /// [`WorkspaceService::zmodem_upload`].
     ZmodemUploadRequested {
@@ -133,6 +135,12 @@ pub trait WorkspaceService {
 
     fn write(&self, id: TerminalId, data: &[u8]);
     fn resize(&self, id: TerminalId, cols: u16, rows: u16);
+
+    /// Begin buffering raw terminal output for a one-shot capture. The buffer
+    /// is cleared when a command is submitted, then collects the next output.
+    fn begin_output_capture(&self, id: TerminalId);
+    /// Take and clear the captured output (if any).
+    fn take_output_capture(&self, id: TerminalId) -> Option<String>;
 
     /// Send local files to a remote `rz` that is already waiting.
     fn zmodem_upload(&self, id: TerminalId, paths: Vec<String>) -> Result<(), String>;

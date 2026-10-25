@@ -400,6 +400,32 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Close to the left", "关闭左侧"),
     ("Create group", "创建分组"),
     ("Join group:", "加入分组："),
+    ("Base64 file", "Base64 收文件"),
+    ("Base64 armed", "Base64 已开启"),
+    (
+        "Base64 capture armed. Run the next command.",
+        "Base64 接收已开启，请执行下一条命令。",
+    ),
+    ("Base64 capture cancelled.", "已取消 Base64 接收。"),
+    (
+        "Open a terminal tab before enabling Base64 capture.",
+        "请先打开终端标签页再开启 Base64 接收。",
+    ),
+    ("Base64 file saved: {path}", "Base64 文件已保存：{path}"),
+    ("Base64 decode failed", "Base64 解析失败"),
+    (
+        "The command produced no output. Base64 parsing failed.",
+        "命令没有输出，Base64 解析失败。",
+    ),
+    (
+        "No Base64 text found in the command output.",
+        "命令输出中未找到 Base64 文本。",
+    ),
+    ("Base64 data is invalid: {error}", "Base64 数据无效：{error}"),
+    (
+        "Could not save decoded file: {error}",
+        "保存解码文件失败：{error}",
+    ),
     ("Search quick commands", "搜索快捷命令"),
     ("Command", "命令"),
     ("Command (supports \\n, \\t, \\xNN)", "命令（支持 \\n、\\t、\\xNN）"),

@@ -72,6 +72,12 @@ guide, the threading model, and the session-open sequence.
   commands** page with search, create, edit and delete. Clicking a saved
   command inserts it into the command bar (double-click in the list works too).
   Commands support `\n`, `\r`, `\t`, `\e`, `\xNN`, `\u{...}` and `\\` escapes.
+- **One-shot Base64 capture**: click **Base64 file** in the compose bar, then
+  run the next command. Its output is captured after the command is submitted;
+  a valid Base64 block is decoded and saved to `Downloads` (filename from a
+  `FILE: name` line or a `base64 path` command, otherwise a timestamped name).
+  Success and failure both disarm the feature; failures open a dialog. Base64 is
+  never captured automatically.
 - **ZMODEM (`lrzsz`)**: `sz file` downloads automatically into `Downloads`
   (unique names, no overwrite); `rz` opens a multi-file picker and uploads the
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is

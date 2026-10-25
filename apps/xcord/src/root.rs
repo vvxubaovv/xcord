@@ -6,15 +6,17 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use async_channel::Receiver;
+use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{
     div, px, rgb, ClipboardItem, Context, Div, DragMoveEvent, Entity, Font, Hsla, KeyDownEvent,
     MouseButton, MouseUpEvent, PathPromptOptions, Render, Rgba, ScrollHandle, SharedString,
-    Stateful, Window,
+    Stateful, Timer, Window,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -240,6 +242,14 @@ pub struct XcordApp {
     ai_text_entities: RefCell<Vec<Entity<SelectableText>>>,
     ai_selection_owner: Rc<Cell<Option<usize>>>,
 
+    base64_target: Option<TerminalId>,
+    base64_capturing: bool,
+    base64_last_output: Option<Instant>,
+    base64_started: Option<Instant>,
+    base64_settle_generation: Cell<u64>,
+    base64_timeout_generation: Cell<u64>,
+    base64_error: Option<String>,
+
     quick_commands_open: bool,
     quick_search: Entity<TextInput>,
     quick_name: Entity<TextInput>,
@@ -413,6 +423,13 @@ impl XcordApp {
             ai_last_chars: Cell::new(0),
             ai_text_entities: RefCell::new(Vec::new()),
             ai_selection_owner: Rc::new(Cell::new(None)),
+            base64_target: None,
+            base64_capturing: false,
+            base64_last_output: None,
+            base64_started: None,
+            base64_settle_generation: Cell::new(0),
+            base64_timeout_generation: Cell::new(0),
+            base64_error: None,
             quick_commands_open: false,
             quick_search,
             quick_name,
@@ -674,6 +691,15 @@ impl XcordApp {
         {
             self.tab_group_pending = None;
         }
+        if self
+            .base64_target
+            .is_some_and(|id| !self.tabs.iter().any(|tab| tab.id == id))
+        {
+            self.base64_target = None;
+            self.base64_capturing = false;
+            self.base64_last_output = None;
+            self.base64_started = None;
+        }
         {
             let live = self.tabs.iter().map(|tab| tab.id).collect::<HashSet<_>>();
             self.tab_group_of
@@ -709,9 +735,16 @@ impl XcordApp {
                 self.set_notice(level, message);
             }
             WorkspaceEvent::Dirty(id) => {
+                if self.base64_target == Some(id) && self.base64_capturing {
+                    self.base64_last_output = Some(Instant::now());
+                    self.schedule_base64_settle(id, 800, cx);
+                }
                 if self.active == Some(id) {
                     self.terminal.update(cx, |_, cx| cx.notify());
                 }
+            }
+            WorkspaceEvent::CommandSubmitted(id) => {
+                self.on_base64_command_submitted(id, cx);
             }
             WorkspaceEvent::StatusChanged(id) | WorkspaceEvent::Bell(id) => {
                 if self.active == Some(id) {
@@ -3178,6 +3211,10 @@ impl XcordApp {
                 self.palette = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.base64_error.is_some() {
+                self.base64_error = None;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.tab_menu.is_some() {
                 self.tab_menu = None;
                 cx.notify();
@@ -4535,6 +4572,178 @@ impl XcordApp {
         }
     }
 
+    fn toggle_base64_capture(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.active else {
+            self.set_notice(
+                NoticeLevel::Warning,
+                self.tr("Open a terminal tab before enabling Base64 capture."),
+            );
+            return;
+        };
+        if self.base64_target == Some(id) {
+            self.cancel_base64_capture(cx, true);
+            return;
+        }
+        if let Some(old) = self.base64_target.take() {
+            self.workspace.take_output_capture(old);
+        }
+        self.base64_target = Some(id);
+        self.base64_capturing = false;
+        self.base64_last_output = None;
+        self.base64_started = Some(Instant::now());
+        self.base64_settle_generation
+            .set(self.base64_settle_generation.get() + 1);
+        self.base64_timeout_generation
+            .set(self.base64_timeout_generation.get() + 1);
+        self.base64_error = None;
+        self.workspace.begin_output_capture(id);
+        self.set_notice(
+            NoticeLevel::Info,
+            self.tr("Base64 capture armed. Run the next command."),
+        );
+        cx.notify();
+    }
+
+    fn cancel_base64_capture(&mut self, cx: &mut Context<Self>, notify: bool) {
+        if let Some(id) = self.base64_target.take() {
+            self.workspace.take_output_capture(id);
+        }
+        self.base64_capturing = false;
+        self.base64_last_output = None;
+        self.base64_started = None;
+        self.base64_settle_generation
+            .set(self.base64_settle_generation.get() + 1);
+        self.base64_timeout_generation
+            .set(self.base64_timeout_generation.get() + 1);
+        if notify {
+            self.set_notice(NoticeLevel::Info, self.tr("Base64 capture cancelled."));
+        }
+        cx.notify();
+    }
+
+    fn on_base64_command_submitted(&mut self, id: TerminalId, cx: &mut Context<Self>) {
+        if self.base64_target != Some(id) || self.base64_capturing {
+            return;
+        }
+        self.base64_capturing = true;
+        self.base64_started = Some(Instant::now());
+        self.base64_last_output = None;
+        self.base64_settle_generation
+            .set(self.base64_settle_generation.get() + 1);
+        self.schedule_base64_settle(id, 900, cx);
+        let generation = self.base64_timeout_generation.get() + 1;
+        self.base64_timeout_generation.set(generation);
+        cx.spawn(async move |this, cx| {
+            Timer::after(Duration::from_secs(30)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.base64_target == Some(id)
+                    && app.base64_capturing
+                    && app.base64_timeout_generation.get() == generation
+                {
+                    app.finish_base64_capture(cx);
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn schedule_base64_settle(&mut self, id: TerminalId, delay_ms: u64, cx: &mut Context<Self>) {
+        let generation = self.base64_settle_generation.get() + 1;
+        self.base64_settle_generation.set(generation);
+        cx.spawn(async move |this, cx| {
+            Timer::after(Duration::from_millis(delay_ms)).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.base64_target == Some(id)
+                    && app.base64_capturing
+                    && app.base64_settle_generation.get() == generation
+                {
+                    app.finish_base64_capture(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn finish_base64_capture(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.base64_target.take() else {
+            return;
+        };
+        self.base64_capturing = false;
+        self.base64_last_output = None;
+        self.base64_started = None;
+        self.base64_settle_generation
+            .set(self.base64_settle_generation.get() + 1);
+        self.base64_timeout_generation
+            .set(self.base64_timeout_generation.get() + 1);
+        let raw = self.workspace.take_output_capture(id).unwrap_or_default();
+        match decode_base64_output(&raw) {
+            Ok((name, bytes)) => match save_base64_file(&name, &bytes) {
+                Ok(path) => self.set_notice(
+                    NoticeLevel::Success,
+                    self.tr_args(
+                        "Base64 file saved: {path}",
+                        &[("path", path.to_string_lossy().into_owned())],
+                    ),
+                ),
+                Err(error) => {
+                    self.base64_error = Some(
+                        self.tr_args("Could not save decoded file: {error}", &[("error", error)]),
+                    );
+                }
+            },
+            Err(Base64DecodeError::Empty) => {
+                self.base64_error =
+                    Some(self.tr("The command produced no output. Base64 parsing failed."));
+            }
+            Err(Base64DecodeError::NotFound) => {
+                self.base64_error = Some(self.tr("No Base64 text found in the command output."));
+            }
+            Err(Base64DecodeError::Invalid(error)) => {
+                self.base64_error =
+                    Some(self.tr_args("Base64 data is invalid: {error}", &[("error", error)]));
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_base64_error(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let message = self.base64_error.clone().unwrap_or_default();
+        div()
+            .w(px(520.))
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgbc(theme.danger))
+            .bg(rgbc(theme.panel))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.danger))
+                    .child(self.tr("Base64 decode failed")),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgbc(theme.foreground))
+                    .child(message),
+            )
+            .child(div().flex().justify_end().child(
+                primary_button(self.tr("Close"), theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.base64_error = None;
+                        cx.notify();
+                    }),
+                ),
+            ))
+    }
+
     fn open_quick_commands(&mut self, cx: &mut Context<Self>) {
         self.quick_commands_open = true;
         self.quick_editing = None;
@@ -4899,6 +5108,37 @@ impl XcordApp {
                     .child(self.snippet_label(&snippet.name)),
             );
         }
+        let base64_armed = self.base64_target.is_some() && self.base64_target == self.active;
+        chips = chips.child(
+            div()
+                .id("base64-capture")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(if base64_armed {
+                    rgbc(theme.success)
+                } else {
+                    rgbc(theme.border)
+                })
+                .text_size(px(9.5))
+                .text_color(if base64_armed {
+                    rgbc(theme.success)
+                } else {
+                    rgbc(theme.muted)
+                })
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.toggle_base64_capture(cx)),
+                )
+                .child(if base64_armed {
+                    self.tr("Base64 armed")
+                } else {
+                    self.tr("Base64 file")
+                }),
+        );
         chips = chips.child(
             div()
                 .id("quick-commands-open")
@@ -6598,7 +6838,9 @@ impl Render for XcordApp {
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
-        let content = if self.quick_commands_open {
+        let content = if self.base64_error.is_some() {
+            modal_shell(self.render_base64_error(cx))
+        } else if self.quick_commands_open {
             modal_shell(self.render_quick_commands(cx))
         } else if self.ftp_open {
             modal_shell(self.render_ftp_panel(cx))
@@ -6753,6 +6995,312 @@ fn render_ai_message(
             ),
     )
     .child(text)
+}
+
+#[derive(Debug)]
+enum Base64DecodeError {
+    Empty,
+    NotFound,
+    Invalid(String),
+}
+
+fn decode_base64_output(raw: &str) -> Result<(String, Vec<u8>), Base64DecodeError> {
+    let clean = strip_ansi(raw);
+    if clean.trim().is_empty() {
+        return Err(Base64DecodeError::Empty);
+    }
+    let lines = clean.lines().map(str::trim).collect::<Vec<_>>();
+    let mut groups: Vec<(usize, String)> = Vec::new();
+    let mut current: Option<(usize, String)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if line.is_empty() {
+            if let Some((start, data)) = current.take() {
+                groups.push((start, data));
+            }
+            continue;
+        }
+        if let Some(compact) = base64_line(line) {
+            if let Some((_, data)) = current.as_mut() {
+                data.push_str(&compact);
+            } else {
+                current = Some((index, compact));
+            }
+        } else if let Some((start, data)) = current.take() {
+            groups.push((start, data));
+        }
+    }
+    if let Some((start, data)) = current.take() {
+        groups.push((start, data));
+    }
+    let Some((start, data)) = groups
+        .into_iter()
+        .filter(|(_, data)| data.len() >= 8 && data.len() % 4 != 1)
+        .last()
+    else {
+        return Err(Base64DecodeError::NotFound);
+    };
+    let name = base64_filename(&lines, start);
+    let bytes = decode_base64_data(&data).map_err(|error| Base64DecodeError::Invalid(error))?;
+    Ok((name, bytes))
+}
+
+fn base64_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let lower = line.to_ascii_lowercase();
+    for command in ["base64", "echo", "printf", "cat", "sudo", "python", "perl"] {
+        if lower == command
+            || lower.starts_with(&format!("{command} "))
+            || lower.starts_with(&format!("{command}\t"))
+            || lower.starts_with(&format!("{command}'"))
+            || lower.starts_with(&format!("{command}\""))
+        {
+            return None;
+        }
+    }
+    if let Some(token) = valid_base64_prefix(line) {
+        if token.len() == line.len() && token.len() >= 4 {
+            return Some(token);
+        }
+    }
+    let suffix_at = line
+        .find('@')
+        .or_else(|| line.find('=').map(|index| index + 1));
+    let Some(cut) = suffix_at else {
+        return None;
+    };
+    let candidate = line[..cut].trim_end_matches(|ch: char| ch == '=');
+    let padding = line[..cut].len() - candidate.len();
+    let mut token = valid_base64_prefix(candidate)?;
+    if padding > 0 {
+        token.push_str(&"=".repeat(padding.min(2)));
+    }
+    if token.len() >= 4 && token.len() % 4 != 1 {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+fn valid_base64_prefix(line: &str) -> Option<String> {
+    let mut token = String::new();
+    let mut padding = 0;
+    for ch in line.chars() {
+        match ch {
+            ch if ch.is_ascii_alphanumeric()
+                || ch == '+'
+                || ch == '/'
+                || ch == '-'
+                || ch == '_' =>
+            {
+                if padding > 0 {
+                    break;
+                }
+                token.push(ch);
+            }
+            '=' => {
+                if token.is_empty() || padding >= 2 {
+                    break;
+                }
+                token.push('=');
+                padding += 1;
+            }
+            _ => break,
+        }
+    }
+    if token.is_empty() {
+        return None;
+    }
+    if token.len() % 4 == 1 {
+        return None;
+    }
+    if token.len() < 4 {
+        return None;
+    }
+    Some(token)
+}
+
+fn decode_base64_data(data: &str) -> Result<Vec<u8>, String> {
+    let normalized = data.replace('-', "+").replace('_', "/");
+    let mut padded = normalized;
+    while padded.len() % 4 != 0 {
+        padded.push('=');
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(padded.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn base64_filename(lines: &[&str], start: usize) -> String {
+    for line in lines[..start].iter().rev().take(8) {
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower
+            .strip_prefix("filename:")
+            .or_else(|| lower.strip_prefix("file:"))
+        {
+            let _ = rest;
+            if let Some(colon) = line.find(':') {
+                let name = line[colon + 1..].trim();
+                if !name.is_empty() {
+                    return sanitize_filename(name);
+                }
+            }
+        }
+    }
+    for line in lines[..start].iter().rev().take(6) {
+        if line.contains("base64") {
+            if let Some(name) = filename_from_command(line) {
+                return sanitize_filename(&name);
+            }
+        }
+    }
+    format!("base64-{}.bin", epoch_seconds())
+}
+
+fn filename_from_command(line: &str) -> Option<String> {
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    for token in tokens.iter().rev() {
+        let token = token.trim_matches(|ch| ch == '"' || ch == '\'' || ch == ';');
+        if token.is_empty()
+            || token.starts_with('-')
+            || token == "|"
+            || token == ">"
+            || token == ">>"
+            || token == "base64"
+            || token == "cat"
+            || token == "sudo"
+        {
+            continue;
+        }
+        if !token.contains('.') && !token.contains('/') && !token.contains('\\') {
+            continue;
+        }
+        if token.contains('@') || token.contains('$') {
+            continue;
+        }
+        return Some(token.to_string());
+    }
+    None
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let name = name.trim().trim_matches('"').trim_matches('\'');
+    let base = Path::new(name)
+        .file_name()
+        .and_then(|part| part.to_str())
+        .unwrap_or(name);
+    let mut result = String::new();
+    for ch in base.chars() {
+        if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            result.push('_');
+        } else {
+            result.push(ch);
+        }
+    }
+    let result = result.trim().trim_end_matches(['.', ' ']).to_string();
+    if result.is_empty() || result == "." || result == ".." {
+        format!("base64-{}.bin", epoch_seconds())
+    } else {
+        result
+    }
+}
+
+fn save_base64_file(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dir = base64_download_dir();
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let name = sanitize_filename(name);
+    let mut path = dir.join(&name);
+    if path.exists() {
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("decoded");
+        let extension = Path::new(&name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("");
+        let mut index = 1;
+        loop {
+            let candidate = if extension.is_empty() {
+                format!("{stem} ({index})")
+            } else {
+                format!("{stem} ({index}).{extension}")
+            };
+            path = dir.join(candidate);
+            if !path.exists() {
+                break;
+            }
+            index += 1;
+        }
+    }
+    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+
+fn base64_download_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() {
+        downloads
+    } else {
+        home
+    }
+}
+
+fn epoch_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(next) = chars.next() {
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {}
+                None => {}
+            },
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                output.push('\n');
+            }
+            '\x08' => {
+                output.pop();
+            }
+            '\n' | '\t' => output.push(ch),
+            ch if ch.is_control() => {}
+            ch => output.push(ch),
+        }
+    }
+    output
 }
 
 fn decode_quick_command(text: &str) -> String {
@@ -7077,5 +7625,60 @@ mod quick_command_tests {
         assert_eq!(decode_quick_command(r"echo a\\nb"), r"echo a\nb");
         assert_eq!(decode_quick_command(r"C:\Users\a_xub"), r"C:\Users\a_xub");
         assert_eq!(decode_quick_command(r"echo \q"), r"echo \q");
+    }
+}
+
+#[cfg(test)]
+mod base64_capture_tests {
+    use super::{decode_base64_output, Base64DecodeError};
+
+    #[test]
+    fn decodes_command_output_and_uses_command_filename() {
+        let output = "base64 hello.txt\r\naGVsbG8=\r\nxubao@host:~$ ";
+        let (name, bytes) = decode_base64_output(output).unwrap();
+        assert_eq!(name, "hello.txt");
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn decodes_wrapped_output_and_file_header() {
+        let output = "FILE: notes.txt\nSGVs\nbG8g\nd29y\nbGQ=\n";
+        let (name, bytes) = decode_base64_output(output).unwrap();
+        assert_eq!(name, "notes.txt");
+        assert_eq!(bytes, b"Hello world");
+    }
+
+    #[test]
+    fn ignores_ansi_and_prompt_text() {
+        let output = "\u{1b}[32mbase64 data.bin\u{1b}[0m\r\n\u{1b}[1maGVsbG8=\u{1b}[0m\r\n$ ";
+        let (name, bytes) = decode_base64_output(output).unwrap();
+        assert_eq!(name, "data.bin");
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn decodes_output_without_trailing_newline() {
+        let output = "printf 'aGVsbG8='\r\naGVsbG8=xubao@host:~$ ";
+        let (_, bytes) = decode_base64_output(output).unwrap();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn ignores_command_echo_lines() {
+        let output = "printf 'aGVsbG8='\r\naGVsbG8=\r\nxubao@host:~$ ";
+        let (_, bytes) = decode_base64_output(output).unwrap();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn reports_missing_base64() {
+        assert!(matches!(
+            decode_base64_output("just a normal command\r\n"),
+            Err(Base64DecodeError::NotFound)
+        ));
+        assert!(matches!(
+            decode_base64_output(""),
+            Err(Base64DecodeError::Empty)
+        ));
     }
 }

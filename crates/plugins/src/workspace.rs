@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -171,6 +172,11 @@ impl Plugin for WorkspacePlugin {
     }
 }
 
+struct OutputCapture {
+    buffer: Vec<u8>,
+    started: bool,
+}
+
 struct TabState {
     id: TerminalId,
     profile: SessionProfile,
@@ -198,6 +204,7 @@ pub struct WorkspaceState {
     active: Cell<Option<TerminalId>>,
     next_id: Cell<u64>,
     next_test_id: Cell<u64>,
+    output_captures: RefCell<HashMap<TerminalId, OutputCapture>>,
     events: broadcast::Sender<WorkspaceEvent>,
 }
 
@@ -217,6 +224,7 @@ impl WorkspaceState {
             active: Cell::new(None),
             next_id: Cell::new(0),
             next_test_id: Cell::new(0),
+            output_captures: RefCell::new(HashMap::new()),
             events: broadcast::channel(2048).0,
         }
     }
@@ -529,6 +537,11 @@ impl WorkspaceState {
                 if upload_requested {
                     self.emit(WorkspaceEvent::ZmodemUploadRequested { terminal: id });
                 }
+                if let Some(capture) = self.output_captures.borrow_mut().get_mut(&id) {
+                    if capture.started {
+                        capture.buffer.extend_from_slice(&data);
+                    }
+                }
                 if let Some((profile_id, profile_name, logging, data)) = raw {
                     self.ctx.emit(&TerminalOutputEvent {
                         terminal: id,
@@ -599,6 +612,7 @@ impl WorkspaceState {
     }
 
     fn close_impl(&self, id: TerminalId) {
+        self.output_captures.borrow_mut().remove(&id);
         let (removed, new_active) = {
             let mut tabs = self.tabs.borrow_mut();
             let Some(index) = tabs.iter().position(|tab| tab.id == id) else {
@@ -818,18 +832,48 @@ impl WorkspaceService for WorkspaceState {
     }
 
     fn write(&self, id: TerminalId, data: &[u8]) {
-        let tabs = self.tabs.borrow();
-        if let Some(tab) = tabs.iter().find(|tab| tab.id == id) {
-            if tab.zmodem.is_some() {
-                return;
+        let submits = data.iter().any(|byte| *byte == b'\r' || *byte == b'\n');
+        if submits {
+            if let Some(capture) = self.output_captures.borrow_mut().get_mut(&id) {
+                capture.buffer.clear();
+                capture.started = true;
             }
-            if let Some(transport) = &tab.transport {
-                if let Err(error) = transport.write(data) {
-                    drop(tabs);
-                    self.fail(id, &error);
+        }
+        {
+            let tabs = self.tabs.borrow();
+            if let Some(tab) = tabs.iter().find(|tab| tab.id == id) {
+                if tab.zmodem.is_some() {
+                    return;
+                }
+                if let Some(transport) = &tab.transport {
+                    if let Err(error) = transport.write(data) {
+                        drop(tabs);
+                        self.fail(id, &error);
+                        return;
+                    }
                 }
             }
         }
+        if submits {
+            self.emit(WorkspaceEvent::CommandSubmitted(id));
+        }
+    }
+
+    fn begin_output_capture(&self, id: TerminalId) {
+        self.output_captures.borrow_mut().insert(
+            id,
+            OutputCapture {
+                buffer: Vec::new(),
+                started: false,
+            },
+        );
+    }
+
+    fn take_output_capture(&self, id: TerminalId) -> Option<String> {
+        self.output_captures
+            .borrow_mut()
+            .remove(&id)
+            .map(|capture| String::from_utf8_lossy(&capture.buffer).into_owned())
     }
 
     fn zmodem_upload(&self, id: TerminalId, paths: Vec<String>) -> std::result::Result<(), String> {
