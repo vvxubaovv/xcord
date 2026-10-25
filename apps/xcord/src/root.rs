@@ -4214,23 +4214,6 @@ impl XcordApp {
                     )
                     .child(self.tr("Group")),
             )
-            .child(
-                div()
-                    .id("new-tab")
-                    .px_3()
-                    .py_1()
-                    .mr_2()
-                    .rounded_md()
-                    .text_size(px(18.))
-                    .text_color(rgbc(theme.muted))
-                    .cursor_pointer()
-                    .hover(|style| style.text_color(rgbc(theme.accent)))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
-                    )
-                    .child("+"),
-            )
     }
 
     fn render_tab_menu(&self, tab_id: TerminalId, cx: &mut Context<Self>) -> Div {
