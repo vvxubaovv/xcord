@@ -242,6 +242,18 @@ pub struct XcordApp {
     ai_text_entities: RefCell<Vec<Entity<SelectableText>>>,
     ai_selection_owner: Rc<Cell<Option<usize>>>,
 
+    b64_upload_open: bool,
+    b64_upload_source: Option<PathBuf>,
+    b64_upload_size: u64,
+    b64_upload_temp_input: Entity<TextInput>,
+    b64_upload_dest_input: Entity<TextInput>,
+    b64_upload_error: Option<String>,
+    b64_uploading: bool,
+    b64_upload_status: Option<String>,
+    b64_upload_cancel: Rc<Cell<bool>>,
+    b64_upload_temp_path: Option<String>,
+    b64_upload_tab: Option<TerminalId>,
+
     base64_target: Option<TerminalId>,
     base64_capturing: bool,
     base64_last_output: Option<Instant>,
@@ -376,6 +388,9 @@ impl XcordApp {
         let ftp_remote_input = Self::make_input(&theme, "/", false, cx);
         let ftp_local_input = Self::make_input(&theme, &i18n.t("app", "Local folder"), false, cx);
         let ftp_new_dir = Self::make_input(&theme, &i18n.t("app", "New folder"), false, cx);
+        let b64_upload_temp_input = Self::make_input(&theme, "/tmp", false, cx);
+        let b64_upload_dest_input =
+            Self::make_input(&theme, &i18n.t("app", "Destination file"), false, cx);
         let quick_search =
             Self::make_input(&theme, &i18n.t("app", "Search quick commands"), false, cx);
         let quick_name = Self::make_input(&theme, &i18n.t("app", "Name"), false, cx);
@@ -423,6 +438,17 @@ impl XcordApp {
             ai_last_chars: Cell::new(0),
             ai_text_entities: RefCell::new(Vec::new()),
             ai_selection_owner: Rc::new(Cell::new(None)),
+            b64_upload_open: false,
+            b64_upload_source: None,
+            b64_upload_size: 0,
+            b64_upload_temp_input,
+            b64_upload_dest_input,
+            b64_upload_error: None,
+            b64_uploading: false,
+            b64_upload_status: None,
+            b64_upload_cancel: Rc::new(Cell::new(false)),
+            b64_upload_temp_path: None,
+            b64_upload_tab: None,
             base64_target: None,
             base64_capturing: false,
             base64_last_output: None,
@@ -3211,6 +3237,9 @@ impl XcordApp {
                 self.palette = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.b64_upload_open {
+                self.close_b64_upload(cx);
+                cx.stop_propagation();
             } else if self.base64_error.is_some() {
                 self.base64_error = None;
                 cx.notify();
@@ -3305,6 +3334,9 @@ impl XcordApp {
                 cx.notify();
             }))
             .child(self.header_button(self.tr("Files"), cx, |this, cx| this.toggle_ftp(cx)))
+            .child(self.header_button(self.tr("Base64 send"), cx, |this, cx| {
+                this.open_b64_upload(cx)
+            }))
             .child(self.header_button(self.tr("Palette"), cx, |this, cx| this.open_palette(cx)))
             .child(self.header_button(self.tr("Plugins"), cx, |this, cx| {
                 this.plugins_panel = true;
@@ -4570,6 +4602,468 @@ impl XcordApp {
             "List files" | "Disk usage" | "Tail syslog" => self.tr(name),
             _ => name.to_string(),
         }
+    }
+
+    fn open_b64_upload(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active else {
+            self.set_notice(
+                NoticeLevel::Warning,
+                self.tr("Open a terminal tab before sending a file."),
+            );
+            return;
+        };
+        self.b64_upload_open = true;
+        self.b64_upload_source = None;
+        self.b64_upload_size = 0;
+        self.b64_upload_error = None;
+        self.b64_uploading = false;
+        self.b64_upload_status = None;
+        self.b64_upload_cancel = Rc::new(Cell::new(false));
+        self.b64_upload_temp_path = None;
+        self.b64_upload_tab = Some(tab);
+        self.b64_upload_temp_input
+            .update(cx, |input, cx| input.set_value("/tmp", cx));
+        self.b64_upload_dest_input
+            .update(cx, |input, cx| input.clear(cx));
+        cx.notify();
+    }
+
+    fn close_b64_upload(&mut self, cx: &mut Context<Self>) {
+        if self.b64_uploading {
+            self.cancel_b64_upload(cx);
+        }
+        self.b64_upload_open = false;
+        self.b64_upload_status = None;
+        cx.notify();
+    }
+
+    fn pick_b64_upload_source(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.tr("Select a file to send").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            let _ = this.update(cx, |app, cx| {
+                app.b64_upload_source = Some(path.clone());
+                app.b64_upload_size = size;
+                app.b64_upload_error = None;
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("file");
+                app.b64_upload_dest_input
+                    .update(cx, |input, cx| input.set_value(format!("/tmp/{name}"), cx));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_b64_upload(&mut self, cx: &mut Context<Self>) {
+        if self.b64_uploading {
+            return;
+        }
+        let Some(source) = self.b64_upload_source.clone() else {
+            self.b64_upload_error = Some(self.tr("Choose the local file to send."));
+            cx.notify();
+            return;
+        };
+        let temp_dir = self
+            .b64_upload_temp_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let destination = self
+            .b64_upload_dest_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if temp_dir.is_empty() || destination.is_empty() {
+            self.b64_upload_error =
+                Some(self.tr("Temporary directory and destination are required."));
+            cx.notify();
+            return;
+        }
+        let Some(tab) = self.active else {
+            self.b64_upload_error = Some(self.tr("Open a terminal tab before sending a file."));
+            cx.notify();
+            return;
+        };
+        self.b64_uploading = true;
+        self.b64_upload_error = None;
+        self.b64_upload_status = Some(self.tr("Reading local file…"));
+        self.b64_upload_cancel = Rc::new(Cell::new(false));
+        self.b64_upload_tab = Some(tab);
+        cx.notify();
+
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let task = cx.background_executor().spawn(async move {
+            let bytes = std::fs::read(&source).map_err(|error| error.to_string())?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let mut payload = String::with_capacity(encoded.len() + encoded.len() / 76 + 2);
+            for chunk in encoded.as_bytes().chunks(76) {
+                payload.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+                payload.push('\n');
+            }
+            Ok::<String, String>(payload)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |app, cx| match result {
+                Ok(payload) => {
+                    if app.b64_upload_cancel.get() {
+                        app.b64_uploading = false;
+                        app.b64_upload_status = None;
+                        app.set_notice(NoticeLevel::Info, app.tr("Transfer cancelled."));
+                        cx.notify();
+                        return;
+                    }
+                    app.begin_b64_upload_payload(tab, temp_dir, destination, name, payload, cx);
+                }
+                Err(error) => {
+                    app.b64_uploading = false;
+                    app.b64_upload_status = None;
+                    app.b64_upload_error = Some(
+                        app.tr_args("Could not read local file: {error}", &[("error", error)]),
+                    );
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn begin_b64_upload_payload(
+        &mut self,
+        tab: TerminalId,
+        temp_dir: String,
+        destination: String,
+        name: String,
+        payload: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.b64_uploading || self.b64_upload_tab != Some(tab) {
+            return;
+        }
+        let temp_file = format!(
+            "{}/xcord-b64-{}-{}.part",
+            temp_dir.trim_end_matches('/'),
+            epoch_seconds(),
+            sanitize_filename(&name)
+        );
+        self.b64_upload_temp_path = Some(temp_file.clone());
+        let temp_quoted = shell_quote(&temp_file);
+        let dest_quoted = shell_quote(&destination);
+        let dir_quoted = shell_quote(&temp_dir);
+        let command = format!(
+            "stty -echo; mkdir -p {dir_quoted}; mkdir -p \"$(dirname {dest_quoted})\"; base64 -d > {temp_quoted}; s=$?; if [ $s -eq 0 ]; then mv {temp_quoted} {dest_quoted}; s=$?; fi; stty echo; echo __XCORD_B64_DONE__:$s"
+        );
+        self.workspace.write(tab, command.as_bytes());
+        self.workspace.write(tab, b"\r");
+        self.b64_upload_status = Some(self.tr("Transferring…"));
+        let workspace = self.workspace.clone();
+        let cancel = self.b64_upload_cancel.clone();
+        let total = payload.len();
+        let fallback_temp = temp_file.clone();
+        cx.spawn(async move |this, cx| {
+            Timer::after(Duration::from_millis(250)).await;
+            let bytes = payload.as_bytes();
+            let mut sent = 0;
+            let mut chunks = 0usize;
+            while sent < total {
+                if cancel.get() {
+                    workspace.write(tab, b"\x03");
+                    Timer::after(Duration::from_millis(250)).await;
+                    workspace.write(
+                        tab,
+                        format!("stty echo; rm -f {}\r", shell_quote(&fallback_temp)).as_bytes(),
+                    );
+                    let _ = this.update(cx, |app, cx| {
+                        app.b64_uploading = false;
+                        app.b64_upload_temp_path = None;
+                        app.b64_upload_status = None;
+                        app.b64_upload_open = false;
+                        app.set_notice(NoticeLevel::Info, app.tr("Transfer cancelled."));
+                        cx.notify();
+                    });
+                    return;
+                }
+                let end = (sent + 4096).min(total);
+                workspace.write(tab, &bytes[sent..end]);
+                sent = end;
+                chunks += 1;
+                if chunks % 8 == 0 {
+                    Timer::after(Duration::from_millis(4)).await;
+                }
+                if chunks % 24 == 0 {
+                    let percent = if total == 0 {
+                        100
+                    } else {
+                        (sent * 100 / total).min(100)
+                    };
+                    let _ = this.update(cx, |app, cx| {
+                        app.b64_upload_status = Some(app.tr_args(
+                            "Transferring… {percent}%",
+                            &[("percent", percent.to_string())],
+                        ));
+                        cx.notify();
+                    });
+                }
+            }
+            workspace.write(tab, b"\x04");
+            let deadline = Instant::now() + Duration::from_secs(600);
+            loop {
+                Timer::after(Duration::from_millis(300)).await;
+                if cancel.get() {
+                    workspace.write(tab, b"\x03");
+                    Timer::after(Duration::from_millis(250)).await;
+                    workspace.write(
+                        tab,
+                        format!("stty echo; rm -f {}\r", shell_quote(&fallback_temp)).as_bytes(),
+                    );
+                    let _ = this.update(cx, |app, cx| {
+                        app.b64_uploading = false;
+                        app.b64_upload_temp_path = None;
+                        app.b64_upload_status = None;
+                        app.b64_upload_open = false;
+                        app.set_notice(NoticeLevel::Info, app.tr("Transfer cancelled."));
+                        cx.notify();
+                    });
+                    return;
+                }
+                let done = workspace.snapshot(tab).and_then(|snapshot| {
+                    snapshot.lines.iter().rev().find_map(|line| {
+                        line.text
+                            .find("__XCORD_B64_DONE__:")
+                            .and_then(|index| {
+                                line.text[index + "__XCORD_B64_DONE__:".len()..]
+                                    .split_whitespace()
+                                    .next()
+                            })
+                            .and_then(|status| status.parse::<i32>().ok())
+                    })
+                });
+                if let Some(status) = done {
+                    let _ = this.update(cx, |app, cx| {
+                        app.b64_uploading = false;
+                        app.b64_upload_status = None;
+                        app.b64_upload_temp_path = None;
+                        if status == 0 {
+                            app.b64_upload_open = false;
+                            app.set_notice(
+                                NoticeLevel::Success,
+                                app.tr_args(
+                                    "Base64 transfer complete: {path}",
+                                    &[("path", destination.clone())],
+                                ),
+                            );
+                        } else {
+                            app.b64_upload_error = Some(app.tr_args(
+                                "Remote transfer failed with status {status}.",
+                                &[("status", status.to_string())],
+                            ));
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    workspace.write(tab, b"\x03");
+                    Timer::after(Duration::from_millis(250)).await;
+                    workspace.write(
+                        tab,
+                        format!("stty echo; rm -f {}\r", shell_quote(&fallback_temp)).as_bytes(),
+                    );
+                    let _ = this.update(cx, |app, cx| {
+                        app.b64_uploading = false;
+                        app.b64_upload_status = None;
+                        app.b64_upload_temp_path = None;
+                        app.b64_upload_error = Some(app.tr("Remote transfer timed out."));
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn cancel_b64_upload(&mut self, cx: &mut Context<Self>) {
+        self.b64_upload_cancel.set(true);
+        self.b64_upload_status = Some(self.tr("Cancelling…"));
+        cx.notify();
+    }
+
+    fn render_b64_upload(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let source = self
+            .b64_upload_source
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.tr("No file selected"));
+        let large = self.b64_upload_size > 1_048_576;
+        div()
+            .w(px(640.))
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child(self.tr("Base64 file transfer")),
+                    )
+                    .child(
+                        div()
+                            .id("b64-upload-close")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.close_b64_upload(cx)),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(self.b64_upload_label(self.tr("Local file"), theme))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h(px(30.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .bg(rgbc(theme.panel_alt))
+                            .border_1()
+                            .border_color(rgbc(theme.border))
+                            .text_size(px(10.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(source),
+                    )
+                    .child(small_button(self.tr("Browse…"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.pick_b64_upload_source(cx)),
+                    )),
+            )
+            .when(large, |panel| {
+                panel.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgbc(theme.accent))
+                        .child(self.tr_args(
+                            "The file is large ({size}). Base64 transfer may take a long time.",
+                            &[("size", format_size(self.b64_upload_size))],
+                        )),
+                )
+            })
+            .child(self.b64_upload_label(self.tr("Remote temp directory"), theme))
+            .child(self.b64_upload_input(self.b64_upload_temp_input.clone(), theme))
+            .child(self.b64_upload_label(self.tr("Destination file"), theme))
+            .child(self.b64_upload_input(self.b64_upload_dest_input.clone(), theme))
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr(
+                        "The file is sent as Base64 through the terminal and decoded on the remote host.",
+                    )),
+            )
+            .when_some(self.b64_upload_error.clone(), |panel, error| {
+                panel.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgbc(theme.danger))
+                        .child(error),
+                )
+            })
+            .when_some(self.b64_upload_status.clone(), |panel, status| {
+                panel.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgbc(theme.accent))
+                        .child(status),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(secondary_button(self.tr("Close"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.close_b64_upload(cx)),
+                    ))
+                    .when(self.b64_uploading, |actions| {
+                        actions.child(primary_button(self.tr("Cancel"), theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.cancel_b64_upload(cx)),
+                        ))
+                    })
+                    .when(!self.b64_uploading, |actions| {
+                        actions.child(primary_button(self.tr("Start transfer"), theme).on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.start_b64_upload(cx)),
+                        ))
+                    }),
+            )
+    }
+
+    fn b64_upload_label(&self, label: String, theme: &Theme) -> Div {
+        div()
+            .text_size(px(10.5))
+            .text_color(rgbc(theme.muted))
+            .child(label)
+    }
+
+    fn b64_upload_input(&self, input: Entity<TextInput>, theme: &Theme) -> Div {
+        div()
+            .h(px(32.))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .bg(rgbc(theme.panel_alt))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .child(input)
     }
 
     fn toggle_base64_capture(&mut self, cx: &mut Context<Self>) {
@@ -6838,7 +7332,9 @@ impl Render for XcordApp {
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
-        let content = if self.base64_error.is_some() {
+        let content = if self.b64_upload_open {
+            modal_shell(self.render_b64_upload(cx))
+        } else if self.base64_error.is_some() {
             modal_shell(self.render_base64_error(cx))
         } else if self.quick_commands_open {
             modal_shell(self.render_quick_commands(cx))
@@ -7303,6 +7799,10 @@ fn strip_ansi(input: &str) -> String {
     output
 }
 
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn decode_quick_command(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -7630,7 +8130,7 @@ mod quick_command_tests {
 
 #[cfg(test)]
 mod base64_capture_tests {
-    use super::{decode_base64_output, Base64DecodeError};
+    use super::{decode_base64_output, shell_quote, Base64DecodeError};
 
     #[test]
     fn decodes_command_output_and_uses_command_filename() {
@@ -7668,6 +8168,12 @@ mod base64_capture_tests {
         let output = "printf 'aGVsbG8='\r\naGVsbG8=\r\nxubao@host:~$ ";
         let (_, bytes) = decode_base64_output(output).unwrap();
         assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn shell_quote_escapes_paths() {
+        assert_eq!(shell_quote("/tmp/a b"), "'/tmp/a b'");
+        assert_eq!(shell_quote("a'b"), r#"'a'\''b'"#);
     }
 
     #[test]

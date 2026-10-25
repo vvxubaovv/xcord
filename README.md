@@ -72,6 +72,11 @@ guide, the threading model, and the session-open sequence.
   commands** page with search, create, edit and delete. Clicking a saved
   command inserts it into the command bar (double-click in the list works too).
   Commands support `\n`, `\r`, `\t`, `\e`, `\xNN`, `\u{...}` and `\\` escapes.
+- **Base64 file send**: **Base64 send** in the header opens a dialog to pick a
+  local file, a remote temporary directory (default `/tmp`) and the destination
+  file. Large files show a time warning. The file is Base64-streamed through the
+  terminal (with echo disabled), decoded into the temp file and moved into place;
+  the remote shell is restored on success, failure or cancellation.
 - **One-shot Base64 capture**: click **Base64 file** in the compose bar, then
   run the next command. Its output is captured after the command is submitted;
   a valid Base64 block is decoded and saved to `Downloads` (filename from a
