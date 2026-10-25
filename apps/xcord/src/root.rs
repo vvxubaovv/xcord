@@ -3334,9 +3334,6 @@ impl XcordApp {
                 cx.notify();
             }))
             .child(self.header_button(self.tr("Files"), cx, |this, cx| this.toggle_ftp(cx)))
-            .child(self.header_button(self.tr("Base64 send"), cx, |this, cx| {
-                this.open_b64_upload(cx)
-            }))
             .child(self.header_button(self.tr("Palette"), cx, |this, cx| this.open_palette(cx)))
             .child(self.header_button(self.tr("Plugins"), cx, |this, cx| {
                 this.plugins_panel = true;
@@ -5577,32 +5574,26 @@ impl XcordApp {
 
     fn render_compose(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
-        let snippets = self.sessions.snippets();
         let mut chips = div().flex().items_center().gap_1().flex_shrink_0();
-        for snippet in snippets.iter().take(3) {
-            let command = snippet.command.clone();
-            chips = chips.child(
-                div()
-                    .id(SharedString::from(format!("snippet-{}", snippet.id)))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgbc(theme.border))
-                    .text_size(px(9.5))
-                    .text_color(rgbc(theme.muted))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.insert_quick_command(&command, cx);
-                        }),
-                    )
-                    .child(self.snippet_label(&snippet.name)),
-            );
-        }
         let base64_armed = self.base64_target.is_some() && self.base64_target == self.active;
+        chips = chips.child(
+            div()
+                .id("base64-send")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgbc(theme.accent))
+                .text_size(px(9.5))
+                .text_color(rgbc(theme.accent))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.open_b64_upload(cx)),
+                )
+                .child(self.tr("Base64 send")),
+        );
         chips = chips.child(
             div()
                 .id("base64-capture")

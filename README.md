@@ -68,11 +68,11 @@ guide, the threading model, and the session-open sequence.
   chip to remove them). Click a group chip to collapse/expand its tabs.
   Right-click any tab for **Close current / Close all / Close right / Close
   left**, **Create group**, and **Join group** (including *Ungrouped*).
-- **Quick commands**: the compose bar has one-click chips plus a **Quick
-  commands** page with search, create, edit and delete. Clicking a saved
+- **Quick commands**: the compose bar has a **Quick commands** page with
+  search, create, edit and delete. Clicking a saved
   command inserts it into the command bar (double-click in the list works too).
   Commands support `\n`, `\r`, `\t`, `\e`, `\xNN`, `\u{...}` and `\\` escapes.
-- **Base64 file send**: **Base64 send** in the header opens a dialog to pick a
+- **Base64 file send**: **Base64 send** in the compose bar opens a dialog to pick a
   local file, a remote temporary directory (default `/tmp`) and the destination
   file. Large files show a time warning. The file is Base64-streamed through the
   terminal (with echo disabled), decoded into the temp file and moved into place;
