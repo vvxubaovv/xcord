@@ -24,7 +24,7 @@ use xcord_plugin_api::{
     Sessions, TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand, UiHost, Workspace,
     WorkspaceEvent,
 };
-use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings};
+use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings, Snippet};
 
 use crate::selectable_text::SelectableText;
 use crate::terminal_view::TerminalView;
@@ -240,6 +240,13 @@ pub struct XcordApp {
     ai_text_entities: RefCell<Vec<Entity<SelectableText>>>,
     ai_selection_owner: Rc<Cell<Option<usize>>>,
 
+    quick_commands_open: bool,
+    quick_search: Entity<TextInput>,
+    quick_name: Entity<TextInput>,
+    quick_command: Entity<TextInput>,
+    quick_editing: Option<String>,
+    quick_error: Option<String>,
+
     ftp_open: bool,
     ftp_profile: Option<String>,
     ftp_snapshot: Option<FtpSnapshot>,
@@ -357,6 +364,15 @@ impl XcordApp {
         let ftp_remote_input = Self::make_input(&theme, "/", false, cx);
         let ftp_local_input = Self::make_input(&theme, &i18n.t("app", "Local folder"), false, cx);
         let ftp_new_dir = Self::make_input(&theme, &i18n.t("app", "New folder"), false, cx);
+        let quick_search =
+            Self::make_input(&theme, &i18n.t("app", "Search quick commands"), false, cx);
+        let quick_name = Self::make_input(&theme, &i18n.t("app", "Name"), false, cx);
+        let quick_command = Self::make_input(
+            &theme,
+            &i18n.t("app", "Command (supports \\n, \\t, \\xNN)"),
+            false,
+            cx,
+        );
         let terminal = cx.new(|cx| {
             TerminalView::new(
                 workspace.clone(),
@@ -395,6 +411,12 @@ impl XcordApp {
             ai_last_chars: Cell::new(0),
             ai_text_entities: RefCell::new(Vec::new()),
             ai_selection_owner: Rc::new(Cell::new(None)),
+            quick_commands_open: false,
+            quick_search,
+            quick_name,
+            quick_command,
+            quick_editing: None,
+            quick_error: None,
             ftp_open: false,
             ftp_profile: None,
             ftp_snapshot: None,
@@ -1688,18 +1710,6 @@ impl XcordApp {
         self.workspace.write(id, b"\r");
         self.compose.update(cx, |input, cx| input.clear(cx));
         self.pending_focus = Some(PendingFocus::Compose);
-        cx.notify();
-    }
-
-    fn send_snippet(&mut self, command: &str, send_enter: bool, cx: &mut Context<Self>) {
-        let Some(id) = self.active else {
-            return;
-        };
-        self.workspace.write(id, command.as_bytes());
-        if send_enter {
-            self.workspace.write(id, b"\r");
-        }
-        self.pending_focus = Some(PendingFocus::Terminal);
         cx.notify();
     }
 
@@ -3100,6 +3110,10 @@ impl XcordApp {
                 self.palette = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.quick_commands_open {
+                self.quick_commands_open = false;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.ftp_open {
                 self.ftp_open = false;
                 self.ftp_snapshot = None;
@@ -4220,13 +4234,349 @@ impl XcordApp {
         }
     }
 
+    fn open_quick_commands(&mut self, cx: &mut Context<Self>) {
+        self.quick_commands_open = true;
+        self.quick_editing = None;
+        self.quick_error = None;
+        self.quick_name.update(cx, |input, cx| input.clear(cx));
+        self.quick_command.update(cx, |input, cx| input.clear(cx));
+        self.quick_search.update(cx, |input, cx| input.clear(cx));
+        cx.notify();
+    }
+
+    fn load_quick_command(&mut self, snippet: Snippet, cx: &mut Context<Self>) {
+        self.quick_editing = Some(snippet.id.clone());
+        self.quick_error = None;
+        let display_name = self.snippet_label(&snippet.name);
+        self.quick_name
+            .update(cx, |input, cx| input.set_value(display_name, cx));
+        self.quick_command
+            .update(cx, |input, cx| input.set_value(snippet.command.clone(), cx));
+        cx.notify();
+    }
+
+    fn new_quick_command(&mut self, cx: &mut Context<Self>) {
+        self.quick_editing = None;
+        self.quick_error = None;
+        self.quick_name.update(cx, |input, cx| input.clear(cx));
+        self.quick_command.update(cx, |input, cx| input.clear(cx));
+        cx.notify();
+    }
+
+    fn save_quick_command(&mut self, cx: &mut Context<Self>) {
+        let name = self.quick_name.read(cx).value().trim().to_string();
+        let command = self.quick_command.read(cx).value().to_string();
+        if name.is_empty() {
+            self.quick_error = Some(self.tr("Quick command name cannot be empty."));
+            cx.notify();
+            return;
+        }
+        if command.trim().is_empty() {
+            self.quick_error = Some(self.tr("Quick command cannot be empty."));
+            cx.notify();
+            return;
+        }
+        let mut snippet = self
+            .quick_editing
+            .as_ref()
+            .and_then(|id| {
+                self.sessions
+                    .snippets()
+                    .into_iter()
+                    .find(|snippet| &snippet.id == id)
+            })
+            .unwrap_or_else(|| Snippet::new(name.clone(), command.clone()));
+        snippet.name = name;
+        snippet.command = command;
+        snippet.send_enter = true;
+        if let Err(error) = self.sessions.save_snippet(snippet.clone()) {
+            self.quick_error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.quick_editing = Some(snippet.id);
+        self.quick_error = None;
+        self.set_notice(
+            NoticeLevel::Success,
+            self.tr_args("Quick command saved: {name}", &[("name", snippet.name)]),
+        );
+        cx.notify();
+    }
+
+    fn delete_quick_command(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.quick_editing.clone() else {
+            return;
+        };
+        match self.sessions.delete_snippet(&id) {
+            Ok(()) => {
+                self.new_quick_command(cx);
+                self.set_notice(NoticeLevel::Info, self.tr("Quick command deleted."));
+            }
+            Err(error) => self.quick_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn insert_quick_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        if command.trim().is_empty() {
+            self.quick_error = Some(self.tr("Quick command cannot be empty."));
+            cx.notify();
+            return;
+        }
+        let decoded = decode_quick_command(command);
+        self.compose
+            .update(cx, |input, cx| input.set_value(decoded, cx));
+        self.quick_commands_open = false;
+        self.settings.compose_bar = true;
+        self.pending_focus = Some(PendingFocus::Compose);
+        cx.notify();
+    }
+
+    fn render_quick_commands(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let query = self.quick_search.read(cx).value().to_lowercase();
+        let snippets = self
+            .sessions
+            .snippets()
+            .into_iter()
+            .filter(|snippet| {
+                query.is_empty()
+                    || snippet.name.to_lowercase().contains(&query)
+                    || snippet.command.to_lowercase().contains(&query)
+            })
+            .collect::<Vec<_>>();
+        let mut list = div()
+            .id("quick-command-list")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll();
+        if snippets.is_empty() {
+            list = list.child(
+                div()
+                    .p_3()
+                    .text_size(px(11.))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("No quick commands yet.")),
+            );
+        }
+        for snippet in snippets {
+            let selected = self.quick_editing.as_deref() == Some(snippet.id.as_str());
+            let command = snippet.command.clone();
+            let row_snippet = snippet.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("quick-command-{}", snippet.id)))
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if selected {
+                        rgbc(theme.accent)
+                    } else {
+                        rgba(theme.border, 0.0)
+                    })
+                    .bg(if selected {
+                        rgba(theme.accent, 0.12)
+                    } else {
+                        rgba(theme.panel_alt, 0.0)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            this.load_quick_command(row_snippet.clone(), cx);
+                            if event.click_count >= 2 {
+                                this.insert_quick_command(&command, cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgbc(theme.foreground))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(self.snippet_label(&snippet.name)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(snippet.command.clone()),
+                    ),
+            );
+        }
+        let editing = self.quick_editing.is_some();
+        let mut actions = div()
+            .id("quick-actions")
+            .h(px(32.))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .child(primary_button(self.tr("Insert"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    let command = this.quick_command.read(cx).value().to_string();
+                    this.insert_quick_command(&command, cx);
+                }),
+            ))
+            .child(secondary_button(self.tr("Save"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.save_quick_command(cx)),
+            ));
+        if editing {
+            actions = actions.child(small_button(self.tr("Delete"), theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.delete_quick_command(cx)),
+            ));
+        }
+        div()
+            .w(px(940.))
+            .h(px(620.))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel))
+            .child(
+                div()
+                    .h(px(48.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgbc(theme.border))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child(self.tr("Quick commands")),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("quick-commands-close")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.quick_commands_open = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .p_3()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(300.))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .h(px(30.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded_md()
+                                    .bg(rgbc(theme.panel_alt))
+                                    .border_1()
+                                    .border_color(rgbc(theme.border))
+                                    .child(self.quick_search.clone()),
+                            )
+                            .child(primary_button(self.tr("New"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.new_quick_command(cx)),
+                            ))
+                            .child(actions)
+                            .child(list),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .px_2()
+                            .child(self.tr("Name"))
+                            .child(
+                                div()
+                                    .h(px(32.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded_md()
+                                    .bg(rgbc(theme.panel_alt))
+                                    .border_1()
+                                    .border_color(rgbc(theme.border))
+                                    .child(self.quick_name.clone()),
+                            )
+                            .child(self.tr("Command"))
+                            .child(
+                                div()
+                                    .h(px(32.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded_md()
+                                    .bg(rgbc(theme.panel_alt))
+                                    .border_1()
+                                    .border_color(rgbc(theme.border))
+                                    .child(self.quick_command.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgbc(theme.muted))
+                                    .child(self.tr(
+                                        "Escapes: \\n newline, \\t tab, \\e ESC, \\xNN byte, \\\\ backslash",
+                                    )),
+                            )
+                            .when_some(self.quick_error.clone(), |panel, error| {
+                                panel.child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgbc(theme.danger))
+                                        .child(error),
+                                )
+                            }),
+                    ),
+            )
+    }
+
     fn render_compose(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let snippets = self.sessions.snippets();
-        let mut chips = div().flex().items_center().gap_1();
+        let mut chips = div().flex().items_center().gap_1().flex_shrink_0();
         for snippet in snippets.iter().take(3) {
             let command = snippet.command.clone();
-            let enter = snippet.send_enter;
             chips = chips.child(
                 div()
                     .id(SharedString::from(format!("snippet-{}", snippet.id)))
@@ -4242,12 +4592,30 @@ impl XcordApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.send_snippet(&command, enter, cx);
+                            this.insert_quick_command(&command, cx);
                         }),
                     )
                     .child(self.snippet_label(&snippet.name)),
             );
         }
+        chips = chips.child(
+            div()
+                .id("quick-commands-open")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgbc(theme.accent))
+                .text_size(px(9.5))
+                .text_color(rgbc(theme.accent))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.open_quick_commands(cx)),
+                )
+                .child(self.tr("Quick commands")),
+        );
 
         div()
             .flex()
@@ -5926,7 +6294,9 @@ impl Render for XcordApp {
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
-        let content = if self.ftp_open {
+        let content = if self.quick_commands_open {
+            modal_shell(self.render_quick_commands(cx))
+        } else if self.ftp_open {
             modal_shell(self.render_ftp_panel(cx))
         } else if self.tab_group_form.is_some() {
             modal_shell(self.render_tab_group_dialog(cx))
@@ -6079,6 +6449,81 @@ fn render_ai_message(
             ),
     )
     .child(text)
+}
+
+fn decode_quick_command(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('e') | Some('E') => output.push('\x1b'),
+            Some('0') => output.push('\0'),
+            Some('\\') => output.push('\\'),
+            Some('"') => output.push('"'),
+            Some('\'') => output.push('\''),
+            Some('x') => {
+                let mut hex = String::new();
+                for _ in 0..2 {
+                    if let Some(next) = chars.peek().copied() {
+                        if next.is_ascii_hexdigit() {
+                            hex.push(next);
+                            chars.next();
+                        }
+                    }
+                }
+                if hex.len() == 2 {
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        output.push(byte as char);
+                    }
+                } else {
+                    output.push_str("\\x");
+                    output.push_str(&hex);
+                }
+            }
+            Some('u') => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut hex = String::new();
+                    while let Some(next) = chars.peek().copied() {
+                        if next == '}' {
+                            chars.next();
+                            break;
+                        }
+                        if next.is_ascii_hexdigit() {
+                            hex.push(next);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(value) = u32::from_str_radix(&hex, 16) {
+                        if let Some(decoded) = char::from_u32(value) {
+                            output.push(decoded);
+                            continue;
+                        }
+                    }
+                    output.push_str("\\u{");
+                    output.push_str(&hex);
+                    output.push('}');
+                } else {
+                    output.push_str("\\u");
+                }
+            }
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
 }
 
 fn remote_parent(path: &str) -> String {
@@ -6304,4 +6749,29 @@ fn auth_chip(label: impl Into<SharedString>, selected: bool, theme: &Theme) -> S
         .text_size(px(10.5))
         .cursor_pointer()
         .child(label)
+}
+
+#[cfg(test)]
+mod quick_command_tests {
+    use super::decode_quick_command;
+
+    #[test]
+    fn decodes_supported_escapes() {
+        assert_eq!(decode_quick_command(r"echo a\tb"), "echo a\tb");
+        assert_eq!(decode_quick_command(r"echo a\nb"), "echo a\nb");
+        assert_eq!(decode_quick_command(r"echo a\rb"), "echo a\rb");
+        assert_eq!(
+            decode_quick_command(r"echo \e[31mred"),
+            "echo \u{1b}[31mred"
+        );
+        assert_eq!(decode_quick_command(r"echo \x41"), "echo A");
+        assert_eq!(decode_quick_command(r"echo \u{41}"), "echo A");
+    }
+
+    #[test]
+    fn preserves_literal_backslashes_and_unknown_escapes() {
+        assert_eq!(decode_quick_command(r"echo a\\nb"), r"echo a\nb");
+        assert_eq!(decode_quick_command(r"C:\Users\a_xub"), r"C:\Users\a_xub");
+        assert_eq!(decode_quick_command(r"echo \q"), r"echo \q");
+    }
 }

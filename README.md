@@ -66,6 +66,10 @@ guide, the threading model, and the session-open sequence.
   reorder. Tab groups are **independent of session groups**: use **Group** to
   create a tab group, then drag tabs onto its chip (or onto the **Ungrouped**
   chip to remove them). Click a group chip to collapse/expand its tabs.
+- **Quick commands**: the compose bar has one-click chips plus a **Quick
+  commands** page with search, create, edit and delete. Clicking a saved
+  command inserts it into the command bar (double-click in the list works too).
+  Commands support `\n`, `\r`, `\t`, `\e`, `\xNN`, `\u{...}` and `\\` escapes.
 - **ZMODEM (`lrzsz`)**: `sz file` downloads automatically into `Downloads`
   (unique names, no overwrite); `rz` opens a multi-file picker and uploads the
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
