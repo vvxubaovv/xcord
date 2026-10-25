@@ -394,6 +394,12 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Folder name cannot be empty.", "文件夹名称不能为空。"),
     ("Quick commands", "快捷命令"),
     ("Tab actions", "标签操作"),
+    ("Group actions", "分组操作"),
+    ("Close group", "关闭分组"),
+    (
+        "Closing this group also closes {count} tab(s).",
+        "关闭分组将同时关闭 {count} 个标签页。",
+    ),
     ("Close current", "关闭当前"),
     ("Close all", "关闭全部"),
     ("Close to the right", "关闭右侧"),

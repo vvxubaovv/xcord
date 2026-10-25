@@ -68,6 +68,8 @@ guide, the threading model, and the session-open sequence.
   the **Ungrouped** chip to remove them). Click a group chip to collapse/expand its tabs.
   Right-click any tab for **Close current / Close all / Close right / Close
   left**, **Create group**, and **Join group** (including *Ungrouped*).
+  Right-click a group chip to close the group; double-click a tab or a group
+  chip to close it directly.
 - **Quick commands**: the compose bar has a **Quick commands** page with
   search, create, edit and delete. Clicking a saved
   command inserts it into the command bar (double-click in the list works too).

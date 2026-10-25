@@ -288,6 +288,7 @@ pub struct XcordApp {
     tab_group_of: RefCell<HashMap<TerminalId, String>>,
     collapsed_tab_groups: RefCell<HashSet<String>>,
     tab_menu: Option<TerminalId>,
+    tab_group_menu: Option<String>,
     tab_group_pending: Option<TerminalId>,
     tab_group_form: Option<TabGroupForm>,
     next_tab_group: Cell<u64>,
@@ -480,6 +481,7 @@ impl XcordApp {
             tab_group_of: RefCell::new(HashMap::new()),
             collapsed_tab_groups: RefCell::new(HashSet::new()),
             tab_menu: None,
+            tab_group_menu: None,
             tab_group_pending: None,
             tab_group_form: None,
             next_tab_group: Cell::new(1),
@@ -714,6 +716,13 @@ impl XcordApp {
             self.tab_menu = None;
         }
         if self
+            .tab_group_menu
+            .as_ref()
+            .is_some_and(|id| !self.tab_groups.borrow().iter().any(|group| &group.id == id))
+        {
+            self.tab_group_menu = None;
+        }
+        if self
             .tab_group_pending
             .is_some_and(|id| !self.tabs.iter().any(|tab| tab.id == id))
         {
@@ -892,6 +901,25 @@ impl XcordApp {
         }
         self.tab_drag_hover.replace(None);
         self.tab_menu = None;
+        self.sync(cx);
+        cx.notify();
+    }
+
+    fn close_tab_group(&mut self, group: &str, cx: &mut Context<Self>) {
+        let ids = {
+            let assignments = self.tab_group_of.borrow();
+            self.tabs
+                .iter()
+                .filter(|tab| assignments.get(&tab.id).is_some_and(|id| id == group))
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>()
+        };
+        self.close_tab_ids(ids, cx);
+        self.tab_groups
+            .borrow_mut()
+            .retain(|state| state.id != group);
+        self.collapsed_tab_groups.borrow_mut().remove(group);
+        self.tab_group_menu = None;
         self.sync(cx);
         cx.notify();
     }
@@ -3285,6 +3313,10 @@ impl XcordApp {
                 self.base64_error = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.tab_group_menu.is_some() {
+                self.tab_group_menu = None;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.tab_menu.is_some() {
                 self.tab_menu = None;
                 cx.notify();
@@ -4193,6 +4225,7 @@ impl XcordApp {
                 .collect::<Vec<_>>();
             let group_id = group.id.clone();
             let toggle_id = group.id.clone();
+            let menu_id = group.id.clone();
             let collapsed = self.collapsed_tab_groups.borrow().contains(&group.id);
             tabs = tabs.child(
                 div()
@@ -4209,8 +4242,21 @@ impl XcordApp {
                     .cursor_pointer()
                     .on_mouse_up(
                         MouseButton::Left,
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            if event.click_count >= 2 {
+                                this.close_tab_group(&toggle_id, cx);
+                            } else {
+                                this.toggle_tab_group(&toggle_id, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Right,
                         cx.listener(move |this, _, _, cx| {
-                            this.toggle_tab_group(&toggle_id, cx);
+                            this.tab_group_menu = Some(menu_id.clone());
+                            this.tab_menu = None;
+                            cx.stop_propagation();
+                            cx.notify();
                         }),
                     )
                     .on_drop::<DraggedTab>(cx.listener(move |this, drag: &DraggedTab, _, cx| {
@@ -4239,6 +4285,103 @@ impl XcordApp {
             .border_b_1()
             .border_color(rgbc(theme.border))
             .child(tabs)
+    }
+
+    fn render_tab_group_menu(&self, group_id: &str, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(group) = self
+            .tab_groups
+            .borrow()
+            .iter()
+            .find(|group| group.id == group_id)
+            .cloned()
+        else {
+            return div();
+        };
+        let count = self
+            .tab_group_of
+            .borrow()
+            .values()
+            .filter(|id| id.as_str() == group_id)
+            .count();
+        let close_id = group.id.clone();
+        div()
+            .px_2()
+            .pb_2()
+            .bg(rgbc(theme.panel))
+            .border_b_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .w(px(560.))
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgbc(theme.muted))
+                                    .child(self.tr("Group actions")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgbc(theme.foreground))
+                                    .child(group.name),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("tab-group-menu-close")
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_color(rgbc(theme.muted))
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(rgbc(theme.danger)))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.tab_group_menu = None;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(10.))
+                                    .text_color(rgbc(theme.muted))
+                                    .child(self.tr_args(
+                                        "Closing this group also closes {count} tab(s).",
+                                        &[("count", count.to_string())],
+                                    )),
+                            )
+                            .child(primary_button(self.tr("Close group"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.close_tab_group(&close_id, cx);
+                                }),
+                            )),
+                    ),
+            )
     }
 
     fn render_tab_menu(&self, tab_id: TerminalId, cx: &mut Context<Self>) -> Div {
@@ -4556,7 +4699,11 @@ impl XcordApp {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
+                cx.listener(move |this, event: &MouseUpEvent, window, cx| {
+                    if event.click_count >= 2 {
+                        this.close_tab_ids(vec![tab_id], cx);
+                        return;
+                    }
                     this.tab_menu = None;
                     this.workspace.select(tab_id);
                     this.pending_focus = Some(PendingFocus::Terminal);
@@ -5934,7 +6081,9 @@ impl XcordApp {
             .flex_col()
             .bg(rgbc(theme.background));
         main = main.child(self.render_tab_bar(cx));
-        if let Some(tab_id) = self.tab_menu {
+        if let Some(group) = self.tab_group_menu.clone() {
+            main = main.child(self.render_tab_group_menu(&group, cx));
+        } else if let Some(tab_id) = self.tab_menu {
             main = main.child(self.render_tab_menu(tab_id, cx));
         }
         if active.is_some() {
