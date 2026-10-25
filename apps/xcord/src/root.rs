@@ -4239,22 +4239,6 @@ impl XcordApp {
             .border_b_1()
             .border_color(rgbc(theme.border))
             .child(tabs)
-            .child(
-                div()
-                    .id("new-tab-group")
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_size(px(10.))
-                    .text_color(rgbc(theme.muted))
-                    .cursor_pointer()
-                    .hover(|style| style.text_color(rgbc(theme.accent)))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.open_tab_group_dialog(cx)),
-                    )
-                    .child(self.tr("Group")),
-            )
     }
 
     fn render_tab_menu(&self, tab_id: TerminalId, cx: &mut Context<Self>) -> Div {
