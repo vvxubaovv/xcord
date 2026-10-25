@@ -66,6 +66,8 @@ guide, the threading model, and the session-open sequence.
   reorder. Tab groups are **independent of session groups**: use **Group** to
   create a tab group, then drag tabs onto its chip (or onto the **Ungrouped**
   chip to remove them). Click a group chip to collapse/expand its tabs.
+  Right-click any tab for **Close current / Close all / Close right / Close
+  left**, **Create group**, and **Join group** (including *Ungrouped*).
 - **Quick commands**: the compose bar has one-click chips plus a **Quick
   commands** page with search, create, edit and delete. Clicking a saved
   command inserts it into the command bar (double-click in the list works too).

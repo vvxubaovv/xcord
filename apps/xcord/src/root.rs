@@ -263,6 +263,8 @@ pub struct XcordApp {
     tab_groups: RefCell<Vec<TabGroupState>>,
     tab_group_of: RefCell<HashMap<TerminalId, String>>,
     collapsed_tab_groups: RefCell<HashSet<String>>,
+    tab_menu: Option<TerminalId>,
+    tab_group_pending: Option<TerminalId>,
     tab_group_form: Option<TabGroupForm>,
     next_tab_group: Cell<u64>,
     collapsed_groups: RefCell<HashSet<String>>,
@@ -432,6 +434,8 @@ impl XcordApp {
             tab_groups: RefCell::new(Vec::new()),
             tab_group_of: RefCell::new(HashMap::new()),
             collapsed_tab_groups: RefCell::new(HashSet::new()),
+            tab_menu: None,
+            tab_group_pending: None,
             tab_group_form: None,
             next_tab_group: Cell::new(1),
             collapsed_groups: RefCell::new(HashSet::new()),
@@ -658,6 +662,18 @@ impl XcordApp {
             };
         }
         self.active = self.workspace.active();
+        if self
+            .tab_menu
+            .is_some_and(|id| !self.tabs.iter().any(|tab| tab.id == id))
+        {
+            self.tab_menu = None;
+        }
+        if self
+            .tab_group_pending
+            .is_some_and(|id| !self.tabs.iter().any(|tab| tab.id == id))
+        {
+            self.tab_group_pending = None;
+        }
         {
             let live = self.tabs.iter().map(|tab| tab.id).collect::<HashSet<_>>();
             self.tab_group_of
@@ -803,7 +819,51 @@ impl XcordApp {
         }
     }
 
+    fn close_tab_ids(&mut self, ids: Vec<TerminalId>, cx: &mut Context<Self>) {
+        for id in ids {
+            self.workspace.close(id);
+            self.tab_group_of.borrow_mut().remove(&id);
+        }
+        self.tab_drag_hover.replace(None);
+        self.tab_menu = None;
+        self.sync(cx);
+        cx.notify();
+    }
+
+    fn close_tab_side(&mut self, right: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.tab_menu else {
+            return;
+        };
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let ids = if right {
+            self.tabs[index + 1..]
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>()
+        } else {
+            self.tabs[..index]
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>()
+        };
+        self.close_tab_ids(ids, cx);
+    }
+
+    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        let ids = self.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+        self.close_tab_ids(ids, cx);
+    }
+
+    fn open_tab_group_dialog_for_tab(&mut self, tab_id: TerminalId, cx: &mut Context<Self>) {
+        self.tab_menu = None;
+        self.open_tab_group_dialog(cx);
+        self.tab_group_pending = Some(tab_id);
+    }
+
     fn open_tab_group_dialog(&mut self, cx: &mut Context<Self>) {
+        self.tab_group_pending = None;
         let theme = self.theme.clone();
         let name = Self::make_input(&theme, &self.tr("Group name"), false, cx);
         self.tab_group_form = Some(TabGroupForm { name, error: None });
@@ -839,10 +899,17 @@ impl XcordApp {
         }
         let index = self.next_tab_group.get();
         self.next_tab_group.set(index + 1);
+        let group_id = format!("tab-group-{index}");
         self.tab_groups.borrow_mut().push(TabGroupState {
-            id: format!("tab-group-{index}"),
+            id: group_id.clone(),
             name: name.clone(),
         });
+        if let Some(tab_id) = self.tab_group_pending.take() {
+            self.tab_group_of
+                .borrow_mut()
+                .insert(tab_id, group_id.clone());
+            self.collapsed_tab_groups.borrow_mut().remove(&group_id);
+        }
         self.tab_group_form = None;
         self.set_notice(
             NoticeLevel::Info,
@@ -908,6 +975,7 @@ impl XcordApp {
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.tab_group_form = None;
+                            this.tab_group_pending = None;
                             cx.notify();
                         }),
                     ))
@@ -3110,6 +3178,10 @@ impl XcordApp {
                 self.palette = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.tab_menu.is_some() {
+                self.tab_menu = None;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.quick_commands_open {
                 self.quick_commands_open = false;
                 cx.notify();
@@ -4095,6 +4167,224 @@ impl XcordApp {
             )
     }
 
+    fn render_tab_menu(&self, tab_id: TerminalId, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return div();
+        };
+        let groups = self.tab_groups.borrow().clone();
+        let position = self.tabs.iter().position(|entry| entry.id == tab_id);
+        let has_left = position.is_some_and(|index| index > 0);
+        let has_right = position.is_some_and(|index| index + 1 < self.tabs.len());
+        let close_current = tab_id;
+        let close_all = tab_id;
+        let close_right = tab_id;
+        let close_left = tab_id;
+        let create_group = tab_id;
+        let move_tab = tab_id;
+        let button = |suffix: &str, label: String, enabled: bool, theme: &Theme| {
+            div()
+                .id(SharedString::from(format!("tab-menu-{suffix}")))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgbc(theme.border))
+                .text_size(px(10.5))
+                .text_color(if enabled {
+                    rgbc(theme.foreground)
+                } else {
+                    rgbc(theme.muted)
+                })
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.background)))
+                .child(label)
+        };
+        let mut join_chips = div().flex().items_center().gap_1().flex_wrap();
+        for group in &groups {
+            let group_id = group.id.clone();
+            let label = group.name.clone();
+            join_chips = join_chips.child(
+                div()
+                    .id(SharedString::from(format!("tab-menu-group-{}", group.id)))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgbc(theme.accent))
+                    .text_size(px(10.))
+                    .text_color(rgbc(theme.accent))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.background)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.assign_tab_to_group(move_tab, Some(group_id.clone()), cx);
+                            this.tab_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+        join_chips = join_chips.child(
+            div()
+                .id("tab-menu-group-ungrouped")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgbc(theme.border))
+                .text_size(px(10.))
+                .text_color(rgbc(theme.muted))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.background)))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.assign_tab_to_group(move_tab, None, cx);
+                        this.tab_menu = None;
+                        cx.notify();
+                    }),
+                )
+                .child(self.tr("Ungrouped")),
+        );
+        div()
+            .px_2()
+            .pb_2()
+            .bg(rgbc(theme.panel))
+            .border_b_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .w(px(700.))
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgbc(theme.muted))
+                                    .child(self.tr("Tab actions")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgbc(theme.foreground))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(tab.title.clone()),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("tab-menu-close")
+                                    .px_1()
+                                    .rounded_sm()
+                                    .text_color(rgbc(theme.muted))
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(rgbc(theme.danger)))
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.tab_menu = None;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("×"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                button("close-current", self.tr("Close current"), true, theme)
+                                    .w_full()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.close_tab_ids(vec![close_current], cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                button("close-all", self.tr("Close all"), true, theme)
+                                    .w_full()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            let _ = close_all;
+                                            this.close_all_tabs(cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                button(
+                                    "close-right",
+                                    self.tr("Close to the right"),
+                                    has_right,
+                                    theme,
+                                )
+                                .w_full()
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        let _ = close_right;
+                                        this.tab_menu = Some(close_right);
+                                        this.close_tab_side(true, cx);
+                                    }),
+                                ),
+                            )
+                            .child(
+                                button("close-left", self.tr("Close to the left"), has_left, theme)
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.tab_menu = Some(close_left);
+                                            this.close_tab_side(false, cx);
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                button("create-group", self.tr("Create group"), true, theme)
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.open_tab_group_dialog_for_tab(create_group, cx);
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgbc(theme.muted))
+                                    .child(self.tr("Join group:")),
+                            )
+                            .child(join_chips),
+                    ),
+            )
+    }
+
     fn render_tab_item(&self, tab: &TabInfo, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = self.theme();
         let active = Some(tab.id) == self.active;
@@ -4181,8 +4471,19 @@ impl XcordApp {
                 cx.notify();
             }))
             .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.tab_menu = Some(tab_id);
+                    this.session_menu = None;
+                    this.group_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
+                    this.tab_menu = None;
                     this.workspace.select(tab_id);
                     this.pending_focus = Some(PendingFocus::Terminal);
                     let _ = window;
@@ -4847,6 +5148,9 @@ impl XcordApp {
             .flex_col()
             .bg(rgbc(theme.background));
         main = main.child(self.render_tab_bar(cx));
+        if let Some(tab_id) = self.tab_menu {
+            main = main.child(self.render_tab_menu(tab_id, cx));
+        }
         if active.is_some() {
             main = main.child(div().flex_1().min_h(px(0.)).child(self.terminal.clone()));
             if self.settings.compose_bar {
