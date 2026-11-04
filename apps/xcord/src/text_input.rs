@@ -256,6 +256,11 @@ impl TextInput {
         let word = modifiers.control || modifiers.platform;
         let shift = modifiers.shift;
 
+        if self.marked_range.is_some() && !word {
+            cx.stop_propagation();
+            return;
+        }
+
         if word {
             match keystroke.key.as_str() {
                 "a" => {
@@ -283,6 +288,12 @@ impl TextInput {
                 }
                 _ => {}
             }
+        }
+
+        if shift && !word && keystroke.key.as_str() == "insert" {
+            self.paste(cx);
+            cx.stop_propagation();
+            return;
         }
 
         match keystroke.key.as_str() {

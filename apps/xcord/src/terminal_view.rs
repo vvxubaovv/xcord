@@ -1,14 +1,16 @@
 //! GPU-rendered terminal grid with selection, scrollback and xterm key encoding.
 
 use std::cell::Cell;
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, point, px, rgb, rgba, size, App, Bounds, Context, CursorStyle, FocusHandle,
-    Focusable, Font, FontWeight, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine,
-    TextRun, UnderlineStyle, Window,
+    canvas, div, fill, point, px, rgb, rgba, size, App, Bounds, Context, CursorStyle,
+    ElementInputHandler, EntityInputHandler, FocusHandle, Focusable, Font, FontWeight,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, TextRun, UTF16Selection,
+    UnderlineStyle, Window,
 };
 use xcord_plugin_api::{HighlightSpan, Highlights, TerminalId, Themes, Ui, UiCommand, Workspace};
 use xcord_store::Settings;
@@ -80,6 +82,7 @@ pub struct TerminalView {
     selection: Option<Selection>,
     selecting: bool,
     scroll_accumulator: f32,
+    ime_text: String,
 }
 
 impl TerminalView {
@@ -103,6 +106,7 @@ impl TerminalView {
             selection: None,
             selecting: false,
             scroll_accumulator: 0.0,
+            ime_text: String::new(),
         }
     }
 
@@ -183,6 +187,38 @@ impl TerminalView {
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
         let key = keystroke.key.as_str();
+
+        if !control && !keystroke.modifiers.alt && !self.ime_text.is_empty() {
+            cx.stop_propagation();
+            return;
+        }
+
+        // Do not handle printable keys here. Let the platform translate the
+        // key into WM_CHAR/WM_IME messages; the input handler below receives
+        // both normal text and IME commits. Stopping propagation here would
+        // prevent translation and therefore also prevent IME activation.
+        if !control && !keystroke.modifiers.alt {
+            let printable = keystroke
+                .key_char
+                .as_ref()
+                .is_some_and(|text| text.chars().any(|ch| !ch.is_control()))
+                || keystroke.key.chars().count() == 1
+                || keystroke.key == "space";
+            if printable {
+                return;
+            }
+        }
+
+        if control && !shift && key == "v" {
+            self.paste(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if shift && !control && key == "insert" {
+            self.paste(cx);
+            cx.stop_propagation();
+            return;
+        }
 
         if control && !shift && key == "c" {
             let has_selection = self
@@ -364,6 +400,8 @@ impl Render for TerminalView {
         let font_size = settings.font_size;
         let line_height = settings.line_height;
         let background = colors.background;
+        let input_view = cx.entity();
+        let input_focus = self.focus_handle.clone();
 
         div()
             .size_full()
@@ -398,11 +436,120 @@ impl Render for TerminalView {
                         )
                     },
                     move |_bounds, paint, window, cx| {
+                        let bounds = paint.bounds;
                         paint_terminal(paint, window, cx);
+                        window.handle_input(
+                            &input_focus,
+                            ElementInputHandler::new(bounds, input_view.clone()),
+                            cx,
+                        );
                     },
                 )
                 .size_full(),
             )
+    }
+}
+
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        Some(self.ime_text.clone())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        (!self.ime_text.is_empty()).then(|| 0..self.ime_text.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.ime_text.clear();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_text.clear();
+        let text = new_text
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .collect::<String>();
+        if !text.is_empty() {
+            if let Some(id) = self.active {
+                self.workspace.write(id, text.as_bytes());
+            }
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_text = new_text.to_string();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (row, col) = self
+            .active
+            .and_then(|id| self.workspace.snapshot(id))
+            .and_then(|snapshot| snapshot.cursor)
+            .unwrap_or((0, 0));
+        let metrics = self.metrics.get();
+        Some(Bounds::new(
+            point(
+                bounds.left() + px(col as f32 * metrics.cell_width),
+                bounds.top() + px(row as f32 * metrics.cell_height),
+            ),
+            size(
+                px(metrics.cell_width.max(1.0)),
+                px(metrics.cell_height.max(1.0)),
+            ),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(0)
     }
 }
 

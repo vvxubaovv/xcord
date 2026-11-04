@@ -60,7 +60,10 @@ guide, the threading model, and the session-open sequence.
   optional startup command, TOFU host keys in OpenSSH `known_hosts`.
 - **Terminal**: xterm-256color, truecolor, alt screen, scroll regions, SGR,
   wide characters, combining marks, OSC title/clipboard, bracketed paste,
-  application cursor keys, scrollback, selection/copy/paste.
+  application cursor keys, scrollback, selection/copy/paste. CJK input uses the
+  Windows IME input handler. **Ctrl+V** and **Shift+Insert** paste,
+  **Ctrl+C** copies a selection (otherwise sends interrupt), and
+  **Ctrl+Shift+C/V** are also available.
 - **Tab bar**: tabs use the configuration name; repeated connections to one
   profile are auto-numbered (`wsl`, `wsl (2)`, …). Drag tabs left/right to
   reorder. Tab groups are **independent of session groups**: right-click a tab
