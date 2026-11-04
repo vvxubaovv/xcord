@@ -374,6 +374,12 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Connecting…", "正在连接…"),
     ("Files", "文件"),
     ("File transfer", "文件传输"),
+    ("All", "全选"),
+    ("Clear", "清除"),
+    (
+        "Ctrl+click to select multiple",
+        "Ctrl+单击可多选（macOS 用 Cmd）",
+    ),
     ("Local", "本地"),
     ("Remote", "远程"),
     ("Local folder", "本地目录"),

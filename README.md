@@ -94,8 +94,10 @@ guide, the threading model, and the session-open sequence.
   chosen files. Protocol bytes stay out of the terminal, and the SSH stream is
   protected from typing during a transfer.
 - **SFTP file manager (Xftp-style)**: the `ftp` plugin opens an independent
-  SFTP subsystem for the active session, with local/remote panes, path
-  navigation, recursive upload/download, folder creation and remote deletion.
+  SFTP subsystem for the active session, with scrollable local/remote panes,
+  path navigation, recursive upload/download, folder creation and remote
+  deletion. **Ctrl/Cmd+click** selects multiple files; **All/Clear** and the
+  batch upload/download/delete actions operate on the whole selection.
 - **Session manager**: folders/groups, search, edit/delete, a right-click menu
   (edit, duplicate, connect, move to group, new group), drag to reorder sessions
   or drop a session onto a group header, collapsible/expandable groups, group

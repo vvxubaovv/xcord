@@ -274,8 +274,8 @@ pub struct XcordApp {
     ftp_open: bool,
     ftp_profile: Option<String>,
     ftp_snapshot: Option<FtpSnapshot>,
-    ftp_remote_selected: Option<String>,
-    ftp_local_selected: Option<String>,
+    ftp_remote_selected: HashSet<String>,
+    ftp_local_selected: HashSet<String>,
     ftp_remote_input: Entity<TextInput>,
     ftp_local_input: Entity<TextInput>,
     ftp_new_dir: Entity<TextInput>,
@@ -468,8 +468,8 @@ impl XcordApp {
             ftp_open: false,
             ftp_profile: None,
             ftp_snapshot: None,
-            ftp_remote_selected: None,
-            ftp_local_selected: None,
+            ftp_remote_selected: HashSet::new(),
+            ftp_local_selected: HashSet::new(),
             ftp_remote_input,
             ftp_local_input,
             ftp_new_dir,
@@ -1187,22 +1187,20 @@ impl XcordApp {
         self.ftp_local_input.update(cx, |input, cx| {
             input.set_value(snapshot.local_path.clone(), cx)
         });
-        if self.ftp_remote_selected.as_ref().is_some_and(|selected| {
-            !snapshot
-                .remote_entries
-                .iter()
-                .any(|entry| &entry.path == selected)
-        }) {
-            self.ftp_remote_selected = None;
-        }
-        if self.ftp_local_selected.as_ref().is_some_and(|selected| {
-            !snapshot
-                .local_entries
-                .iter()
-                .any(|entry| &entry.path == selected)
-        }) {
-            self.ftp_local_selected = None;
-        }
+        let remote_paths = snapshot
+            .remote_entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<HashSet<_>>();
+        let local_paths = snapshot
+            .local_entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<HashSet<_>>();
+        self.ftp_remote_selected
+            .retain(|selected| remote_paths.contains(selected.as_str()));
+        self.ftp_local_selected
+            .retain(|selected| local_paths.contains(selected.as_str()));
     }
 
     fn open_group_dialog(&mut self, cx: &mut Context<Self>) {
@@ -6112,7 +6110,7 @@ impl XcordApp {
             self.tr("Local"),
             self.ftp_local_input.clone(),
             &snapshot.local_entries,
-            self.ftp_local_selected.as_deref(),
+            &self.ftp_local_selected,
             false,
             &profile_id,
             cx,
@@ -6121,7 +6119,7 @@ impl XcordApp {
             self.tr("Remote"),
             self.ftp_remote_input.clone(),
             &snapshot.remote_entries,
-            self.ftp_remote_selected.as_deref(),
+            &self.ftp_remote_selected,
             true,
             &profile_id,
             cx,
@@ -6129,6 +6127,25 @@ impl XcordApp {
         let upload_id = profile_id.clone();
         let download_id = profile_id.clone();
         let delete_id = profile_id.clone();
+        let upload_label = if self.ftp_local_selected.is_empty() {
+            self.tr("Upload")
+        } else {
+            format!("{} ({})", self.tr("Upload"), self.ftp_local_selected.len())
+        };
+        let download_label = if self.ftp_remote_selected.is_empty() {
+            self.tr("Download")
+        } else {
+            format!(
+                "{} ({})",
+                self.tr("Download"),
+                self.ftp_remote_selected.len()
+            )
+        };
+        let delete_label = if self.ftp_remote_selected.is_empty() {
+            self.tr("Delete")
+        } else {
+            format!("{} ({})", self.tr("Delete"), self.ftp_remote_selected.len())
+        };
         div()
             .w(px(1060.))
             .h(px(680.))
@@ -6218,25 +6235,28 @@ impl XcordApp {
                     .gap_2()
                     .border_t_1()
                     .border_color(rgbc(theme.border))
-                    .child(primary_button(self.tr("Upload"), theme).on_mouse_up(
+                    .child(primary_button(upload_label, theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            let Some(path) = this.ftp_local_selected.clone() else {
+                            let paths = this.ftp_local_selected.iter().cloned().collect::<Vec<_>>();
+                            if paths.is_empty() {
                                 return;
-                            };
-                            if let Err(error) = this.ftp.upload(&upload_id, vec![path]) {
+                            }
+                            if let Err(error) = this.ftp.upload(&upload_id, paths) {
                                 this.set_notice(NoticeLevel::Error, error);
                             }
                             cx.notify();
                         }),
                     ))
-                    .child(primary_button(self.tr("Download"), theme).on_mouse_up(
+                    .child(primary_button(download_label, theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            let Some(path) = this.ftp_remote_selected.clone() else {
+                            let paths =
+                                this.ftp_remote_selected.iter().cloned().collect::<Vec<_>>();
+                            if paths.is_empty() {
                                 return;
-                            };
-                            if let Err(error) = this.ftp.download(&download_id, vec![path]) {
+                            }
+                            if let Err(error) = this.ftp.download(&download_id, paths) {
                                 this.set_notice(NoticeLevel::Error, error);
                             }
                             cx.notify();
@@ -6260,18 +6280,26 @@ impl XcordApp {
                             )
                             .child(self.tr("Upload files…")),
                     )
-                    .child(small_button(self.tr("Delete"), theme).on_mouse_up(
+                    .child(small_button(delete_label, theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            let Some(path) = this.ftp_remote_selected.clone() else {
+                            let paths =
+                                this.ftp_remote_selected.iter().cloned().collect::<Vec<_>>();
+                            if paths.is_empty() {
                                 return;
-                            };
-                            if let Err(error) = this.ftp.delete_remote(&delete_id, vec![path]) {
+                            }
+                            if let Err(error) = this.ftp.delete_remote(&delete_id, paths) {
                                 this.set_notice(NoticeLevel::Error, error);
                             }
                             cx.notify();
                         }),
                     ))
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(self.tr("Ctrl+click to select multiple")),
+                    )
                     .child(div().flex_1())
                     .when_some(snapshot.busy.clone(), |footer, busy| {
                         footer.child(
@@ -6289,7 +6317,7 @@ impl XcordApp {
         title: String,
         path_input: Entity<TextInput>,
         entries: &[FtpEntry],
-        selected: Option<&str>,
+        selected: &HashSet<String>,
         remote: bool,
         profile_id: &str,
         cx: &mut Context<Self>,
@@ -6315,6 +6343,10 @@ impl XcordApp {
         let refresh_profile = profile_id.to_string();
         let refresh_path = path.clone();
         let enter_profile = profile_id.to_string();
+        let all_paths = entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
         let mut toolbar = div()
             .h(px(32.))
             .flex()
@@ -6473,7 +6505,7 @@ impl XcordApp {
             } else {
                 format_size(entry.size)
             };
-            let is_selected = selected == Some(path.as_str());
+            let is_selected = selected.contains(&path);
             let entry_profile = profile_id.to_string();
             rows = rows.child(
                 div()
@@ -6503,10 +6535,23 @@ impl XcordApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            let control = event.modifiers.control || event.modifiers.platform;
                             if remote {
-                                this.ftp_remote_selected = Some(path.clone());
+                                if control {
+                                    if !this.ftp_remote_selected.insert(path.clone()) {
+                                        this.ftp_remote_selected.remove(&path);
+                                    }
+                                } else {
+                                    this.ftp_remote_selected.clear();
+                                    this.ftp_remote_selected.insert(path.clone());
+                                }
+                            } else if control {
+                                if !this.ftp_local_selected.insert(path.clone()) {
+                                    this.ftp_local_selected.remove(&path);
+                                }
                             } else {
-                                this.ftp_local_selected = Some(path.clone());
+                                this.ftp_local_selected.clear();
+                                this.ftp_local_selected.insert(path.clone());
                             }
                             if event.click_count >= 2 && is_dir {
                                 if remote {
@@ -6549,13 +6594,77 @@ impl XcordApp {
                 div()
                     .px_2()
                     .pt_2()
-                    .text_size(px(10.))
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgbc(theme.muted))
-                    .child(title),
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(10.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.muted))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .id(if remote {
+                                "ftp-select-all-remote"
+                            } else {
+                                "ftp-select-all-local"
+                            })
+                            .px_1()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.accent)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    if remote {
+                                        this.ftp_remote_selected.extend(all_paths.clone());
+                                    } else {
+                                        this.ftp_local_selected.extend(all_paths.clone());
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(self.tr("All")),
+                    )
+                    .child(
+                        div()
+                            .id(if remote {
+                                "ftp-select-none-remote"
+                            } else {
+                                "ftp-select-none-local"
+                            })
+                            .px_1()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.accent)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    if remote {
+                                        this.ftp_remote_selected.clear();
+                                    } else {
+                                        this.ftp_local_selected.clear();
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(self.tr("Clear")),
+                    ),
             )
             .child(div().px_2().pb_1().child(toolbar))
-            .child(div().px_2().flex_1().min_h(px(0.)).child(rows))
+            .child(
+                div()
+                    .px_2()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .flex_col()
+                    .child(rows),
+            )
     }
 
     fn pick_ftp_uploads(&mut self, cx: &mut Context<Self>) {
