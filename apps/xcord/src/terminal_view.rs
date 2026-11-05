@@ -3,7 +3,6 @@
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
@@ -84,7 +83,6 @@ pub struct TerminalView {
     selecting: bool,
     scroll_accumulator: f32,
     ime_text: String,
-    suppress_ctrl_c_until: Option<Instant>,
 }
 
 impl TerminalView {
@@ -109,7 +107,6 @@ impl TerminalView {
             selecting: false,
             scroll_accumulator: 0.0,
             ime_text: String::new(),
-            suppress_ctrl_c_until: None,
         }
     }
 
@@ -224,14 +221,6 @@ impl TerminalView {
         }
 
         if control && !shift && key == "c" {
-            if self
-                .suppress_ctrl_c_until
-                .is_some_and(|until| Instant::now() < until)
-            {
-                self.suppress_ctrl_c_until = None;
-                cx.stop_propagation();
-                return;
-            }
             let has_selection = self
                 .selection
                 .as_ref()
@@ -308,6 +297,49 @@ impl TerminalView {
         cx.stop_propagation();
     }
 
+    fn select_word_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(id) = self.active else {
+            return;
+        };
+        let Some(snapshot) = self.workspace.snapshot(id) else {
+            return;
+        };
+        let (row, col) = self.metrics.get().cell_at(position);
+        let Some(line) = snapshot.lines.get(row) else {
+            return;
+        };
+        if line.cells.is_empty() {
+            return;
+        }
+        let target = col.min(line.cells.len() - 1);
+        if line.cells[target].ch == ' ' {
+            self.selection = None;
+            cx.notify();
+            return;
+        }
+        let is_word = |ch: char| {
+            ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\' | ':' | '@' | '~')
+        };
+        let target_is_word = is_word(line.cells[target].ch);
+        let mut start = target;
+        let mut end = target;
+        if target_is_word {
+            while start > 0 && is_word(line.cells[start - 1].ch) {
+                start -= 1;
+            }
+            while end + 1 < line.cells.len() && is_word(line.cells[end + 1].ch) {
+                end += 1;
+            }
+        }
+        let end_cell = &line.cells[end];
+        let head = end + (end_cell.width.max(1) as usize) - 1;
+        self.selection = Some(Selection {
+            anchor: (row, start),
+            head: (row, head),
+        });
+        cx.notify();
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -332,9 +364,7 @@ impl TerminalView {
         }
         if event.click_count >= 2 {
             self.selecting = false;
-            self.selection = None;
-            self.suppress_ctrl_c_until = Some(Instant::now() + Duration::from_millis(600));
-            cx.notify();
+            self.select_word_at(event.position, cx);
             cx.stop_propagation();
             return;
         }
@@ -366,7 +396,9 @@ impl TerminalView {
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if event.click_count >= 2 {
             self.selecting = false;
-            self.selection = None;
+            if self.settings.copy_on_select {
+                self.copy_selection(cx);
+            }
             cx.notify();
             return;
         }

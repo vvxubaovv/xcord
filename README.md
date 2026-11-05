@@ -60,7 +60,8 @@ guide, the threading model, and the session-open sequence.
   optional startup command, TOFU host keys in OpenSSH `known_hosts`.
 - **Terminal**: xterm-256color, truecolor, alt screen, scroll regions, SGR,
   wide characters, combining marks, OSC title/clipboard, bracketed paste,
-  application cursor keys, scrollback, selection/copy/paste. CJK input uses the
+  application cursor keys, scrollback, selection/copy/paste;
+  double-click selects a word. CJK input uses the
   Windows IME input handler. **Ctrl+V** and **Shift+Insert** paste,
   **Ctrl+C** copies a selection (otherwise sends interrupt), and
   **Ctrl+Shift+C/V** are also available.
