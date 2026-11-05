@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
@@ -83,6 +84,7 @@ pub struct TerminalView {
     selecting: bool,
     scroll_accumulator: f32,
     ime_text: String,
+    suppress_ctrl_c_until: Option<Instant>,
 }
 
 impl TerminalView {
@@ -107,6 +109,7 @@ impl TerminalView {
             selecting: false,
             scroll_accumulator: 0.0,
             ime_text: String::new(),
+            suppress_ctrl_c_until: None,
         }
     }
 
@@ -221,6 +224,14 @@ impl TerminalView {
         }
 
         if control && !shift && key == "c" {
+            if self
+                .suppress_ctrl_c_until
+                .is_some_and(|until| Instant::now() < until)
+            {
+                self.suppress_ctrl_c_until = None;
+                cx.stop_propagation();
+                return;
+            }
             let has_selection = self
                 .selection
                 .as_ref()
@@ -322,6 +333,7 @@ impl TerminalView {
         if event.click_count >= 2 {
             self.selecting = false;
             self.selection = None;
+            self.suppress_ctrl_c_until = Some(Instant::now() + Duration::from_millis(600));
             cx.notify();
             cx.stop_propagation();
             return;
