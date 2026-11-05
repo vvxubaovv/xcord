@@ -319,6 +319,13 @@ impl TerminalView {
         if event.button != MouseButton::Left {
             return;
         }
+        if event.click_count >= 2 {
+            self.selecting = false;
+            self.selection = None;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let (row, col) = self.metrics.get().cell_at(event.position);
         self.selecting = true;
         self.selection = Some(Selection {
@@ -344,7 +351,13 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.click_count >= 2 {
+            self.selecting = false;
+            self.selection = None;
+            cx.notify();
+            return;
+        }
         if !self.selecting {
             return;
         }
