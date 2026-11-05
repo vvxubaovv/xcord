@@ -6916,17 +6916,22 @@ impl XcordApp {
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_3()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
                             .text_size(px(10.5))
                             .text_color(rgbc(status_color))
+                            .text_ellipsis()
                             .child(status_text),
                     )
                     .child(
                         div()
                             .flex()
                             .gap_2()
+                            .flex_shrink_0()
                             .child(
                                 secondary_button(self.tr("Test connection"), theme).on_mouse_up(
                                     MouseButton::Left,
