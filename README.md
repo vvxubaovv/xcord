@@ -174,10 +174,19 @@ remote `rz`. Multi-file `sz`/`rz` batches are supported.
 
 ### Terminal automation with Rhai
 
-Open **Automation** in the header. Scripts are plain `.rhai` files stored in
+Open **Automation** in the header. The script panel opens beside the terminal,
+so the live session and the script stay visible together. **Fullscreen** opens
+the larger editor. Scripts are plain `.rhai` files stored in
 `%APPDATA%\xcord\scripts` (or `$XDG_CONFIG_HOME/xcord/scripts`). The first
-launch creates `example.rhai`. Edit a script with **Edit script** (the system
-editor), save it, then press **Reload** and **Run script**.
+launch creates `example.rhai`.
+
+The panel contains an inline multiline editor. Use **Save** / `Ctrl+S`,
+**Reload**, or open the file in **VS Code**, **Zed**, **Notepad**, or a custom
+program. A custom editor can be picked with **Choose…**. **Run script** saves
+the current editor buffer first. While a run is active, the current Rhai line
+is highlighted with `▶` and the header shows the line number. **Stop script**
+cancels the run without sending Ctrl+C to the remote command. The log pane is
+selectable, so text can be dragged and copied with `Ctrl+C`.
 
 Scripts run on a dedicated thread, so waiting for output never blocks the UI.
 They target the active terminal tab.

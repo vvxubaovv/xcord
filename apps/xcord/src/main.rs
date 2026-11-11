@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod root;
+mod script_editor;
 mod selectable_text;
 mod terminal_view;
 mod text_input;

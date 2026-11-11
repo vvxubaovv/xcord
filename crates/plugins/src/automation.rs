@@ -13,7 +13,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Position};
+use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, NativeCallContext, Position};
 use tokio::sync::broadcast;
 use xcord_cordis::{Context, Plugin, PluginMeta, Result};
 use xcord_plugin_api::{
@@ -151,6 +151,7 @@ struct SharedRun {
     has_output: bool,
     cancelled: bool,
     status: RunStatus,
+    current_line: usize,
     logs: Vec<ScriptLog>,
     error: Option<String>,
 }
@@ -174,6 +175,7 @@ impl Run {
             script_name: self.name.clone(),
             terminal: self.terminal,
             status: shared.status,
+            current_line: shared.current_line,
             logs: shared.logs.clone(),
             error: shared.error.clone(),
         }
@@ -298,6 +300,7 @@ impl AutomationState {
                 has_output: false,
                 cancelled: false,
                 status: RunStatus::Running,
+                current_line: 0,
                 logs: Vec::new(),
                 error: None,
             }),
@@ -463,6 +466,21 @@ struct HostApi {
 }
 
 impl HostApi {
+    fn mark(&self, position: Position) {
+        let Some(line) = position.line() else {
+            return;
+        };
+        let (lock, _) = &*self.shared;
+        let mut shared = lock.lock().unwrap();
+        if shared.current_line != line {
+            shared.current_line = line;
+            drop(shared);
+            let _ = self.events.send(AutomationEvent::Changed {
+                run_id: self.run_id,
+            });
+        }
+    }
+
     fn log(&self, level: ScriptLogLevel, message: impl Into<String>) {
         let (lock, _) = &*self.shared;
         let mut shared = lock.lock().unwrap();
@@ -614,13 +632,17 @@ impl HostApi {
 
 fn register_host_functions(engine: &mut Engine, host: Arc<HostApi>) {
     let h = host.clone();
-    engine.register_fn("log", move |message: String| {
+    engine.register_fn("log", move |ctx: NativeCallContext, message: String| {
+        h.mark(ctx.call_position());
         h.log(ScriptLogLevel::Info, message);
     });
     let h = host.clone();
     engine.register_fn(
         "fail",
-        move |message: String| -> std::result::Result<(), Box<EvalAltResult>> {
+        move |ctx: NativeCallContext,
+              message: String|
+              -> std::result::Result<(), Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
             h.log(ScriptLogLevel::Error, message.clone());
             Err(runtime_error(message))
         },
@@ -628,24 +650,36 @@ fn register_host_functions(engine: &mut Engine, host: Arc<HostApi>) {
     let h = host.clone();
     engine.register_fn(
         "sleep",
-        move |ms: i64| -> std::result::Result<(), Box<EvalAltResult>> { h.sleep(ms) },
+        move |ctx: NativeCallContext, ms: i64| -> std::result::Result<(), Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
+            h.sleep(ms)
+        },
     );
     let h = host.clone();
     engine.register_fn(
         "send",
-        move |text: String| -> std::result::Result<(), Box<EvalAltResult>> {
+        move |ctx: NativeCallContext,
+              text: String|
+              -> std::result::Result<(), Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
             h.send(text.into_bytes())
         },
     );
     let h = host.clone();
     engine.register_fn(
         "send_line",
-        move |text: String| -> std::result::Result<(), Box<EvalAltResult>> { h.send_line(&text) },
+        move |ctx: NativeCallContext,
+              text: String|
+              -> std::result::Result<(), Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
+            h.send_line(&text)
+        },
     );
     let h = host.clone();
     engine.register_fn(
         "send_key",
-        move |key: String| -> std::result::Result<(), Box<EvalAltResult>> {
+        move |ctx: NativeCallContext, key: String| -> std::result::Result<(), Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
             let bytes = match key.as_str() {
                 "enter" => b"\r".to_vec(),
                 "tab" => b"\t".to_vec(),
@@ -664,21 +698,33 @@ fn register_host_functions(engine: &mut Engine, host: Arc<HostApi>) {
     let h = host.clone();
     engine.register_fn(
         "expect",
-        move |pattern: String, timeout_ms: i64| -> std::result::Result<Map, Box<EvalAltResult>> {
+        move |ctx: NativeCallContext,
+              pattern: String,
+              timeout_ms: i64|
+              -> std::result::Result<Map, Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
             h.expect(vec![pattern], timeout_ms, false)
         },
     );
     let h = host.clone();
     engine.register_fn(
         "expect_regex",
-        move |pattern: String, timeout_ms: i64| -> std::result::Result<Map, Box<EvalAltResult>> {
+        move |ctx: NativeCallContext,
+              pattern: String,
+              timeout_ms: i64|
+              -> std::result::Result<Map, Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
             h.expect(vec![pattern], timeout_ms, true)
         },
     );
     let h = host.clone();
     engine.register_fn(
         "expect_any",
-        move |patterns: Array, timeout_ms: i64| -> std::result::Result<Map, Box<EvalAltResult>> {
+        move |ctx: NativeCallContext,
+              patterns: Array,
+              timeout_ms: i64|
+              -> std::result::Result<Map, Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
             let patterns = patterns
                 .into_iter()
                 .filter_map(|value| value.clone().try_cast::<String>())
@@ -689,16 +735,27 @@ fn register_host_functions(engine: &mut Engine, host: Arc<HostApi>) {
     let h = host.clone();
     engine.register_fn(
         "wait_idle",
-        move |idle_ms: i64, timeout_ms: i64| -> std::result::Result<String, Box<EvalAltResult>> {
+        move |ctx: NativeCallContext,
+              idle_ms: i64,
+              timeout_ms: i64|
+              -> std::result::Result<String, Box<EvalAltResult>> {
+            h.mark(ctx.call_position());
             h.wait_idle(idle_ms, timeout_ms)
         },
     );
     let h = host.clone();
-    engine.register_fn("read_screen", move || -> String { h.text_tail(40) });
-    let h = host.clone();
-    engine.register_fn("read_scrollback", move |lines: i64| -> String {
-        h.text_tail(lines.max(1) as usize)
+    engine.register_fn("read_screen", move |ctx: NativeCallContext| -> String {
+        h.mark(ctx.call_position());
+        h.text_tail(40)
     });
+    let h = host.clone();
+    engine.register_fn(
+        "read_scrollback",
+        move |ctx: NativeCallContext, lines: i64| -> String {
+            h.mark(ctx.call_position());
+            h.text_tail(lines.max(1) as usize)
+        },
+    );
 }
 
 fn find_match(
@@ -792,6 +849,7 @@ mod tests {
                 has_output: false,
                 cancelled: false,
                 status: RunStatus::Running,
+                current_line: 0,
                 logs: Vec::new(),
                 error: None,
             }),
@@ -838,5 +896,6 @@ mod tests {
         let state = lock.lock().unwrap();
         assert!(state.logs.iter().any(|log| log.message == "hi"));
         assert!(state.logs.iter().any(|log| log.message == "branch"));
+        assert!(state.current_line > 0);
     }
 }

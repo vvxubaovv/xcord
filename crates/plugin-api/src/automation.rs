@@ -42,6 +42,7 @@ pub struct ScriptRunSnapshot {
     pub script_name: String,
     pub terminal: TerminalId,
     pub status: RunStatus,
+    pub current_line: usize,
     pub logs: Vec<ScriptLog>,
     pub error: Option<String>,
 }

@@ -227,6 +227,9 @@ pub struct Settings {
     /// Ask for another folder after a file has been received.
     #[serde(default)]
     pub download_ask: bool,
+    /// External editor used by the automation script page.
+    #[serde(default = "default_editor_command")]
+    pub editor_command: String,
     pub sidebar_width: f32,
     pub compose_bar: bool,
     /// UI locale. Defaults to Simplified Chinese for existing configs.
@@ -266,6 +269,7 @@ impl Default for Settings {
             log_dir: String::new(),
             download_dir: String::new(),
             download_ask: false,
+            editor_command: default_editor_command(),
             sidebar_width: 260.0,
             compose_bar: true,
             language: "zh-CN".into(),
@@ -283,6 +287,10 @@ impl Default for Settings {
             ai_system_prompt: default_ai_system_prompt(),
         }
     }
+}
+
+fn default_editor_command() -> String {
+    "notepad.exe".into()
 }
 
 fn default_ai_system_prompt() -> String {

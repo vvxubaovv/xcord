@@ -29,6 +29,7 @@ use xcord_plugin_api::{
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings, Snippet};
 
+use crate::script_editor::ScriptEditor;
 use crate::selectable_text::SelectableText;
 use crate::terminal_view::TerminalView;
 use crate::text_input::TextInput;
@@ -280,6 +281,10 @@ pub struct XcordApp {
     automation_run: Option<ScriptRunSnapshot>,
     automation_run_id: Option<u64>,
     automation_error: Option<String>,
+    automation_fullscreen: bool,
+    automation_editor: Option<Entity<ScriptEditor>>,
+    automation_log: Option<Entity<SelectableText>>,
+    automation_log_owner: Rc<Cell<Option<usize>>>,
 
     ftp_open: bool,
     ftp_profile: Option<String>,
@@ -487,6 +492,10 @@ impl XcordApp {
             automation_run: None,
             automation_run_id: None,
             automation_error: None,
+            automation_fullscreen: false,
+            automation_editor: None,
+            automation_log: None,
+            automation_log_owner: Rc::new(Cell::new(None)),
 
             ftp_open: false,
             ftp_profile: None,
@@ -3328,6 +3337,11 @@ impl XcordApp {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
+        if control && !shift && keystroke.key == "s" && self.automation_open {
+            self.save_automation_source(cx);
+            cx.stop_propagation();
+            return;
+        }
         if control && shift {
             match keystroke.key.as_str() {
                 "p" => {
@@ -3369,7 +3383,11 @@ impl XcordApp {
                 cx.notify();
                 cx.stop_propagation();
             } else if self.automation_open {
-                self.automation_open = false;
+                if self.automation_fullscreen {
+                    self.automation_fullscreen = false;
+                } else {
+                    self.automation_open = false;
+                }
                 cx.notify();
                 cx.stop_propagation();
             } else if self.b64_upload_open {
@@ -4827,14 +4845,36 @@ impl XcordApp {
 
     fn toggle_automation(&mut self, cx: &mut Context<Self>) {
         self.automation_open = !self.automation_open;
+        if !self.automation_open {
+            self.automation_fullscreen = false;
+        }
         if self.automation_open {
             self.automation_error = None;
             self.refresh_automation_scripts(cx);
             if let Some(run_id) = self.automation_run_id {
                 self.automation_run = self.automation.run_snapshot(run_id);
             }
+            self.ensure_automation_editor(cx);
         }
         cx.notify();
+    }
+
+    fn ensure_automation_editor(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme();
+        if self.automation_editor.is_none() {
+            self.automation_editor = Some(cx.new(|cx| {
+                ScriptEditor::new(
+                    rgbc(theme.foreground).into(),
+                    rgbc(theme.muted).into(),
+                    rgbc(theme.accent).into(),
+                    cx,
+                )
+            }));
+        }
+        let source = self.automation_source.clone();
+        if let Some(editor) = self.automation_editor.clone() {
+            editor.update(cx, |editor, cx| editor.set_value(source, cx));
+        }
     }
 
     fn refresh_automation_scripts(&mut self, cx: &mut Context<Self>) {
@@ -4862,11 +4902,53 @@ impl XcordApp {
             .as_ref()
             .and_then(|id| self.automation.script_source(id))
             .unwrap_or_default();
+        let source = self.automation_source.clone();
+        if let Some(editor) = self.automation_editor.clone() {
+            editor.update(cx, |editor, cx| editor.set_value(source, cx));
+        }
+        cx.notify();
+    }
+
+    fn save_automation_source(&mut self, cx: &mut Context<Self>) {
+        let Some(script) = self.automation_selected_script() else {
+            self.automation_error = Some(self.tr("Select a script first."));
+            cx.notify();
+            return;
+        };
+        let Some(editor) = self.automation_editor.clone() else {
+            return;
+        };
+        let source = editor.read(cx).value().to_string();
+        match std::fs::write(&script.path, &source) {
+            Ok(()) => {
+                self.automation_source = source;
+                self.automation_error = None;
+            }
+            Err(error) => self.automation_error = Some(error.to_string()),
+        }
         cx.notify();
     }
 
     fn select_automation_script(&mut self, id: String, cx: &mut Context<Self>) {
         self.automation_selected = Some(id);
+        self.reload_automation_source(cx);
+    }
+
+    fn cycle_automation_script(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.automation_scripts.is_empty() {
+            return;
+        }
+        let current = self
+            .automation_selected
+            .as_ref()
+            .and_then(|id| {
+                self.automation_scripts
+                    .iter()
+                    .position(|script| &script.id == id)
+            })
+            .unwrap_or(0) as isize;
+        let index = (current + delta).rem_euclid(self.automation_scripts.len() as isize) as usize;
+        self.automation_selected = Some(self.automation_scripts[index].id.clone());
         self.reload_automation_source(cx);
     }
 
@@ -4899,27 +4981,120 @@ impl XcordApp {
     }
 
     fn open_automation_editor(&self, path: &str) {
+        let _ = self.try_open_automation_editor_with(&self.settings.editor_command, path);
+    }
+
+    fn try_open_automation_editor_with(
+        &self,
+        program: &str,
+        path: &str,
+    ) -> std::result::Result<(), String> {
+        let program = program.trim();
+        let program = if program.is_empty() {
+            "notepad.exe"
+        } else {
+            program
+        };
         #[cfg(target_os = "windows")]
-        let mut command = {
-            let mut command = std::process::Command::new("notepad.exe");
-            command.arg(path);
-            command
-        };
-        #[cfg(target_os = "macos")]
-        let mut command = {
-            let mut command = std::process::Command::new("open");
-            command.arg(path);
-            command
-        };
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let mut command = {
-            let mut command = std::process::Command::new("xdg-open");
-            command.arg(path);
-            command
-        };
-        #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
-        let mut command = std::process::Command::new("true");
-        let _ = command.spawn();
+        {
+            let mut command = if matches!(program, "code" | "zed") {
+                let mut command = std::process::Command::new("cmd.exe");
+                command
+                    .arg("/C")
+                    .arg(format!("{program} \"{}\"", path.replace('"', "\"")));
+                command
+            } else {
+                let mut command = std::process::Command::new(program);
+                command.arg(path);
+                command
+            };
+            return command
+                .spawn()
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::process::Command::new(program)
+                .arg(path)
+                .spawn()
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn choose_automation_editor(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.tr("Choose editor program").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.settings.editor_command = path.to_string_lossy().into_owned();
+                if let Err(error) = this.sessions.save_settings(this.settings.clone()) {
+                    this.automation_error = Some(error);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn launch_automation_editor(&mut self, program: &str, cx: &mut Context<Self>) {
+        if let Some(script) = self.automation_selected_script() {
+            if let Err(error) = self.try_open_automation_editor_with(program, &script.path) {
+                self.automation_error = Some(format!("{}: {error}", program));
+            }
+        }
+        cx.notify();
+    }
+
+    fn ensure_automation_log(&mut self, cx: &mut Context<Self>) {
+        let theme = self.theme();
+        let text = self
+            .automation_run
+            .as_ref()
+            .map(|run| {
+                run.logs
+                    .iter()
+                    .map(|log| {
+                        format!(
+                            "[{}] {}",
+                            match log.level {
+                                ScriptLogLevel::Info => "info",
+                                ScriptLogLevel::Warning => "warn",
+                                ScriptLogLevel::Error => "error",
+                            },
+                            log.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if self.automation_log.is_none() {
+            self.automation_log = Some(cx.new(|cx| {
+                SelectableText::new(
+                    0,
+                    self.automation_log_owner.clone(),
+                    text.clone(),
+                    rgbc(theme.muted),
+                    10.0,
+                    rgbc(theme.selection),
+                    cx,
+                )
+            }));
+        } else if let Some(log) = self.automation_log.clone() {
+            log.update(cx, |log, cx| log.set_text(text, cx));
+        }
     }
 
     fn open_automation_folder(&mut self, cx: &mut Context<Self>) {
@@ -4934,6 +5109,9 @@ impl XcordApp {
     }
 
     fn start_automation(&mut self, cx: &mut Context<Self>) {
+        if self.automation_editor.is_some() {
+            self.save_automation_source(cx);
+        }
         let Some(id) = self.automation_selected.clone() else {
             self.automation_error = Some(self.tr("Select a script first."));
             cx.notify();
@@ -4980,8 +5158,14 @@ impl XcordApp {
         let changed = self.automation_run.as_ref().is_none_or(|previous| {
             previous.status != run.status
                 || previous.logs.len() != run.logs.len()
+                || previous.current_line != run.current_line
                 || previous.error != run.error
         });
+        if let Some(editor) = self.automation_editor.clone() {
+            let line = (run.current_line > 0 && run.status == RunStatus::Running)
+                .then_some(run.current_line);
+            editor.update(cx, |editor, cx| editor.set_active_line(line, cx));
+        }
         self.automation_run = Some(run);
         if changed && self.automation_open {
             cx.notify();
@@ -5313,8 +5497,319 @@ impl XcordApp {
         }
     }
 
-    fn render_automation(&self, cx: &mut Context<Self>) -> Div {
+    fn render_automation_panel(&mut self, cx: &mut Context<Self>) -> Div {
+        self.ensure_automation_log(cx);
         let theme = self.theme();
+        let selected = self.automation_selected_script();
+        let running = self
+            .automation_run
+            .as_ref()
+            .is_some_and(|run| run.status == RunStatus::Running);
+        let status = self
+            .automation_run
+            .as_ref()
+            .map(|run| self.automation_status(run.status))
+            .unwrap_or_else(|| self.tr("Idle"));
+        let current_line = self
+            .automation_run
+            .as_ref()
+            .map(|run| run.current_line)
+            .unwrap_or(0);
+        let target = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map(|tab| tab.title.clone())
+            .unwrap_or_else(|| self.tr("No active terminal"));
+        let editor = self.automation_editor.clone();
+        div()
+            .w(px(510.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgbc(theme.panel_alt))
+            .border_l_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .h(px(42.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgbc(theme.border))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child(self.tr("Terminal automation")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(if running {
+                                rgbc(theme.accent)
+                            } else {
+                                rgbc(theme.muted)
+                            })
+                            .child(if current_line > 0 {
+                                format!("{status} · {} {current_line}", self.tr("Line"))
+                            } else {
+                                status
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("automation-fullscreen")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.accent)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.automation_fullscreen = true;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(self.tr("Fullscreen")),
+                    )
+                    .child(
+                        div()
+                            .id("automation-panel-close")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.automation_open = false;
+                                    this.automation_fullscreen = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .text_size(px(11.))
+                                    .text_color(rgbc(theme.foreground))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(
+                                        selected
+                                            .as_ref()
+                                            .map(|script| script.name.clone())
+                                            .unwrap_or_else(|| self.tr("No script selected.")),
+                                    ),
+                            )
+                            .child(self.tiny_button("‹", cx, |this, cx| {
+                                this.cycle_automation_script(-1, cx)
+                            }))
+                            .child(self.tiny_button("›", cx, |this, cx| {
+                                this.cycle_automation_script(1, cx)
+                            }))
+                            .child(small_button(self.tr("New"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.create_automation_script(cx)),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(9.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(format!("{}: {target}", self.tr("Target")))
+                            .child(div().flex_1())
+                            .child(format!("{} {current_line}", self.tr("Line"))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(primary_button(self.tr("Save"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.save_automation_source(cx)),
+                            ))
+                            .child(small_button(self.tr("Reload"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.reload_automation_source(cx)),
+                            ))
+                            .child(primary_button(self.tr("Run script"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.start_automation(cx)),
+                            ))
+                            .child(small_button(self.tr("Stop script"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.stop_automation(cx)),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_size(px(9.))
+                            .text_color(rgbc(theme.muted))
+                            .child(self.tr("External editor"))
+                            .child(self.tiny_text_button("VS Code", cx, |this, cx| {
+                                this.launch_automation_editor("code", cx)
+                            }))
+                            .child(self.tiny_text_button("Zed", cx, |this, cx| {
+                                this.launch_automation_editor("zed", cx)
+                            }))
+                            .child(self.tiny_text_button("Notepad", cx, |this, cx| {
+                                this.launch_automation_editor("notepad.exe", cx)
+                            }))
+                            .child(self.tiny_text_button(self.tr("Choose…"), cx, |this, cx| {
+                                this.choose_automation_editor(cx)
+                            }))
+                            .child(div().flex_1())
+                            .child(self.tiny_text_button(self.tr("Custom"), cx, |this, cx| {
+                                let program = this.settings.editor_command.clone();
+                                this.launch_automation_editor(&program, cx)
+                            })),
+                    )
+                    .when_some(self.automation_error.clone(), |panel, error| {
+                        panel.child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(rgbc(theme.danger))
+                                .child(error),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .mx_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .bg(rgbc(theme.panel))
+                    .child(if let Some(editor) = editor {
+                        div().size_full().child(editor)
+                    } else {
+                        div()
+                            .p_3()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.muted))
+                            .child(self.tr("No script selected."))
+                    }),
+            )
+            .child(
+                div()
+                    .h(px(170.))
+                    .mx_3()
+                    .my_2()
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_size(px(9.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.muted))
+                            .child(self.tr("Logs")),
+                    )
+                    .child(
+                        div()
+                            .id("automation-panel-log-scroll")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .px_2()
+                            .child(if let Some(log) = self.automation_log.clone() {
+                                div().size_full().child(log)
+                            } else {
+                                div()
+                            }),
+                    ),
+            )
+    }
+
+    fn tiny_button(
+        &self,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Div {
+        let action = Rc::new(action);
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(self.theme().border))
+            .text_size(px(10.))
+            .text_color(rgbc(self.theme().muted))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgbc(self.theme().panel)))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| action(this, cx)),
+            )
+            .child(label.into())
+    }
+
+    fn tiny_text_button(
+        &self,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> Div {
+        let action = Rc::new(action);
+        div()
+            .px_1()
+            .py_1()
+            .rounded_sm()
+            .text_size(px(9.))
+            .text_color(rgbc(self.theme().accent))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgbc(self.theme().panel)))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| action(this, cx)),
+            )
+            .child(label.into())
+    }
+
+    fn render_automation(&mut self, cx: &mut Context<Self>) -> Div {
+        self.ensure_automation_log(cx);
+        let theme = self.theme();
+        let editor_entity = self.automation_editor.clone();
+        let log_entity = self.automation_log.clone();
         let mut scripts = div()
             .id("automation-scripts")
             .flex()
@@ -5379,56 +5874,6 @@ impl XcordApp {
             );
         }
         let selected = self.automation_selected_script();
-        let source = &self.automation_source;
-        let mut source_lines = div()
-            .id("automation-source")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .p_2()
-            .gap_1();
-        if source.is_empty() {
-            source_lines = source_lines.child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(rgbc(theme.muted))
-                    .child(self.tr("No script selected.")),
-            );
-        } else {
-            for (index, line) in source.lines().take(400).enumerate() {
-                source_lines = source_lines.child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(rgbc(theme.foreground))
-                        .child(format!("{:>3}  {}", index + 1, line)),
-                );
-            }
-        }
-        let mut logs = div()
-            .id("automation-logs")
-            .flex()
-            .flex_col()
-            .gap_1()
-            .h(px(190.))
-            .overflow_y_scroll()
-            .p_2();
-        if let Some(run) = &self.automation_run {
-            for log in run.logs.iter().rev().take(100).rev() {
-                let color = match log.level {
-                    ScriptLogLevel::Info => theme.muted,
-                    ScriptLogLevel::Warning => theme.accent,
-                    ScriptLogLevel::Error => theme.danger,
-                };
-                logs = logs.child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(rgbc(color))
-                        .child(log.message.clone()),
-                );
-            }
-        }
         let target = self
             .active
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
@@ -5443,13 +5888,18 @@ impl XcordApp {
             .as_ref()
             .map(|run| self.automation_status(run.status))
             .unwrap_or_else(|| self.tr("Idle"));
+        let current_line = self
+            .automation_run
+            .as_ref()
+            .map(|run| run.current_line)
+            .unwrap_or(0);
         let script_path = selected
             .as_ref()
             .map(|script| script.path.clone())
             .unwrap_or_default();
         div()
-            .w(px(1120.))
-            .h(px(720.))
+            .w(px(1560.))
+            .h(px(860.))
             .flex()
             .flex_col()
             .rounded_lg()
@@ -5487,6 +5937,25 @@ impl XcordApp {
                     )
                     .child(
                         div()
+                            .id("automation-exit-fullscreen")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.accent)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.automation_fullscreen = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(self.tr("Exit fullscreen")),
+                    )
+                    .child(
+                        div()
                             .id("automation-close")
                             .px_2()
                             .py_1()
@@ -5498,6 +5967,7 @@ impl XcordApp {
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     this.automation_open = false;
+                                    this.automation_fullscreen = false;
                                     cx.notify();
                                 }),
                             )
@@ -5523,24 +5993,28 @@ impl XcordApp {
                                 div()
                                     .flex()
                                     .gap_1()
-                                    .child(primary_button(self.tr("New script"), theme).on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.create_automation_script(cx)
-                                        }),
-                                    ))
+                                    .child(
+                                        primary_button(self.tr("New script"), theme).on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.create_automation_script(cx)
+                                            }),
+                                        ),
+                                    )
                                     .child(small_button(self.tr("Refresh"), theme).on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             this.refresh_automation_scripts(cx)
                                         }),
                                     ))
-                                    .child(small_button(self.tr("Open folder"), theme).on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.open_automation_folder(cx)
-                                        }),
-                                    )),
+                                    .child(
+                                        small_button(self.tr("Open folder"), theme).on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.open_automation_folder(cx)
+                                            }),
+                                        ),
+                                    ),
                             ),
                     )
                     .child(
@@ -5574,7 +6048,14 @@ impl XcordApp {
                                             } else {
                                                 rgbc(theme.muted)
                                             })
-                                            .child(status),
+                                            .child(if current_line > 0 {
+                                                format!(
+                                                    "{status} · {} {current_line}",
+                                                    self.tr("Line")
+                                                )
+                                            } else {
+                                                status
+                                            }),
                                     ),
                             )
                             .child(
@@ -5582,31 +6063,52 @@ impl XcordApp {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(secondary_button(self.tr("Edit script"), theme).on_mouse_up(
+                                    .child(primary_button(self.tr("Save"), theme).on_mouse_up(
                                         MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.edit_automation_script(cx)),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.save_automation_source(cx)
+                                        }),
                                     ))
+                                    .child(
+                                        secondary_button(self.tr("Edit external"), theme)
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.edit_automation_script(cx)
+                                                }),
+                                            ),
+                                    )
                                     .child(secondary_button(self.tr("Reload"), theme).on_mouse_up(
                                         MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.reload_automation_source(cx)),
+                                        cx.listener(|this, _, _, cx| {
+                                            this.reload_automation_source(cx)
+                                        }),
                                     ))
-                                    .child(primary_button(self.tr("Run script"), theme).on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.start_automation(cx)),
-                                    ))
+                                    .child(
+                                        primary_button(self.tr("Run script"), theme).on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| this.start_automation(cx)),
+                                        ),
+                                    )
                                     .child(small_button(self.tr("Stop script"), theme).on_mouse_up(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| this.stop_automation(cx)),
                                     ))
                                     .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .text_size(px(9.5))
-                                            .text_color(rgbc(theme.muted))
-                                            .child(self.tr(
-                                                "Edit the .rhai file in an external editor, save, then Reload.",
-                                            )),
-                                    ),
+                                    .child(self.tiny_text_button("VS Code", cx, |this, cx| {
+                                        this.launch_automation_editor("code", cx)
+                                    }))
+                                    .child(self.tiny_text_button("Zed", cx, |this, cx| {
+                                        this.launch_automation_editor("zed", cx)
+                                    }))
+                                    .child(self.tiny_text_button("Notepad", cx, |this, cx| {
+                                        this.launch_automation_editor("notepad.exe", cx)
+                                    }))
+                                    .child(self.tiny_text_button(
+                                        self.tr("Choose…"),
+                                        cx,
+                                        |this, cx| this.choose_automation_editor(cx),
+                                    )),
                             )
                             .when_some(self.automation_error.clone(), |panel, error| {
                                 panel.child(
@@ -5625,7 +6127,15 @@ impl XcordApp {
                                     .rounded_md()
                                     .border_1()
                                     .border_color(rgbc(theme.border))
-                                    .child(source_lines),
+                                    .child(if let Some(editor) = editor_entity.clone() {
+                                        div().size_full().child(editor)
+                                    } else {
+                                        div()
+                                            .p_3()
+                                            .text_size(px(10.5))
+                                            .text_color(rgbc(theme.muted))
+                                            .child(self.tr("No script selected."))
+                                    }),
                             )
                             .child(
                                 div()
@@ -5656,10 +6166,18 @@ impl XcordApp {
                             )
                             .child(
                                 div()
+                                    .id("automation-fullscreen-logs")
+                                    .h(px(190.))
                                     .rounded_md()
                                     .border_1()
                                     .border_color(rgbc(theme.border))
-                                    .child(logs),
+                                    .overflow_y_scroll()
+                                    .p_1()
+                                    .child(if let Some(log) = log_entity.clone() {
+                                        div().size_full().child(log)
+                                    } else {
+                                        div()
+                                    }),
                             ),
                     ),
             )
@@ -8310,8 +8828,12 @@ impl Render for XcordApp {
             .flex()
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
+            .when(
+                self.automation_open && !self.automation_fullscreen,
+                |body| body.child(self.render_automation_panel(cx)),
+            )
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
-        let content = if self.automation_open {
+        let content = if self.automation_open && self.automation_fullscreen {
             modal_shell(self.render_automation(cx))
         } else if self.b64_upload_open {
             modal_shell(self.render_b64_upload(cx))
