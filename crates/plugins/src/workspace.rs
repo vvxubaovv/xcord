@@ -957,6 +957,12 @@ impl WorkspaceService for WorkspaceState {
         Some(tab.terminal.snapshot(tab.scroll))
     }
 
+    fn history_text(&self, id: TerminalId) -> Option<String> {
+        let tabs = self.tabs.borrow();
+        let tab = tabs.iter().find(|tab| tab.id == id)?;
+        Some(tab.terminal.history_text())
+    }
+
     fn dimensions(&self, id: TerminalId) -> Option<(u16, u16)> {
         let tabs = self.tabs.borrow();
         let tab = tabs.iter().find(|tab| tab.id == id)?;

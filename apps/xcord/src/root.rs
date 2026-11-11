@@ -21,9 +21,10 @@ use gpui::{
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
 use xcord_plugin_api::{
-    services, Ai, AiMessageView, AiSnapshot, Command, Commands, ConnectionTest, Ftp, FtpEntry,
-    FtpEvent, FtpSnapshot, Highlights, I18n, McpStatus, NoticeLevel, OpenRequest, Runtime,
-    Sessions, TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand, UiHost, Workspace,
+    services, Ai, AiMessageView, AiSnapshot, Automation, AutomationEvent, Command, Commands,
+    ConnectionTest, Ftp, FtpEntry, FtpEvent, FtpSnapshot, Highlights, I18n, McpStatus, NoticeLevel,
+    OpenRequest, RunStatus, Runtime, ScriptInfo, ScriptLogLevel, ScriptRunSnapshot, Sessions,
+    TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand, UiHost, Workspace,
     WorkspaceEvent,
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings, Snippet};
@@ -271,6 +272,15 @@ pub struct XcordApp {
     quick_editing: Option<String>,
     quick_error: Option<String>,
 
+    automation: Automation,
+    automation_open: bool,
+    automation_scripts: Vec<ScriptInfo>,
+    automation_selected: Option<String>,
+    automation_source: String,
+    automation_run: Option<ScriptRunSnapshot>,
+    automation_run_id: Option<u64>,
+    automation_error: Option<String>,
+
     ftp_open: bool,
     ftp_profile: Option<String>,
     ftp_snapshot: Option<FtpSnapshot>,
@@ -366,6 +376,10 @@ impl XcordApp {
         let ftp = (*ctx
             .require::<Ftp>(services::FTP)
             .expect("ftp plugin did not start"))
+        .clone();
+        let automation = (*ctx
+            .require::<Automation>(services::AUTOMATION)
+            .expect("automation plugin did not start"))
         .clone();
         let mcp = (*ctx
             .require::<McpStatus>(services::MCP_STATUS)
@@ -465,6 +479,15 @@ impl XcordApp {
             quick_command,
             quick_editing: None,
             quick_error: None,
+            automation,
+            automation_open: false,
+            automation_scripts: Vec::new(),
+            automation_selected: None,
+            automation_source: String::new(),
+            automation_run: None,
+            automation_run_id: None,
+            automation_error: None,
+
             ftp_open: false,
             ftp_profile: None,
             ftp_snapshot: None,
@@ -674,6 +697,46 @@ impl XcordApp {
         })
         .detach();
 
+        // Rhai automation notifications and pump.
+        let mut automation_events = self.automation.subscribe();
+        cx.spawn(async move |this, cx| loop {
+            match automation_events.recv().await {
+                Ok(event) => {
+                    if this
+                        .update(cx, |app, cx| app.on_automation_event(event, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    if this
+                        .update(cx, |app, cx| {
+                            app.automation_tick(cx);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| loop {
+            Timer::after(Duration::from_millis(80)).await;
+            let keep_running = this
+                .update(cx, |app, cx| {
+                    app.automation_tick(cx);
+                })
+                .is_ok();
+            if !keep_running {
+                break;
+            }
+        })
+        .detach();
+
         // Commands sent by plugins.
         let ui_rx = self.ui_rx.clone();
         cx.spawn(async move |this, cx| {
@@ -858,6 +921,7 @@ impl XcordApp {
             }
             UiCommand::OpenAiSettings => self.open_ai_config(cx),
             UiCommand::ToggleFtp => self.toggle_ftp(cx),
+            UiCommand::ToggleAutomation => self.toggle_automation(cx),
         }
         cx.notify();
     }
@@ -3304,6 +3368,10 @@ impl XcordApp {
                 self.palette = None;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.automation_open {
+                self.automation_open = false;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.b64_upload_open {
                 self.close_b64_upload(cx);
                 cx.stop_propagation();
@@ -3405,6 +3473,9 @@ impl XcordApp {
                 cx.notify();
             }))
             .child(self.header_button(self.tr("Files"), cx, |this, cx| this.toggle_ftp(cx)))
+            .child(self.header_button(self.tr("Automation"), cx, |this, cx| {
+                this.toggle_automation(cx)
+            }))
             .child(self.header_button(self.tr("Palette"), cx, |this, cx| this.open_palette(cx)))
             .child(self.header_button(self.tr("Plugins"), cx, |this, cx| {
                 this.plugins_panel = true;
@@ -4754,6 +4825,179 @@ impl XcordApp {
         }
     }
 
+    fn toggle_automation(&mut self, cx: &mut Context<Self>) {
+        self.automation_open = !self.automation_open;
+        if self.automation_open {
+            self.automation_error = None;
+            self.refresh_automation_scripts(cx);
+            if let Some(run_id) = self.automation_run_id {
+                self.automation_run = self.automation.run_snapshot(run_id);
+            }
+        }
+        cx.notify();
+    }
+
+    fn refresh_automation_scripts(&mut self, cx: &mut Context<Self>) {
+        self.automation_scripts = self.automation.scripts();
+        if self.automation_selected.as_ref().is_some_and(|id| {
+            !self
+                .automation_scripts
+                .iter()
+                .any(|script| &script.id == id)
+        }) {
+            self.automation_selected = None;
+        }
+        if self.automation_selected.is_none() {
+            self.automation_selected = self
+                .automation_scripts
+                .first()
+                .map(|script| script.id.clone());
+        }
+        self.reload_automation_source(cx);
+    }
+
+    fn reload_automation_source(&mut self, cx: &mut Context<Self>) {
+        self.automation_source = self
+            .automation_selected
+            .as_ref()
+            .and_then(|id| self.automation.script_source(id))
+            .unwrap_or_default();
+        cx.notify();
+    }
+
+    fn select_automation_script(&mut self, id: String, cx: &mut Context<Self>) {
+        self.automation_selected = Some(id);
+        self.reload_automation_source(cx);
+    }
+
+    fn automation_selected_script(&self) -> Option<ScriptInfo> {
+        self.automation_selected.as_ref().and_then(|id| {
+            self.automation_scripts
+                .iter()
+                .find(|script| &script.id == id)
+                .cloned()
+        })
+    }
+
+    fn create_automation_script(&mut self, cx: &mut Context<Self>) {
+        match self.automation.create_script("script") {
+            Ok(script) => {
+                self.automation_selected = Some(script.id.clone());
+                self.refresh_automation_scripts(cx);
+                self.open_automation_editor(&script.path);
+            }
+            Err(error) => self.automation_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn edit_automation_script(&mut self, cx: &mut Context<Self>) {
+        if let Some(script) = self.automation_selected_script() {
+            self.open_automation_editor(&script.path);
+        }
+        cx.notify();
+    }
+
+    fn open_automation_editor(&self, path: &str) {
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = std::process::Command::new("notepad.exe");
+            command.arg(path);
+            command
+        };
+        #[cfg(target_os = "macos")]
+        let mut command = {
+            let mut command = std::process::Command::new("open");
+            command.arg(path);
+            command
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut command = {
+            let mut command = std::process::Command::new("xdg-open");
+            command.arg(path);
+            command
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+        let mut command = std::process::Command::new("true");
+        let _ = command.spawn();
+    }
+
+    fn open_automation_folder(&mut self, cx: &mut Context<Self>) {
+        let dir = self.automation.scripts_dir();
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(dir).spawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        cx.notify();
+    }
+
+    fn start_automation(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.automation_selected.clone() else {
+            self.automation_error = Some(self.tr("Select a script first."));
+            cx.notify();
+            return;
+        };
+        let Some(tab) = self.active else {
+            self.automation_error = Some(self.tr("Open a terminal tab first."));
+            cx.notify();
+            return;
+        };
+        match self.automation.run(&id, tab) {
+            Ok(run) => {
+                self.automation_run_id = Some(run.run_id);
+                self.automation_run = Some(run);
+                self.automation_error = None;
+                self.automation_tick(cx);
+            }
+            Err(error) => self.automation_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn stop_automation(&mut self, cx: &mut Context<Self>) {
+        if let Some(run_id) = self.automation_run_id {
+            self.automation.stop(run_id);
+            self.automation_run = self.automation.run_snapshot(run_id);
+        }
+        cx.notify();
+    }
+
+    fn automation_tick(&mut self, cx: &mut Context<Self>) {
+        self.automation.pump();
+        let Some(run_id) = self.automation_run_id else {
+            return;
+        };
+        let Some(run) = self.automation.run_snapshot(run_id) else {
+            return;
+        };
+        if run.status == RunStatus::Running {
+            if let Some(text) = self.workspace.history_text(run.terminal) {
+                self.automation.update_terminal(run.terminal, text);
+            }
+        }
+        let changed = self.automation_run.as_ref().is_none_or(|previous| {
+            previous.status != run.status
+                || previous.logs.len() != run.logs.len()
+                || previous.error != run.error
+        });
+        self.automation_run = Some(run);
+        if changed && self.automation_open {
+            cx.notify();
+        }
+    }
+
+    fn on_automation_event(&mut self, event: AutomationEvent, cx: &mut Context<Self>) {
+        let AutomationEvent::Changed { run_id } = event;
+        if self.automation_run_id == Some(run_id) {
+            self.automation_run = self.automation.run_snapshot(run_id);
+            if self.automation_open {
+                cx.notify();
+            }
+        }
+    }
+
     fn open_b64_upload(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.active else {
             self.set_notice(
@@ -5058,6 +5302,367 @@ impl XcordApp {
         self.b64_upload_cancel.set(true);
         self.b64_upload_status = Some(self.tr("Cancelling…"));
         cx.notify();
+    }
+
+    fn automation_status(&self, status: RunStatus) -> String {
+        match status {
+            RunStatus::Running => self.tr("Script running"),
+            RunStatus::Success => self.tr("Script succeeded"),
+            RunStatus::Failed => self.tr("Script failed"),
+            RunStatus::Stopped => self.tr("Script stopped"),
+        }
+    }
+
+    fn render_automation(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let mut scripts = div()
+            .id("automation-scripts")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll();
+        if self.automation_scripts.is_empty() {
+            scripts = scripts.child(
+                div()
+                    .p_2()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("No scripts yet.")),
+            );
+        }
+        for script in &self.automation_scripts {
+            let id = script.id.clone();
+            let selected = self.automation_selected.as_deref() == Some(script.id.as_str());
+            let path = script.path.clone();
+            scripts = scripts.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "automation-script-{}",
+                        script.id
+                    )))
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if selected {
+                        rgbc(theme.accent)
+                    } else {
+                        rgba(theme.border, 0.0)
+                    })
+                    .bg(if selected {
+                        rgba(theme.accent, 0.12)
+                    } else {
+                        rgba(theme.panel_alt, 0.0)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            if event.click_count >= 2 {
+                                this.open_automation_editor(&path);
+                            } else {
+                                this.select_automation_script(id.clone(), cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(rgbc(theme.foreground))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(script.name.clone()),
+                    ),
+            );
+        }
+        let selected = self.automation_selected_script();
+        let source = &self.automation_source;
+        let mut source_lines = div()
+            .id("automation-source")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .p_2()
+            .gap_1();
+        if source.is_empty() {
+            source_lines = source_lines.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("No script selected.")),
+            );
+        } else {
+            for (index, line) in source.lines().take(400).enumerate() {
+                source_lines = source_lines.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgbc(theme.foreground))
+                        .child(format!("{:>3}  {}", index + 1, line)),
+                );
+            }
+        }
+        let mut logs = div()
+            .id("automation-logs")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .h(px(190.))
+            .overflow_y_scroll()
+            .p_2();
+        if let Some(run) = &self.automation_run {
+            for log in run.logs.iter().rev().take(100).rev() {
+                let color = match log.level {
+                    ScriptLogLevel::Info => theme.muted,
+                    ScriptLogLevel::Warning => theme.accent,
+                    ScriptLogLevel::Error => theme.danger,
+                };
+                logs = logs.child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgbc(color))
+                        .child(log.message.clone()),
+                );
+            }
+        }
+        let target = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map(|tab| tab.title.clone())
+            .unwrap_or_else(|| self.tr("No active terminal"));
+        let running = self
+            .automation_run
+            .as_ref()
+            .is_some_and(|run| run.status == RunStatus::Running);
+        let status = self
+            .automation_run
+            .as_ref()
+            .map(|run| self.automation_status(run.status))
+            .unwrap_or_else(|| self.tr("Idle"));
+        let script_path = selected
+            .as_ref()
+            .map(|script| script.path.clone())
+            .unwrap_or_default();
+        div()
+            .w(px(1120.))
+            .h(px(720.))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel))
+            .child(
+                div()
+                    .h(px(48.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgbc(theme.border))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child(self.tr("Terminal automation")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgbc(theme.muted))
+                            .child("Rhai"),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgbc(theme.muted))
+                            .child(format!("{}: {target}", self.tr("Target"))),
+                    )
+                    .child(
+                        div()
+                            .id("automation-close")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.automation_open = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .p_3()
+                    .flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(280.))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(scripts)
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(primary_button(self.tr("New script"), theme).on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.create_automation_script(cx)
+                                        }),
+                                    ))
+                                    .child(small_button(self.tr("Refresh"), theme).on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.refresh_automation_scripts(cx)
+                                        }),
+                                    ))
+                                    .child(small_button(self.tr("Open folder"), theme).on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.open_automation_folder(cx)
+                                        }),
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .text_size(px(11.5))
+                                            .text_color(rgbc(theme.foreground))
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(script_path),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(if running {
+                                                rgbc(theme.accent)
+                                            } else {
+                                                rgbc(theme.muted)
+                                            })
+                                            .child(status),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(secondary_button(self.tr("Edit script"), theme).on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.edit_automation_script(cx)),
+                                    ))
+                                    .child(secondary_button(self.tr("Reload"), theme).on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.reload_automation_source(cx)),
+                                    ))
+                                    .child(primary_button(self.tr("Run script"), theme).on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.start_automation(cx)),
+                                    ))
+                                    .child(small_button(self.tr("Stop script"), theme).on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.stop_automation(cx)),
+                                    ))
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(rgbc(theme.muted))
+                                            .child(self.tr(
+                                                "Edit the .rhai file in an external editor, save, then Reload.",
+                                            )),
+                                    ),
+                            )
+                            .when_some(self.automation_error.clone(), |panel, error| {
+                                panel.child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(rgbc(theme.danger))
+                                        .child(error),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgbc(theme.border))
+                                    .child(source_lines),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgbc(theme.muted))
+                                            .child(self.tr("Logs")),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(rgbc(theme.muted))
+                                            .child(format!(
+                                                "{}  {}",
+                                                selected.map(|s| s.name).unwrap_or_default(),
+                                                self.automation_run
+                                                    .as_ref()
+                                                    .map(|run| run.script_name.clone())
+                                                    .unwrap_or_default()
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgbc(theme.border))
+                                    .child(logs),
+                            ),
+                    ),
+            )
     }
 
     fn render_b64_upload(&self, cx: &mut Context<Self>) -> Div {
@@ -7706,7 +8311,9 @@ impl Render for XcordApp {
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
-        let content = if self.b64_upload_open {
+        let content = if self.automation_open {
+            modal_shell(self.render_automation(cx))
+        } else if self.b64_upload_open {
             modal_shell(self.render_b64_upload(cx))
         } else if self.base64_error.is_some() {
             modal_shell(self.render_base64_error(cx))

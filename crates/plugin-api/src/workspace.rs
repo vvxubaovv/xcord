@@ -153,6 +153,8 @@ pub trait WorkspaceService {
     fn zmodem_cancel(&self, id: TerminalId);
 
     fn snapshot(&self, id: TerminalId) -> Option<Snapshot>;
+    /// Plain text of the terminal scrollback and current screen.
+    fn history_text(&self, id: TerminalId) -> Option<String>;
     /// Current grid size without cloning the whole viewport.
     fn dimensions(&self, id: TerminalId) -> Option<(u16, u16)>;
     fn scroll_by(&self, id: TerminalId, delta: i32);

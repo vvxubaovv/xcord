@@ -9,6 +9,7 @@
 //! is a declaration of intent rather than a hard requirement.
 
 mod ai;
+mod automation;
 mod commands_plugin;
 mod ftp;
 mod highlights;
@@ -48,4 +49,5 @@ pub fn install(ctx: &Context) {
     ctx.plugin(mcp::McpPlugin);
     ctx.plugin(ai::AiPlugin);
     ctx.plugin(ftp::FtpPlugin);
+    ctx.plugin(automation::AutomationPlugin);
 }

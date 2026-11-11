@@ -21,6 +21,7 @@
 //! [`Context`]: xcord_cordis::Context
 
 pub mod ai;
+pub mod automation;
 pub mod commands;
 pub mod ftp;
 pub mod highlight;
@@ -34,6 +35,10 @@ pub mod ui;
 pub mod workspace;
 
 pub use ai::{Ai, AiAssistant, AiMessageView, AiSnapshot};
+pub use automation::{
+    Automation, AutomationEvent, AutomationService, RunStatus, ScriptInfo, ScriptLog,
+    ScriptLogLevel, ScriptRunSnapshot,
+};
 pub use commands::{Command, CommandRegistry, Commands};
 pub use ftp::{Ftp, FtpEntry, FtpEvent, FtpService, FtpSnapshot};
 pub use highlight::{HighlightService, HighlightSpan, Highlights};
@@ -72,4 +77,5 @@ pub mod services {
     pub const MCP_STATUS: &str = "mcp-status";
     pub const AI: &str = "ai";
     pub const FTP: &str = "ftp";
+    pub const AUTOMATION: &str = "automation";
 }

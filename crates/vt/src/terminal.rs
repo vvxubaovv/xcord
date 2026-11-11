@@ -258,6 +258,20 @@ impl Terminal {
         self.version = self.version.wrapping_add(1);
     }
 
+    /// Plain text of the scrollback plus the current screen.
+    pub fn history_text(&self) -> String {
+        let mut out = String::new();
+        for row in &self.history {
+            out.push_str(&row.trimmed_text());
+            out.push('\n');
+        }
+        for row in &self.screen {
+            out.push_str(&row.trimmed_text());
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn snapshot(&self, scroll_offset: usize) -> Snapshot {
         let scroll_offset = if self.alt_screen {
             0

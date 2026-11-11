@@ -20,6 +20,7 @@ pub enum UiCommand {
     ToggleAi,
     OpenAiSettings,
     ToggleFtp,
+    ToggleAutomation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

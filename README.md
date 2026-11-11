@@ -172,6 +172,59 @@ The protocol bytes are hidden from the terminal, keyboard input is ignored while
 the transfer owns the stream, and cancelling the upload picker aborts the
 remote `rz`. Multi-file `sz`/`rz` batches are supported.
 
+### Terminal automation with Rhai
+
+Open **Automation** in the header. Scripts are plain `.rhai` files stored in
+`%APPDATA%\xcord\scripts` (or `$XDG_CONFIG_HOME/xcord/scripts`). The first
+launch creates `example.rhai`. Edit a script with **Edit script** (the system
+editor), save it, then press **Reload** and **Run script**.
+
+Scripts run on a dedicated thread, so waiting for output never blocks the UI.
+They target the active terminal tab.
+
+```rhai
+send_line("systemctl status nginx");
+
+let result = expect_any([
+    "password for",
+    "Active: active (running)",
+    "failed"
+], 15000);
+
+if result.pattern == "password for" {
+    fail("sudo password is required");
+}
+
+if result.pattern == "failed" {
+    fail("nginx failed to start");
+}
+
+log("nginx is running");
+```
+
+Available host functions:
+
+| Function | Description |
+|---|---|
+| `send(text)` | Send text without a newline |
+| `send_line(text)` | Send text followed by Enter |
+| `send_key("ctrl+c")` | Send Enter, Tab, Escape, Ctrl+C/D, or an arrow key |
+| `expect(pattern, timeout_ms)` | Wait for literal output, return a match map |
+| `expect_regex(pattern, timeout_ms)` | Wait for a regular expression |
+| `expect_any([patterns], timeout_ms)` | Wait for the first matching pattern |
+| `wait_idle(idle_ms, timeout_ms)` | Wait until output has been quiet |
+| `read_screen()` / `read_scrollback(lines)` | Read terminal text |
+| `sleep(ms)` / `log(message)` / `fail(message)` | Utilities |
+
+A match map has `pattern`, `text`, and `before` fields. `expect` only searches
+output produced after the last `send`/`send_line`, and timeouts include the
+recent terminal tail in the error.
+
+Rhai runs with `Engine::new_raw()`: no filesystem, network, process, or `eval`
+access is exposed. Scripts can still run arbitrary commands in the connected
+session, so only run scripts you trust. One script may run at a time per app;
+**Stop script** cancels the run without sending Ctrl+C to the remote command.
+
 ## Xshell: what we keep, what we fix
 
 | Xshell strength | Xcord |
