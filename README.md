@@ -451,12 +451,11 @@ docs/
 Xcord is a working foundation, not a finished Xshell replacement. The next
 increments are:
 
-- SFTP file browser and transfer queue
 - Local/remote/dynamic port forwarding, proxy jumps
 - Split panes and a session overview grid
-- IME composition in the terminal view (text inputs already use
-  `EntityInputHandler`; the terminal currently uses raw key events)
 - Search in scrollback, reflow on resize, sixel/kitty graphics
+- The inline automation editor is single-caret; use an external editor for
+  range selection or IME-heavy script comments
 - Per-call AI tool approval, persisted conversations, MCP streamable HTTP/SSE
 - Xshell `.xsh`/PuTTY import, encrypted workspace sync
 - Packaging and code signing

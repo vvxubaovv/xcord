@@ -5898,13 +5898,10 @@ impl XcordApp {
             .map(|script| script.path.clone())
             .unwrap_or_default();
         div()
-            .w(px(1560.))
-            .h(px(860.))
+            .w_full()
+            .h_full()
             .flex()
             .flex_col()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgbc(theme.border))
             .bg(rgbc(theme.panel))
             .child(
                 div()
