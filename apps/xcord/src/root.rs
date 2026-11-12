@@ -735,14 +735,11 @@ impl XcordApp {
         .detach();
         cx.spawn(async move |this, cx| loop {
             Timer::after(Duration::from_millis(80)).await;
-            let keep_running = this
-                .update(cx, |app, cx| {
-                    app.automation_tick(cx);
-                })
-                .is_ok();
-            if !keep_running {
-                break;
-            }
+            // A timer can fire while the entity is leased by another update.
+            // Retry on the next tick instead of stopping the pump forever.
+            let _ = this.update(cx, |app, cx| {
+                app.automation_tick(cx);
+            });
         })
         .detach();
 
@@ -844,6 +841,12 @@ impl XcordApp {
                 self.set_notice(level, message);
             }
             WorkspaceEvent::Dirty(id) => {
+                let automation_terminal = self.automation_run.as_ref().map(|run| run.terminal);
+                if automation_terminal == Some(id) {
+                    if let Some(text) = self.workspace.history_text(id) {
+                        self.automation.update_terminal(id, text);
+                    }
+                }
                 if self.base64_target == Some(id) && self.base64_capturing {
                     self.base64_last_output = Some(Instant::now());
                     self.schedule_base64_settle(id, 800, cx);
@@ -5176,6 +5179,7 @@ impl XcordApp {
         let AutomationEvent::Changed { run_id } = event;
         if self.automation_run_id == Some(run_id) {
             self.automation_run = self.automation.run_snapshot(run_id);
+            self.automation_tick(cx);
             if self.automation_open {
                 cx.notify();
             }

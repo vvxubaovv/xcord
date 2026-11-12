@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -147,6 +146,9 @@ struct HostCommand {
 struct SharedRun {
     text: String,
     baseline: usize,
+    /// Raw terminal text received since the last send.
+    stream: String,
+    stream_pos: usize,
     last_output: Instant,
     has_output: bool,
     cancelled: bool,
@@ -162,7 +164,7 @@ struct Run {
     name: String,
     terminal: TerminalId,
     shared: Arc<(Mutex<SharedRun>, Condvar)>,
-    rx: Mutex<Receiver<HostCommand>>,
+    commands: Arc<Mutex<Vec<HostCommand>>>,
 }
 
 impl Run {
@@ -296,6 +298,8 @@ impl AutomationState {
             Mutex::new(SharedRun {
                 text: String::new(),
                 baseline: 0,
+                stream: String::new(),
+                stream_pos: 0,
                 last_output: Instant::now(),
                 has_output: false,
                 cancelled: false,
@@ -306,21 +310,21 @@ impl AutomationState {
             }),
             Condvar::new(),
         ));
-        let (command_tx, command_rx) = mpsc::channel();
+        let commands = Arc::new(Mutex::new(Vec::new()));
         let run = Arc::new(Run {
             id: run_id,
             script_id: script_id.to_string(),
             name,
             terminal,
             shared: shared.clone(),
-            rx: Mutex::new(command_rx),
+            commands: commands.clone(),
         });
         self.runs.lock().unwrap().insert(run_id, run.clone());
 
         let host = Arc::new(HostApi {
             terminal,
             shared: shared.clone(),
-            commands: command_tx,
+            commands: commands.clone(),
             events: self.events.clone(),
             run_id,
         });
@@ -394,17 +398,12 @@ impl AutomationState {
             .cloned()
             .collect::<Vec<_>>();
         for run in runs {
-            let rx = run.rx.lock().unwrap();
-            loop {
-                match rx.try_recv() {
-                    Ok(command) => {
-                        let (lock, _) = &*run.shared;
-                        let cancelled = lock.lock().unwrap().cancelled;
-                        if !cancelled {
-                            self.workspace.write(command.terminal, &command.bytes);
-                        }
-                    }
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            let queued = std::mem::take(&mut *run.commands.lock().unwrap());
+            for command in queued {
+                let (lock, _) = &*run.shared;
+                let cancelled = lock.lock().unwrap().cancelled;
+                if !cancelled {
+                    self.workspace.write(command.terminal, &command.bytes);
                 }
             }
         }
@@ -427,7 +426,23 @@ impl AutomationState {
             if shared.status != RunStatus::Running {
                 continue;
             }
-            shared.has_output = text.len() > shared.baseline;
+            let previous_len = shared.text.len();
+            let delta = if text.len() >= previous_len && text.starts_with(&shared.text) {
+                text[previous_len..].to_string()
+            } else if text == shared.text {
+                String::new()
+            } else {
+                text.clone()
+            };
+            if !delta.is_empty() {
+                shared.stream.push_str(&delta);
+                if shared.stream.len() > 1_048_576 {
+                    let keep = shared.stream.len() - 1_048_576;
+                    shared.stream.drain(..keep);
+                    shared.stream_pos = shared.stream_pos.saturating_sub(keep);
+                }
+                shared.has_output = true;
+            }
             shared.text = text.clone();
             shared.last_output = Instant::now();
             condvar.notify_all();
@@ -461,7 +476,7 @@ struct HostApi {
     run_id: u64,
     terminal: TerminalId,
     shared: Arc<(Mutex<SharedRun>, Condvar)>,
-    commands: Sender<HostCommand>,
+    commands: Arc<Mutex<Vec<HostCommand>>>,
     events: broadcast::Sender<AutomationEvent>,
 }
 
@@ -508,14 +523,18 @@ impl HostApi {
         let (lock, _) = &*self.shared;
         let mut shared = lock.lock().unwrap();
         shared.baseline = shared.text.len();
+        shared.stream.clear();
+        shared.stream_pos = 0;
         shared.has_output = false;
         drop(shared);
-        self.commands
-            .send(HostCommand {
-                terminal: self.terminal,
-                bytes,
-            })
-            .map_err(|_| runtime_error("terminal is closed"))
+        self.commands.lock().unwrap().push(HostCommand {
+            terminal: self.terminal,
+            bytes,
+        });
+        let _ = self.events.send(AutomationEvent::Changed {
+            run_id: self.run_id,
+        });
+        Ok(())
     }
 
     fn send_line(&self, text: &str) -> std::result::Result<(), Box<EvalAltResult>> {
@@ -524,16 +543,20 @@ impl HostApi {
             let (lock, _) = &*self.shared;
             let mut shared = lock.lock().unwrap();
             shared.baseline = shared.text.len();
+            shared.stream.clear();
+            shared.stream_pos = 0;
             shared.has_output = false;
         }
         let mut bytes = text.as_bytes().to_vec();
         bytes.push(b'\r');
-        self.commands
-            .send(HostCommand {
-                terminal: self.terminal,
-                bytes,
-            })
-            .map_err(|_| runtime_error("terminal is closed"))
+        self.commands.lock().unwrap().push(HostCommand {
+            terminal: self.terminal,
+            bytes,
+        });
+        let _ = self.events.send(AutomationEvent::Changed {
+            run_id: self.run_id,
+        });
+        Ok(())
     }
 
     fn expect(
@@ -551,16 +574,14 @@ impl HostApi {
             if shared.cancelled || shared.status != RunStatus::Running {
                 return Err(runtime_error("script stopped"));
             }
-            let mut baseline = shared.baseline.min(shared.text.len());
-            if shared.text.len() < shared.baseline {
-                baseline = 0;
-            }
-            let haystack = shared.text[baseline..].to_string();
+            let baseline = shared.stream_pos.min(shared.stream.len());
+            let haystack = shared.stream[baseline..].to_string();
             if let Some((pattern, start, end, text)) = find_match(&haystack, &patterns, regex) {
                 let absolute_start = baseline + start;
                 let absolute_end = baseline + end;
-                shared.baseline = absolute_end;
-                let before = tail(&shared.text[..absolute_start], 2000);
+                shared.stream_pos = absolute_end;
+                shared.baseline = shared.text.len();
+                let before = tail(&shared.stream[..absolute_start], 2000);
                 let mut map = Map::new();
                 map.insert("pattern".into(), Dynamic::from(pattern));
                 map.insert("text".into(), Dynamic::from(text));
@@ -569,7 +590,7 @@ impl HostApi {
             }
             let now = Instant::now();
             if now >= deadline {
-                let tail_text = tail(&shared.text, 2000);
+                let tail_text = tail(&shared.stream, 2000);
                 return Err(runtime_error(format!(
                     "timeout waiting for {}; last output:\n{}",
                     patterns.join(" | "),
@@ -597,7 +618,8 @@ impl HostApi {
                 return Err(runtime_error("script stopped"));
             }
             if shared.has_output && shared.last_output.elapsed() >= idle {
-                let text = shared.text[shared.baseline.min(shared.text.len())..].to_string();
+                let text = shared.stream[shared.stream_pos.min(shared.stream.len())..].to_string();
+                shared.stream_pos = shared.stream.len();
                 shared.baseline = shared.text.len();
                 return Ok(text);
             }
@@ -845,6 +867,8 @@ mod tests {
             Mutex::new(SharedRun {
                 text: String::new(),
                 baseline: 0,
+                stream: String::new(),
+                stream_pos: 0,
                 last_output: Instant::now(),
                 has_output: false,
                 cancelled: false,
@@ -855,13 +879,13 @@ mod tests {
             }),
             Condvar::new(),
         ));
-        let (command_tx, command_rx) = mpsc::channel();
+        let commands = Arc::new(Mutex::new(Vec::new()));
         let (events, _) = broadcast::channel(16);
         let host = Arc::new(HostApi {
             run_id: 1,
             terminal: TerminalId::new(1),
             shared: shared.clone(),
-            commands: command_tx,
+            commands: commands.clone(),
             events,
         });
         let host_for_thread = host.clone();
@@ -879,14 +903,25 @@ mod tests {
             let ast = engine.compile(script).map_err(|error| error.to_string())?;
             engine.run_ast(&ast).map_err(|error| error.to_string())
         });
-        let command = command_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("send_line command");
-        assert_eq!(command.bytes, b"echo hi\r");
+        let mut command = None;
+        for _ in 0..40 {
+            if let Some(bytes) = commands
+                .lock()
+                .unwrap()
+                .first()
+                .map(|command| command.bytes.clone())
+            {
+                command = Some(bytes);
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(command.expect("send_line command"), b"echo hi\r");
         {
             let (lock, condvar) = &*shared;
             let mut state = lock.lock().unwrap();
             state.text = "echo hi\r\nhi\r\n".into();
+            state.stream = state.text.clone();
             state.has_output = true;
             state.last_output = Instant::now();
             condvar.notify_all();

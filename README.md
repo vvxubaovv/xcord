@@ -225,9 +225,10 @@ Available host functions:
 | `read_screen()` / `read_scrollback(lines)` | Read terminal text |
 | `sleep(ms)` / `log(message)` / `fail(message)` | Utilities |
 
-A match map has `pattern`, `text`, and `before` fields. `expect` only searches
-output produced after the last `send`/`send_line`, and timeouts include the
-recent terminal tail in the error.
+A match map has `pattern`, `text`, and `before` fields. `expect` searches a
+per-run output stream that is reset immediately before `send`/`send_line` queues
+the command, so listener setup happens before the command reaches the terminal.
+Timeouts include the recent stream tail in the error.
 
 Rhai runs with `Engine::new_raw()`: no filesystem, network, process, or `eval`
 access is exposed. Scripts can still run arbitrary commands in the connected
