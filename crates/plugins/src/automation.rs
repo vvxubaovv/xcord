@@ -17,7 +17,8 @@ use tokio::sync::broadcast;
 use xcord_cordis::{Context, Plugin, PluginMeta, Result};
 use xcord_plugin_api::{
     services, Automation, AutomationEvent, AutomationService, Command, Commands, I18n, RunStatus,
-    ScriptInfo, ScriptLog, ScriptLogLevel, ScriptRunSnapshot, TerminalId, Ui, UiCommand, Workspace,
+    ScriptDiagnostic, ScriptInfo, ScriptLog, ScriptLogLevel, ScriptRunSnapshot, TerminalId, Ui,
+    UiCommand, Workspace,
 };
 
 const SAMPLE: &str = r#"// Xcord Rhai automation example
@@ -104,6 +105,9 @@ impl AutomationService for RcAutomation {
     }
     fn script_source(&self, id: &str) -> Option<String> {
         self.0.script_source(id)
+    }
+    fn validate(&self, source: &str) -> Option<ScriptDiagnostic> {
+        self.0.validate(source)
     }
     fn create_script(&self, name: &str) -> std::result::Result<ScriptInfo, String> {
         self.0.create_script(name)
@@ -234,6 +238,22 @@ impl AutomationState {
     fn script_source(&self, id: &str) -> Option<String> {
         let path = self.script_path(id)?;
         std::fs::read_to_string(path).ok()
+    }
+
+    fn validate(&self, source: &str) -> Option<ScriptDiagnostic> {
+        let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+        let engine = Engine::new_raw();
+        match engine.compile(source) {
+            Ok(_) => None,
+            Err(error) => {
+                let position = error.position();
+                Some(ScriptDiagnostic {
+                    line: position.line().unwrap_or(1),
+                    column: position.position().unwrap_or(1),
+                    message: error.to_string(),
+                })
+            }
+        }
     }
 
     fn create_script(&self, name: &str) -> std::result::Result<ScriptInfo, String> {

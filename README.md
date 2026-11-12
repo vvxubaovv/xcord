@@ -180,13 +180,19 @@ the larger editor. Scripts are plain `.rhai` files stored in
 `%APPDATA%\xcord\scripts` (or `$XDG_CONFIG_HOME/xcord/scripts`). The first
 launch creates `example.rhai`.
 
-The panel contains an inline multiline editor. Use **Save** / `Ctrl+S`,
-**Reload**, or open the file in **VS Code**, **Zed**, **Notepad**, or a custom
-program. A custom editor can be picked with **Choose…**. **Run script** saves
-the current editor buffer first. While a run is active, the current Rhai line
-is highlighted with `▶` and the header shows the line number. **Stop script**
-cancels the run without sending Ctrl+C to the remote command. The log pane is
-selectable, so text can be dragged and copied with `Ctrl+C`.
+The panel contains an inline multiline editor with mouse caret placement,
+drag selection, double-click word selection, clipboard shortcuts and undo/redo.
+Use **Save** / `Ctrl+S`, **Reload**, or open the file in **VS Code**, **Zed**,
+**Notepad**, or a custom program. A custom editor can be picked with
+**Choose…**. **Run script** saves the current editor buffer first. While a run
+is active, the current Rhai line is highlighted with `▶` and the header shows
+the line number. **Stop script** cancels the run without sending Ctrl+C to the
+remote command. The log pane is selectable, so text can be dragged and copied
+with `Ctrl+C`.
+
+The panel includes a **Syntax help** cheat sheet. Rhai syntax is checked while
+editing; errors show the line/column and mark the source line in red. **Run
+script** refuses to start while the current buffer has a syntax error.
 
 Scripts run on a dedicated thread, so waiting for output never blocks the UI.
 They target the active terminal tab.

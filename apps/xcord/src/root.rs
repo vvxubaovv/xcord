@@ -23,9 +23,9 @@ use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
 use xcord_plugin_api::{
     services, Ai, AiMessageView, AiSnapshot, Automation, AutomationEvent, Command, Commands,
     ConnectionTest, Ftp, FtpEntry, FtpEvent, FtpSnapshot, Highlights, I18n, McpStatus, NoticeLevel,
-    OpenRequest, RunStatus, Runtime, ScriptInfo, ScriptLogLevel, ScriptRunSnapshot, Sessions,
-    TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand, UiHost, Workspace,
-    WorkspaceEvent,
+    OpenRequest, RunStatus, Runtime, ScriptDiagnostic, ScriptInfo, ScriptLogLevel,
+    ScriptRunSnapshot, Sessions, TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand,
+    UiHost, Workspace, WorkspaceEvent,
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings, Snippet};
 
@@ -285,6 +285,9 @@ pub struct XcordApp {
     automation_editor: Option<Entity<ScriptEditor>>,
     automation_log: Option<Entity<SelectableText>>,
     automation_log_owner: Rc<Cell<Option<usize>>>,
+    automation_diagnostic: Option<ScriptDiagnostic>,
+    automation_editor_revision: u64,
+    automation_help_open: bool,
 
     ftp_open: bool,
     ftp_profile: Option<String>,
@@ -496,6 +499,9 @@ impl XcordApp {
             automation_editor: None,
             automation_log: None,
             automation_log_owner: Rc::new(Cell::new(None)),
+            automation_diagnostic: None,
+            automation_editor_revision: 0,
+            automation_help_open: true,
 
             ftp_open: false,
             ftp_profile: None,
@@ -4870,6 +4876,7 @@ impl XcordApp {
                     rgbc(theme.foreground).into(),
                     rgbc(theme.muted).into(),
                     rgbc(theme.accent).into(),
+                    rgbc(theme.danger).into(),
                     cx,
                 )
             }));
@@ -4878,6 +4885,8 @@ impl XcordApp {
         if let Some(editor) = self.automation_editor.clone() {
             editor.update(cx, |editor, cx| editor.set_value(source, cx));
         }
+        self.automation_editor_revision = 0;
+        self.validate_automation_editor(cx);
     }
 
     fn refresh_automation_scripts(&mut self, cx: &mut Context<Self>) {
@@ -4899,6 +4908,108 @@ impl XcordApp {
         self.reload_automation_source(cx);
     }
 
+    fn validate_automation_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.automation_editor.clone() else {
+            self.automation_diagnostic = None;
+            return;
+        };
+        let revision = editor.read(cx).revision();
+        if revision == self.automation_editor_revision {
+            return;
+        }
+        let source = editor.read(cx).value().to_string();
+        let diagnostic = self.automation.validate(&source);
+        let line = diagnostic.as_ref().map(|diagnostic| diagnostic.line);
+        editor.update(cx, |editor, cx| editor.set_error_line(line, cx));
+        self.automation_diagnostic = diagnostic;
+        self.automation_editor_revision = revision;
+        cx.notify();
+    }
+
+    fn automation_diagnostic_text(&self) -> Option<String> {
+        self.automation_diagnostic.as_ref().map(|diagnostic| {
+            format!(
+                "{} {} {}, {} {}: {}",
+                self.tr("Syntax error"),
+                self.tr("Line"),
+                diagnostic.line,
+                self.tr("Column"),
+                diagnostic.column,
+                diagnostic.message
+            )
+        })
+    }
+
+    fn render_automation_help(&self, compact: bool) -> impl IntoElement {
+        let theme = self.theme();
+        let size = if compact { 9.5 } else { 10.5 };
+        let mut help = div()
+            .id("automation-help")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .bg(rgbc(theme.panel))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .text_size(px(size))
+            .font_family("Consolas");
+        let lines = [
+            ("send(text)", "发送文本，不回车"),
+            ("send_line(text)", "发送文本并回车"),
+            ("send_key(key)", "enter/tab/escape/ctrl+c/up…"),
+            ("expect(pattern, ms)", "等待文本，返回 pattern/text/before"),
+            ("expect_regex(pattern, ms)", "正则等待"),
+            ("expect_any([..], ms)", "等待任意一个模式"),
+            ("wait_idle(idle_ms, timeout)", "等待输出静止"),
+            ("read_screen() / read_scrollback(n)", "读取终端文本"),
+            ("sleep(ms) / log(msg) / fail(msg)", "工具函数"),
+        ];
+        for (signature, description) in lines {
+            help = help.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(if compact { 168. } else { 205. }))
+                            .flex_shrink_0()
+                            .text_color(rgbc(theme.accent))
+                            .child(signature),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_color(rgbc(theme.muted))
+                            .child(description),
+                    ),
+            );
+        }
+        help.child(div().h(px(1.)).bg(rgbc(theme.border)).my_1())
+            .child(
+                div()
+                    .text_color(rgbc(theme.muted))
+                    .child("let m = expect_any([\"ok\", \"failed\"], 5000);"),
+            )
+            .child(
+                div()
+                    .text_color(rgbc(theme.muted))
+                    .child("if m.pattern == \"ok\" { log(\"done\"); }"),
+            )
+            .child(
+                div()
+                    .text_color(rgbc(theme.muted))
+                    .child("// 监听从 send/send_line 之前开始"),
+            )
+            .child(
+                div()
+                    .text_color(rgbc(theme.muted))
+                    .child("// expect 只匹配本次发送后的新输出"),
+            )
+    }
+
     fn reload_automation_source(&mut self, cx: &mut Context<Self>) {
         self.automation_source = self
             .automation_selected
@@ -4909,6 +5020,9 @@ impl XcordApp {
         if let Some(editor) = self.automation_editor.clone() {
             editor.update(cx, |editor, cx| editor.set_value(source, cx));
         }
+        self.automation_editor_revision = 0;
+        self.automation_diagnostic = None;
+        self.validate_automation_editor(cx);
         cx.notify();
     }
 
@@ -4922,6 +5036,10 @@ impl XcordApp {
             return;
         };
         let source = editor.read(cx).value().to_string();
+        let diagnostic = self.automation.validate(&source);
+        let line = diagnostic.as_ref().map(|diagnostic| diagnostic.line);
+        editor.update(cx, |editor, cx| editor.set_error_line(line, cx));
+        self.automation_diagnostic = diagnostic;
         match std::fs::write(&script.path, &source) {
             Ok(()) => {
                 self.automation_source = source;
@@ -5000,11 +5118,18 @@ impl XcordApp {
         };
         #[cfg(target_os = "windows")]
         {
-            let mut command = if matches!(program, "code" | "zed") {
+            let lower = program.to_ascii_lowercase();
+            let through_cmd = lower == "code"
+                || lower == "zed"
+                || lower.ends_with(".cmd")
+                || lower.ends_with(".bat");
+            let mut command = if through_cmd {
                 let mut command = std::process::Command::new("cmd.exe");
-                command
-                    .arg("/C")
-                    .arg(format!("{program} \"{}\"", path.replace('"', "\"")));
+                command.arg("/C").arg(program);
+                if lower == "code" {
+                    command.arg("--reuse-window");
+                }
+                command.arg(path);
                 command
             } else {
                 let mut command = std::process::Command::new(program);
@@ -5114,6 +5239,19 @@ impl XcordApp {
     fn start_automation(&mut self, cx: &mut Context<Self>) {
         if self.automation_editor.is_some() {
             self.save_automation_source(cx);
+        }
+        if let Some(diagnostic) = self.automation_diagnostic.as_ref() {
+            self.automation_error = Some(format!(
+                "{} {} {}, {} {}: {}",
+                self.tr("Syntax error"),
+                self.tr("Line"),
+                diagnostic.line,
+                self.tr("Column"),
+                diagnostic.column,
+                diagnostic.message
+            ));
+            cx.notify();
+            return;
         }
         let Some(id) = self.automation_selected.clone() else {
             self.automation_error = Some(self.tr("Select a script first."));
@@ -5502,6 +5640,7 @@ impl XcordApp {
     }
 
     fn render_automation_panel(&mut self, cx: &mut Context<Self>) -> Div {
+        self.validate_automation_editor(cx);
         self.ensure_automation_log(cx);
         let theme = self.theme();
         let selected = self.automation_selected_script();
@@ -5707,6 +5846,60 @@ impl XcordApp {
                                 .text_color(rgbc(theme.danger))
                                 .child(error),
                         )
+                    })
+                    .when_some(self.automation_diagnostic_text(), |panel, error| {
+                        panel.child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(rgbc(theme.danger))
+                                .child(error),
+                        )
+                    })
+                    .when(
+                        self.automation_diagnostic.is_none() && self.automation_editor.is_some(),
+                        |panel| {
+                            panel.child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(rgbc(theme.success))
+                                    .child(self.tr("Syntax check passed")),
+                            )
+                        },
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgbc(theme.muted))
+                                    .child(self.tr("Syntax help")),
+                            )
+                            .child(div().flex_1())
+                            .child(self.tiny_text_button(
+                                if self.automation_help_open {
+                                    self.tr("Hide")
+                                } else {
+                                    self.tr("Show")
+                                },
+                                cx,
+                                |this, cx| {
+                                    this.automation_help_open = !this.automation_help_open;
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .when(self.automation_help_open, |panel| {
+                        panel.child(
+                            div()
+                                .id("automation-panel-help-scroll")
+                                .max_h(px(190.))
+                                .overflow_y_scroll()
+                                .child(self.render_automation_help(true)),
+                        )
                     }),
             )
             .child(
@@ -5810,6 +6003,7 @@ impl XcordApp {
     }
 
     fn render_automation(&mut self, cx: &mut Context<Self>) -> Div {
+        self.validate_automation_editor(cx);
         self.ensure_automation_log(cx);
         let theme = self.theme();
         let editor_entity = self.automation_editor.clone();
@@ -6119,6 +6313,26 @@ impl XcordApp {
                                         .child(error),
                                 )
                             })
+                            .when_some(self.automation_diagnostic_text(), |panel, error| {
+                                panel.child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(rgbc(theme.danger))
+                                        .child(error),
+                                )
+                            })
+                            .when(
+                                self.automation_diagnostic.is_none()
+                                    && self.automation_editor.is_some(),
+                                |panel| {
+                                    panel.child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(rgbc(theme.success))
+                                            .child(self.tr("Syntax check passed")),
+                                    )
+                                },
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -6179,6 +6393,23 @@ impl XcordApp {
                                     } else {
                                         div()
                                     }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgbc(theme.muted))
+                                    .child(self.tr("Syntax help")),
+                            )
+                            .child(
+                                div()
+                                    .id("automation-fullscreen-help")
+                                    .h(px(180.))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgbc(theme.border))
+                                    .overflow_y_scroll()
+                                    .child(self.render_automation_help(false)),
                             ),
                     ),
             )

@@ -36,8 +36,8 @@ pub mod workspace;
 
 pub use ai::{Ai, AiAssistant, AiMessageView, AiSnapshot};
 pub use automation::{
-    Automation, AutomationEvent, AutomationService, RunStatus, ScriptInfo, ScriptLog,
-    ScriptLogLevel, ScriptRunSnapshot,
+    Automation, AutomationEvent, AutomationService, RunStatus, ScriptDiagnostic, ScriptInfo,
+    ScriptLog, ScriptLogLevel, ScriptRunSnapshot,
 };
 pub use commands::{Command, CommandRegistry, Commands};
 pub use ftp::{Ftp, FtpEntry, FtpEvent, FtpService, FtpSnapshot};

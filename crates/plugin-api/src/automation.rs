@@ -48,6 +48,13 @@ pub struct ScriptRunSnapshot {
 }
 
 #[derive(Clone, Debug)]
+pub struct ScriptDiagnostic {
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+}
+
+#[derive(Clone, Debug)]
 pub enum AutomationEvent {
     Changed { run_id: u64 },
 }
@@ -55,6 +62,7 @@ pub enum AutomationEvent {
 pub trait AutomationService {
     fn scripts(&self) -> Vec<ScriptInfo>;
     fn script_source(&self, id: &str) -> Option<String>;
+    fn validate(&self, source: &str) -> Option<ScriptDiagnostic>;
     fn create_script(&self, name: &str) -> Result<ScriptInfo, String>;
     fn scripts_dir(&self) -> String;
     fn run(&self, script_id: &str, terminal: TerminalId) -> Result<ScriptRunSnapshot, String>;
