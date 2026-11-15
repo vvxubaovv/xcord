@@ -415,6 +415,33 @@ There is also an end-to-end SSH probe that speaks to a public test server:
 cargo run -p xcord-ssh --example probe
 ```
 
+### Plugin development
+
+Xcord features are Rust plugins registered in `crates/plugins/src/lib.rs`.
+Start with the complete guide:
+
+- **`docs/plugin-development.md`** — kernel lifecycle, services, effects,
+  threading, tests and failure modes.
+- **`docs/plugin-development/service-reference.md`** — exact service contracts.
+- **`docs/plugin-development/ui-integration.md`** — side panel/modal/header
+  integration in the GPUI shell.
+- **`docs/plugin-development/templates.md`** — copy-paste plugin skeletons.
+- **`docs/plugin-development/checklist.md`** — final verification gate.
+
+An AI-facing project skill is included at
+**`.agents/skills/xcord-plugin-development/SKILL.md`**. It is named
+`xcord-plugin-development`; after restarting the session, an agent can load it
+with the `skill` tool before adding a plugin.
+
+Definition of done for a plugin:
+
+```bash
+cargo fmt --all
+cargo check --workspace
+cargo test --workspace
+cargo build -p xcord
+```
+
 ## Project layout
 
 ```
@@ -429,10 +456,18 @@ apps/
   xcord/        GPUI shell: sidebar, tabs, terminal canvas, AI panel, dialogs
   xcord-mcp/    stdio ↔ localhost MCP bridge
 docs/
+  plugin-development.md
+  plugin-development/
+    service-reference.md
+    ui-integration.md
+    templates.md
+    checklist.md
   terminal.png
   ai.png
   ai-settings.png
   settings-language.png
+.agents/
+  skills/xcord-plugin-development/SKILL.md
 ```
 
 ## Security notes
