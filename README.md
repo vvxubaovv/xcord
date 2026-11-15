@@ -74,10 +74,13 @@ guide, the threading model, and the session-open sequence.
   left**, **Create group**, and **Join group** (including *Ungrouped*).
   Right-click a group chip to close the group; double-click a tab or a group
   chip to close it directly.
-- **Quick commands**: the compose bar has a **Quick commands** page with
-  search, create, edit and delete. Clicking a saved
-  command inserts it into the command bar (double-click in the list works too).
-  Commands support `\n`, `\r`, `\t`, `\e`, `\xNN`, `\u{...}` and `\\` escapes.
+- **Quick command bar**: a Xshell-style button row sits between the terminal and
+  the compose bar. Click a command button to send it immediately, or click a
+  green script button to run the bound automation script (the script panel opens
+  with live status, current line and logs). **New** opens the editor for a new
+  button; **Manage** / right-click edits existing buttons. A button can bind to a
+  shell command or an automation script. Commands support `\n`, `\r`, `\t`,
+  `\e`, `\xNN`, `\u{...}` and `\\` escapes.
 - **Base64 file send**: **Base64 send** in the compose bar opens a dialog to pick a
   local file, a remote temporary directory (default `/tmp`) and the destination
   file. Large files show a time warning. The file is Base64-streamed through the
@@ -110,8 +113,8 @@ guide, the threading model, and the session-open sequence.
   auth without opening a tab. Duplicating a session creates a new profile with a
   unique auto-numbered name. Double-click a session (or use right-click →
   **Connect**) to open another independent terminal tab for the same profile.
-- **Compose bar + snippets**: send a line without touching the shell prompt;
-  one-click snippets.
+- **Compose bar**: send a line without touching the shell prompt; quick buttons
+  can send saved commands or run automation scripts.
 - **Command palette**: every plugin can contribute commands; `Ctrl+Shift+P`.
 - **Output highlighting**: regex rules with foreground/background colors,
   shipped with error/warning defaults.

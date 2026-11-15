@@ -156,6 +156,14 @@ impl SessionProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnippetAction {
+    #[default]
+    Command,
+    Script,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snippet {
     pub id: String,
@@ -163,6 +171,10 @@ pub struct Snippet {
     pub command: String,
     #[serde(default = "default_true")]
     pub send_enter: bool,
+    #[serde(default)]
+    pub action: SnippetAction,
+    #[serde(default)]
+    pub script_id: String,
 }
 
 fn default_true() -> bool {
@@ -176,6 +188,8 @@ impl Snippet {
             name: name.into(),
             command: command.into(),
             send_enter: true,
+            action: SnippetAction::Command,
+            script_id: String::new(),
         }
     }
 }
@@ -765,6 +779,31 @@ mod tests {
         assert!(!store.warnings().is_empty());
         assert!(paths.config_file.with_extension("toml.corrupt").exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snippet_script_action_roundtrip_and_backcompat() {
+        let mut snippet = Snippet::new("deploy", "");
+        snippet.action = SnippetAction::Script;
+        snippet.script_id = "deploy".into();
+        let config = WorkspaceConfig {
+            snippets: vec![snippet],
+            ..WorkspaceConfig::default()
+        };
+        let text = toml::to_string(&config).unwrap();
+        let parsed: WorkspaceConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.snippets[0].action, SnippetAction::Script);
+        assert_eq!(parsed.snippets[0].script_id, "deploy");
+
+        let old = r#"
+[[snippets]]
+id = "legacy"
+name = "List files"
+command = "ls -lah"
+"#;
+        let legacy: WorkspaceConfig = toml::from_str(old).unwrap();
+        assert_eq!(legacy.snippets[0].action, SnippetAction::Command);
+        assert!(legacy.snippets[0].script_id.is_empty());
     }
 
     #[test]

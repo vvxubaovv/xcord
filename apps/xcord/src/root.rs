@@ -27,7 +27,7 @@ use xcord_plugin_api::{
     ScriptRunSnapshot, Sessions, TabInfo, TabStatus, TerminalId, Theme, Themes, Ui, UiCommand,
     UiHost, Workspace, WorkspaceEvent,
 };
-use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings, Snippet};
+use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings, Snippet, SnippetAction};
 
 use crate::script_editor::ScriptEditor;
 use crate::selectable_text::SelectableText;
@@ -271,6 +271,8 @@ pub struct XcordApp {
     quick_name: Entity<TextInput>,
     quick_command: Entity<TextInput>,
     quick_editing: Option<String>,
+    quick_action: SnippetAction,
+    quick_script: Option<String>,
     quick_error: Option<String>,
 
     automation: Automation,
@@ -486,6 +488,8 @@ impl XcordApp {
             quick_name,
             quick_command,
             quick_editing: None,
+            quick_action: SnippetAction::Command,
+            quick_script: None,
             quick_error: None,
             automation,
             automation_open: false,
@@ -6799,6 +6803,8 @@ impl XcordApp {
     fn open_quick_commands(&mut self, cx: &mut Context<Self>) {
         self.quick_commands_open = true;
         self.quick_editing = None;
+        self.quick_action = SnippetAction::Command;
+        self.quick_script = None;
         self.quick_error = None;
         self.quick_name.update(cx, |input, cx| input.clear(cx));
         self.quick_command.update(cx, |input, cx| input.clear(cx));
@@ -6808,6 +6814,8 @@ impl XcordApp {
 
     fn load_quick_command(&mut self, snippet: Snippet, cx: &mut Context<Self>) {
         self.quick_editing = Some(snippet.id.clone());
+        self.quick_action = snippet.action;
+        self.quick_script = (!snippet.script_id.is_empty()).then(|| snippet.script_id.clone());
         self.quick_error = None;
         let display_name = self.snippet_label(&snippet.name);
         self.quick_name
@@ -6819,6 +6827,8 @@ impl XcordApp {
 
     fn new_quick_command(&mut self, cx: &mut Context<Self>) {
         self.quick_editing = None;
+        self.quick_action = SnippetAction::Command;
+        self.quick_script = None;
         self.quick_error = None;
         self.quick_name.update(cx, |input, cx| input.clear(cx));
         self.quick_command.update(cx, |input, cx| input.clear(cx));
@@ -6833,10 +6843,28 @@ impl XcordApp {
             cx.notify();
             return;
         }
-        if command.trim().is_empty() {
+        let script_id = self.quick_script.clone().unwrap_or_default();
+        if self.quick_action == SnippetAction::Command && command.trim().is_empty() {
             self.quick_error = Some(self.tr("Quick command cannot be empty."));
             cx.notify();
             return;
+        }
+        if self.quick_action == SnippetAction::Script {
+            if script_id.is_empty() {
+                self.quick_error = Some(self.tr("Select an automation script."));
+                cx.notify();
+                return;
+            }
+            if !self
+                .automation
+                .scripts()
+                .iter()
+                .any(|script| script.id == script_id)
+            {
+                self.quick_error = Some(self.tr("Automation script not found."));
+                cx.notify();
+                return;
+            }
         }
         let mut snippet = self
             .quick_editing
@@ -6850,7 +6878,13 @@ impl XcordApp {
             .unwrap_or_else(|| Snippet::new(name.clone(), command.clone()));
         snippet.name = name;
         snippet.command = command;
-        snippet.send_enter = true;
+        snippet.action = self.quick_action;
+        snippet.script_id = if self.quick_action == SnippetAction::Script {
+            script_id
+        } else {
+            String::new()
+        };
+        snippet.send_enter = self.quick_action == SnippetAction::Command;
         if let Err(error) = self.sessions.save_snippet(snippet.clone()) {
             self.quick_error = Some(error);
             cx.notify();
@@ -6894,9 +6928,281 @@ impl XcordApp {
         cx.notify();
     }
 
+    fn execute_quick_command(&mut self, snippet: Snippet, cx: &mut Context<Self>) {
+        self.quick_commands_open = false;
+        if snippet.action == SnippetAction::Script {
+            self.run_automation_from_quick(&snippet.script_id, cx);
+            return;
+        }
+        let Some(id) = self.active else {
+            self.set_notice(NoticeLevel::Warning, self.tr("Open a terminal tab first."));
+            cx.notify();
+            return;
+        };
+        let decoded = decode_quick_command(&snippet.command);
+        if decoded.is_empty() {
+            self.set_notice(
+                NoticeLevel::Warning,
+                self.tr("Quick command cannot be empty."),
+            );
+            cx.notify();
+            return;
+        }
+        self.workspace.write(id, decoded.as_bytes());
+        if snippet.send_enter {
+            self.workspace.write(id, b"\r");
+        }
+        self.pending_focus = Some(PendingFocus::Terminal);
+        cx.notify();
+    }
+
+    fn run_automation_from_quick(&mut self, script_id: &str, cx: &mut Context<Self>) {
+        let Some(tab) = self.active else {
+            self.set_notice(NoticeLevel::Warning, self.tr("Open a terminal tab first."));
+            cx.notify();
+            return;
+        };
+        let Some(script) = self
+            .automation
+            .scripts()
+            .into_iter()
+            .find(|script| script.id == script_id)
+        else {
+            self.set_notice(
+                NoticeLevel::Warning,
+                self.tr("Automation script not found."),
+            );
+            cx.notify();
+            return;
+        };
+        let Some(source) = self.automation.script_source(&script.id) else {
+            self.set_notice(
+                NoticeLevel::Warning,
+                self.tr("Automation script not found."),
+            );
+            cx.notify();
+            return;
+        };
+
+        self.automation_open = true;
+        self.automation_fullscreen = false;
+        self.automation_scripts = self.automation.scripts();
+        self.automation_selected = Some(script.id.clone());
+        self.automation_source = source.clone();
+        self.ensure_automation_editor(cx);
+        self.automation_editor_revision = 0;
+        self.automation_diagnostic = self.automation.validate(&source);
+        if let Some(editor) = self.automation_editor.clone() {
+            let line = self
+                .automation_diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.line);
+            editor.update(cx, |editor, cx| editor.set_error_line(line, cx));
+        }
+        if let Some(diagnostic) = self.automation_diagnostic.as_ref() {
+            self.automation_error = Some(format!(
+                "{} {} {}, {} {}: {}",
+                self.tr("Syntax error"),
+                self.tr("Line"),
+                diagnostic.line,
+                self.tr("Column"),
+                diagnostic.column,
+                diagnostic.message
+            ));
+            self.set_notice(
+                NoticeLevel::Error,
+                self.tr("Fix the syntax error before running."),
+            );
+            cx.notify();
+            return;
+        }
+
+        match self.automation.run(&script.id, tab) {
+            Ok(run) => {
+                self.automation_run_id = Some(run.run_id);
+                self.automation_run = Some(run);
+                self.automation_error = None;
+                self.automation_tick(cx);
+            }
+            Err(error) => {
+                self.automation_error = Some(error.clone());
+                self.set_notice(NoticeLevel::Error, error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_quick_command_bar(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let snippets = self.sessions.snippets();
+        let scripts = self.automation.scripts();
+        let mut buttons = div()
+            .id("quick-command-buttons")
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_x_scroll();
+        if snippets.is_empty() {
+            buttons = buttons.child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("No quick buttons yet.")),
+            );
+        }
+        for snippet in snippets {
+            let is_script = snippet.action == SnippetAction::Script;
+            let label = self.snippet_label(&snippet.name);
+            let label = if is_script {
+                let script = scripts
+                    .iter()
+                    .find(|script| script.id == snippet.script_id)
+                    .map(|script| script.name.clone())
+                    .unwrap_or_else(|| self.tr("Missing script"));
+                format!("▶ {label} · {script}")
+            } else {
+                format!("$ {label}")
+            };
+            let color = if is_script {
+                theme.success
+            } else {
+                theme.accent
+            };
+            let click_snippet = snippet.clone();
+            let edit_snippet = snippet.clone();
+            let id = SharedString::from(format!("quick-button-{}", snippet.id));
+            buttons = buttons.child(
+                div()
+                    .id(id)
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgbc(if is_script { color } else { theme.border }))
+                    .bg(if is_script {
+                        rgba(color, 0.10)
+                    } else {
+                        rgba(theme.panel_alt, 0.0)
+                    })
+                    .text_size(px(9.5))
+                    .text_color(rgbc(if is_script { color } else { theme.foreground }))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.execute_quick_command(click_snippet.clone(), cx);
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.quick_commands_open = true;
+                            this.load_quick_command(edit_snippet.clone(), cx);
+                        }),
+                    )
+                    .child(label),
+            );
+        }
+        buttons = buttons.child(
+            div()
+                .id("quick-new-button")
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgbc(theme.accent))
+                .text_size(px(9.5))
+                .text_color(rgbc(theme.accent))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.new_quick_button(cx)),
+                )
+                .child(format!("＋ {}", self.tr("New"))),
+        );
+        div()
+            .h(px(38.))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(rgbc(theme.panel_alt))
+            .border_t_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.muted))
+                    .flex_shrink_0()
+                    .child(self.tr("Quick bar")),
+            )
+            .child(buttons)
+            .child(div().flex().items_center().gap_1().flex_shrink_0().child(
+                self.tiny_text_button(self.tr("Manage"), cx, |this, cx| {
+                    this.open_quick_commands(cx)
+                }),
+            ))
+    }
+
+    fn new_quick_button(&mut self, cx: &mut Context<Self>) {
+        self.open_quick_commands(cx);
+        self.new_quick_command(cx);
+    }
+
+    fn quick_action_button(
+        &self,
+        label: impl Into<SharedString>,
+        action: SnippetAction,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.theme();
+        let selected = self.quick_action == action;
+        div()
+            .id(SharedString::from(format!("quick-action-{action:?}")))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(if selected {
+                rgbc(theme.accent)
+            } else {
+                rgbc(theme.border)
+            })
+            .bg(if selected {
+                rgba(theme.accent, 0.12)
+            } else {
+                rgba(theme.panel_alt, 0.0)
+            })
+            .text_size(px(10.))
+            .text_color(if selected {
+                rgbc(theme.accent)
+            } else {
+                rgbc(theme.muted)
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(rgbc(theme.panel_alt)))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.quick_action = action;
+                    if action == SnippetAction::Command && this.quick_script.is_some() {
+                        this.quick_command.update(cx, |input, cx| input.clear(cx));
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(label.into())
+    }
+
     fn render_quick_commands(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let query = self.quick_search.read(cx).value().to_lowercase();
+        let scripts = self.automation.scripts();
         let snippets = self
             .sessions
             .snippets()
@@ -6905,6 +7211,7 @@ impl XcordApp {
                 query.is_empty()
                     || snippet.name.to_lowercase().contains(&query)
                     || snippet.command.to_lowercase().contains(&query)
+                    || snippet.script_id.to_lowercase().contains(&query)
             })
             .collect::<Vec<_>>();
         let mut list = div()
@@ -6926,7 +7233,17 @@ impl XcordApp {
         }
         for snippet in snippets {
             let selected = self.quick_editing.as_deref() == Some(snippet.id.as_str());
-            let command = snippet.command.clone();
+            let is_script = snippet.action == SnippetAction::Script;
+            let detail = if is_script {
+                let name = scripts
+                    .iter()
+                    .find(|script| script.id == snippet.script_id)
+                    .map(|script| script.name.clone())
+                    .unwrap_or_else(|| self.tr("Missing script"));
+                format!("▶ {name}")
+            } else {
+                snippet.command.clone()
+            };
             let row_snippet = snippet.clone();
             list = list.child(
                 div()
@@ -6952,7 +7269,7 @@ impl XcordApp {
                         cx.listener(move |this, event: &MouseUpEvent, _, cx| {
                             this.load_quick_command(row_snippet.clone(), cx);
                             if event.click_count >= 2 {
-                                this.insert_quick_command(&command, cx);
+                                this.execute_quick_command(row_snippet.clone(), cx);
                             }
                         }),
                     )
@@ -6967,10 +7284,14 @@ impl XcordApp {
                     .child(
                         div()
                             .text_size(px(9.5))
-                            .text_color(rgbc(theme.muted))
+                            .text_color(rgbc(if is_script {
+                                theme.success
+                            } else {
+                                theme.muted
+                            }))
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(snippet.command.clone()),
+                            .child(detail),
                     ),
             );
         }
@@ -6982,18 +7303,20 @@ impl XcordApp {
             .flex()
             .items_center()
             .gap_2()
-            .flex_shrink_0()
-            .child(primary_button(self.tr("Insert"), theme).on_mouse_up(
+            .flex_shrink_0();
+        if self.quick_action == SnippetAction::Command {
+            actions = actions.child(primary_button(self.tr("Insert"), theme).on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     let command = this.quick_command.read(cx).value().to_string();
                     this.insert_quick_command(&command, cx);
                 }),
-            ))
-            .child(secondary_button(self.tr("Save"), theme).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.save_quick_command(cx)),
             ));
+        }
+        actions = actions.child(secondary_button(self.tr("Save"), theme).on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| this.save_quick_command(cx)),
+        ));
         if editing {
             actions = actions.child(small_button(self.tr("Delete"), theme).on_mouse_up(
                 MouseButton::Left,
@@ -7100,27 +7423,137 @@ impl XcordApp {
                                     .border_color(rgbc(theme.border))
                                     .child(self.quick_name.clone()),
                             )
-                            .child(self.tr("Command"))
+                            .child(self.tr("Action"))
                             .child(
                                 div()
-                                    .h(px(32.))
-                                    .px_2()
                                     .flex()
                                     .items_center()
-                                    .rounded_md()
-                                    .bg(rgbc(theme.panel_alt))
-                                    .border_1()
-                                    .border_color(rgbc(theme.border))
-                                    .child(self.quick_command.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgbc(theme.muted))
-                                    .child(self.tr(
-                                        "Escapes: \\n newline, \\t tab, \\e ESC, \\xNN byte, \\\\ backslash",
+                                    .gap_1()
+                                    .child(self.quick_action_button(
+                                        self.tr("Command"),
+                                        SnippetAction::Command,
+                                        cx,
+                                    ))
+                                    .child(self.quick_action_button(
+                                        self.tr("Automation script"),
+                                        SnippetAction::Script,
+                                        cx,
                                     )),
                             )
+                            .when(self.quick_action == SnippetAction::Command, |panel| {
+                                panel
+                                    .child(self.tr("Command"))
+                                    .child(
+                                        div()
+                                            .h(px(32.))
+                                            .px_2()
+                                            .flex()
+                                            .items_center()
+                                            .rounded_md()
+                                            .bg(rgbc(theme.panel_alt))
+                                            .border_1()
+                                            .border_color(rgbc(theme.border))
+                                            .child(self.quick_command.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(rgbc(theme.muted))
+                                            .child(self.tr(
+                                                "Escapes: \\n newline, \\t tab, \\e ESC, \\xNN byte, \\\\ backslash",
+                                            )),
+                                    )
+                            })
+                            .when(self.quick_action == SnippetAction::Script, |panel| {
+                                panel
+                                    .child(self.tr("Automation script"))
+                                    .child(
+                                        div()
+                                            .id("quick-script-list")
+                                            .max_h(px(180.))
+                                            .overflow_y_scroll()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(if scripts.is_empty() {
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(rgbc(theme.muted))
+                                                    .child(self.tr("No automation scripts yet."))
+                                            } else {
+                                                let mut list = div().flex().flex_col().gap_1();
+                                                for script in &scripts {
+                                                    let id = script.id.clone();
+                                                    let selected =
+                                                        self.quick_script.as_deref() == Some(id.as_str());
+                                                    list = list.child(
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "quick-script-{}", script.id
+                                                            )))
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .border_1()
+                                                            .border_color(if selected {
+                                                                rgbc(theme.success)
+                                                            } else {
+                                                                rgba(theme.border, 0.0)
+                                                            })
+                                                            .bg(if selected {
+                                                                rgba(theme.success, 0.12)
+                                                            } else {
+                                                                rgba(theme.panel_alt, 0.0)
+                                                            })
+                                                            .cursor_pointer()
+                                                            .hover(|style| {
+                                                                style.bg(rgbc(theme.panel_alt))
+                                                            })
+                                                            .on_mouse_up(
+                                                                MouseButton::Left,
+                                                                cx.listener(move |this, _, _, cx| {
+                                                                    this.quick_script = Some(id.clone());
+                                                                    cx.notify();
+                                                                }),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(11.))
+                                                                    .text_color(rgbc(
+                                                                        theme.foreground,
+                                                                    ))
+                                                                    .child(script.name.clone()),
+                                                            ),
+                                                    );
+                                                }
+                                                list
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(rgbc(theme.muted))
+                                                    .child(self.tr("Click a script, then Save.")),
+                                            )
+                                            .child(div().flex_1())
+                                            .child(small_button(self.tr("Open automation"), theme).on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.quick_commands_open = false;
+                                                    this.automation_open = true;
+                                                    this.automation_fullscreen = false;
+                                                    this.refresh_automation_scripts(cx);
+                                                    this.ensure_automation_editor(cx);
+                                                    cx.notify();
+                                                }),
+                                            )),
+                                    )
+                            })
                             .when_some(self.quick_error.clone(), |panel, error| {
                                 panel.child(
                                     div()
@@ -7440,7 +7873,14 @@ impl XcordApp {
             main = main.child(self.render_tab_menu(tab_id, cx));
         }
         if active.is_some() {
-            main = main.child(div().flex_1().min_h(px(0.)).child(self.terminal.clone()));
+            main = main.child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(self.terminal.clone()),
+            );
+            main = main.child(self.render_quick_command_bar(cx));
             if self.settings.compose_bar {
                 main = main.child(self.render_compose(cx));
             }
