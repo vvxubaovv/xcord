@@ -114,6 +114,10 @@ guide, the threading model, and the session-open sequence.
   path navigation, recursive upload/download, folder creation and remote
   deletion. **Ctrl/Cmd+click** selects multiple files; **All/Clear** and the
   batch upload/download/delete actions operate on the whole selection.
+- **Quick access**: pinned session links appear directly below **New session**.
+  Right-click a session to pin or unpin it; click a pinned link to connect;
+  drag pinned links to reorder them. The pin order is stored in `config.toml`;
+  deleting a session also removes its pinned link.
 - **Session manager**: folders/groups, search, edit/delete, a right-click menu
   (edit, duplicate, connect, move to group, new group), drag to reorder sessions
   or drop a session onto a group header, collapsible/expandable groups, group

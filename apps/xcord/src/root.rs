@@ -68,6 +68,32 @@ struct DraggedSession {
     name: String,
 }
 
+#[derive(Clone)]
+struct DraggedQuickAccess {
+    id: String,
+    name: String,
+}
+
+struct QuickAccessDragPreview {
+    name: String,
+    theme: Theme,
+}
+
+impl Render for QuickAccessDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(self.theme.accent))
+            .bg(rgbc(self.theme.panel_alt))
+            .text_size(px(11.))
+            .text_color(rgbc(self.theme.foreground))
+            .child(self.name.clone())
+    }
+}
+
 struct DragHover {
     group: String,
     target: Option<String>,
@@ -318,6 +344,7 @@ pub struct XcordApp {
     next_tab_group: Cell<u64>,
     collapsed_groups: RefCell<HashSet<String>>,
     drag_hover: RefCell<Option<DragHover>>,
+    quick_access_hover: RefCell<Option<(String, bool)>>,
     group_drag_hover: RefCell<Option<(String, bool)>>,
     tab_drag_hover: RefCell<Option<(TerminalId, bool)>>,
     last_session_open: RefCell<Option<(String, Instant)>>,
@@ -536,6 +563,7 @@ impl XcordApp {
             next_tab_group: Cell::new(1),
             collapsed_groups: RefCell::new(HashSet::new()),
             drag_hover: RefCell::new(None),
+            quick_access_hover: RefCell::new(None),
             group_drag_hover: RefCell::new(None),
             tab_drag_hover: RefCell::new(None),
             last_session_open: RefCell::new(None),
@@ -3767,7 +3795,8 @@ impl XcordApp {
                     .child(primary_button(self.tr("New session"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
-                    )),
+                    ))
+                    .child(self.render_quick_access(cx)),
             )
             .child(list)
             .child(
@@ -3951,6 +3980,232 @@ impl XcordApp {
             )
     }
 
+    fn render_quick_access(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let pinned = self.sessions.quick_access();
+        let profiles = pinned
+            .iter()
+            .filter_map(|id| self.sessions.get(id))
+            .collect::<Vec<_>>();
+        let pinned_count = profiles.len();
+        let mut rows = div()
+            .id("quick-access-list")
+            .max_h(px(148.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1();
+        if profiles.is_empty() {
+            rows = rows.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(9.5))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("Right-click a session and pin it here.")),
+            );
+        }
+        for profile in profiles {
+            let id = profile.id.clone();
+            let click_id = id.clone();
+            let drag_id = id.clone();
+            let drag_name = profile.name.clone();
+            let drop_target = id.clone();
+            let hover_target = id.clone();
+            let drag_theme = theme.clone();
+            let status_color = self
+                .tabs
+                .iter()
+                .find(|tab| tab.profile_id == profile.id)
+                .map(|tab| match &tab.status {
+                    TabStatus::Connected => rgbc(theme.success),
+                    TabStatus::Connecting => rgbc(theme.accent),
+                    TabStatus::Failed(_) => rgbc(theme.danger),
+                    TabStatus::Closed => rgbc(theme.muted),
+                })
+                .unwrap_or(rgba(theme.muted, 0.35));
+            let hover = self
+                .quick_access_hover
+                .borrow()
+                .as_ref()
+                .is_some_and(|(target, _)| target == &id);
+            let subtitle = if profile.user.is_empty() {
+                profile.host.clone()
+            } else {
+                format!("{}@{}", profile.user, profile.host)
+            };
+            let unpin_id = id.clone();
+            rows = rows.child(
+                div()
+                    .id(SharedString::from(format!("quick-access-{}", profile.id)))
+                    .h(px(30.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .bg(if hover {
+                        rgba(theme.accent, 0.18)
+                    } else {
+                        rgba(theme.panel_alt, 0.0)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(theme.accent, 0.1)))
+                    .on_drag(
+                        DraggedQuickAccess {
+                            id: drag_id,
+                            name: drag_name,
+                        },
+                        move |drag, _, _, cx| {
+                            let theme = drag_theme.clone();
+                            cx.new(|_| QuickAccessDragPreview {
+                                name: drag.name.clone(),
+                                theme,
+                            })
+                        },
+                    )
+                    .on_drag_move::<DraggedQuickAccess>(cx.listener(
+                        move |this, event: &DragMoveEvent<DraggedQuickAccess>, _, cx| {
+                            let after = event.event.position.y >= event.bounds.center().y;
+                            this.quick_access_hover
+                                .replace(Some((hover_target.clone(), after)));
+                            cx.notify();
+                        },
+                    ))
+                    .on_drop::<DraggedQuickAccess>(cx.listener(
+                        move |this, drag: &DraggedQuickAccess, _, cx| {
+                            let after = this
+                                .quick_access_hover
+                                .borrow()
+                                .as_ref()
+                                .filter(|(target, _)| target == &drop_target)
+                                .map(|(_, after)| *after)
+                                .unwrap_or(true);
+                            this.move_quick_access(drag, &drop_target, after, cx);
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.connect_profile(click_id.clone(), window, cx, false);
+                        }),
+                    )
+                    .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(status_color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(11.))
+                            .text_color(rgbc(theme.foreground))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(profile.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(90.))
+                            .text_size(px(9.))
+                            .text_color(rgbc(theme.muted))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(subtitle),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "quick-access-unpin-{}",
+                                profile.id
+                            )))
+                            .px_1()
+                            .rounded_sm()
+                            .text_size(px(11.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_pin_quick_access(&unpin_id, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(9.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.muted))
+                    .child("★")
+                    .child(self.tr("Quick access"))
+                    .child(div().flex_1())
+                    .child(format!("{pinned_count}")),
+            )
+            .child(rows)
+    }
+
+    fn toggle_pin_quick_access(&mut self, id: &str, cx: &mut Context<Self>) {
+        let pinned = self
+            .sessions
+            .quick_access()
+            .iter()
+            .any(|pinned| pinned == id);
+        let result = if pinned {
+            self.sessions.unpin_quick_access(id)
+        } else {
+            self.sessions.pin_quick_access(id)
+        };
+        match result {
+            Ok(()) => {
+                self.session_menu = None;
+                self.quick_access_hover.replace(None);
+                self.set_notice(
+                    NoticeLevel::Info,
+                    if pinned {
+                        self.tr("Removed from Quick access.")
+                    } else {
+                        self.tr("Pinned to Quick access.")
+                    },
+                );
+            }
+            Err(error) => self.set_notice(NoticeLevel::Error, error),
+        }
+        cx.notify();
+    }
+
+    fn move_quick_access(
+        &mut self,
+        drag: &DraggedQuickAccess,
+        target: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if drag.id == target {
+            self.quick_access_hover.replace(None);
+            cx.notify();
+            return;
+        }
+        match self
+            .sessions
+            .move_quick_access(&drag.id, Some(target), after)
+        {
+            Ok(()) => {
+                self.quick_access_hover.replace(None);
+            }
+            Err(error) => self.set_notice(NoticeLevel::Error, error),
+        }
+        cx.notify();
+    }
+
     fn render_session_menu(&self, profile_id: &str, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let edit_id = profile_id.to_string();
@@ -3973,6 +4228,17 @@ impl XcordApp {
                 .cursor_pointer()
                 .hover(|style| style.bg(rgbc(theme.panel)))
                 .child(label)
+        };
+        let pin_id = profile_id.to_string();
+        let pinned = self
+            .sessions
+            .quick_access()
+            .iter()
+            .any(|pinned| pinned == profile_id);
+        let pin_label = if pinned {
+            self.tr("Unpin from Quick access")
+        } else {
+            self.tr("Pin to Quick access")
         };
         let groups = self.sessions.groups();
         let current_group = self
@@ -4099,6 +4365,14 @@ impl XcordApp {
                     )),
             )
             .child(group_row)
+            .child(div().flex().gap_1().child(
+                button("pin-quick-access", pin_label, theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.toggle_pin_quick_access(&pin_id, cx);
+                    }),
+                ),
+            ))
     }
 
     fn drop_session(

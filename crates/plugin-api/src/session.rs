@@ -24,6 +24,11 @@ pub trait SessionService {
     fn save(&self, profile: SessionProfile) -> Result<(), String>;
     fn delete(&self, id: &str) -> Result<(), String>;
 
+    fn quick_access(&self) -> Vec<String>;
+    fn pin_quick_access(&self, id: &str) -> Result<(), String>;
+    fn unpin_quick_access(&self, id: &str) -> Result<(), String>;
+    fn move_quick_access(&self, id: &str, target: Option<&str>, after: bool) -> Result<(), String>;
+
     fn snippets(&self) -> Vec<Snippet>;
     fn save_snippet(&self, snippet: Snippet) -> Result<(), String>;
     fn delete_snippet(&self, id: &str) -> Result<(), String>;

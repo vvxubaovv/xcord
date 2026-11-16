@@ -414,7 +414,16 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Quick command bar", "快捷命令栏"),
     ("Action", "动作类型"),
     ("Automation", "自动化"),
-    ("Open in new window", "在新窗口打开"),
+    ("Open in new window", "在新窗口打开"),    ("Quick access", "快捷访问"),
+    ("Pin to Quick access", "固定到快捷访问"),
+    ("Unpin from Quick access", "取消固定"),
+    (
+        "Right-click a session and pin it here.",
+        "右键会话，然后固定到这里。",
+    ),
+    ("Pinned to Quick access.", "已固定到快捷访问。"),
+    ("Removed from Quick access.", "已取消固定。"),
+
     ("Terminal tab not found.", "找不到终端标签页。"),
     (
         "Terminal opened in a new window. Drag it to another display.",

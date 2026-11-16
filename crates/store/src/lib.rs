@@ -23,6 +23,8 @@ pub enum StoreError {
     Serialize(#[from] toml::ser::Error),
     #[error("secret vault error: {0}")]
     Vault(String),
+    #[error("{0}")]
+    Message(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -331,6 +333,8 @@ pub struct WorkspaceConfig {
     pub version: u32,
     pub sessions: Vec<SessionProfile>,
     pub groups: Vec<String>,
+    #[serde(default)]
+    pub quick_access: Vec<String>,
     pub snippets: Vec<Snippet>,
     pub highlights: Vec<HighlightRule>,
     pub settings: Settings,
@@ -342,6 +346,7 @@ impl WorkspaceConfig {
             version: 1,
             sessions: Vec::new(),
             groups: vec!["Sessions".into()],
+            quick_access: Vec::new(),
             snippets: vec![
                 Snippet::new("List files", "ls -lah"),
                 Snippet::new("Disk usage", "df -h"),
@@ -542,7 +547,52 @@ impl Store {
     }
 
     pub fn delete_session(&self, id: &str) -> Result<()> {
-        self.update(|config| config.sessions.retain(|session| session.id != id))
+        self.update(|config| {
+            config.sessions.retain(|session| session.id != id);
+            config.quick_access.retain(|pinned| pinned != id);
+        })
+    }
+
+    pub fn quick_access(&self) -> Vec<String> {
+        self.config.borrow().quick_access.clone()
+    }
+
+    pub fn pin_quick_access(&self, id: &str) -> Result<()> {
+        if !self
+            .config
+            .borrow()
+            .sessions
+            .iter()
+            .any(|session| session.id == id)
+        {
+            return Err(StoreError::Message("Session no longer exists.".into()));
+        }
+        self.update(|config| {
+            if !config.quick_access.iter().any(|pinned| pinned == id) {
+                config.quick_access.push(id.to_string());
+            }
+        })
+    }
+
+    pub fn unpin_quick_access(&self, id: &str) -> Result<()> {
+        self.update(|config| config.quick_access.retain(|pinned| pinned != id))
+    }
+
+    pub fn move_quick_access(&self, id: &str, target: Option<&str>, after: bool) -> Result<()> {
+        let mut pinned = self.config.borrow().quick_access.clone();
+        let Some(index) = pinned.iter().position(|pinned| pinned == id) else {
+            return Err(StoreError::Message(
+                "Pinned session no longer exists.".into(),
+            ));
+        };
+        let id = pinned.remove(index);
+        let insert_at = target
+            .and_then(|target| pinned.iter().position(|pinned| pinned == target))
+            .map(|index| if after { index + 1 } else { index })
+            .unwrap_or(pinned.len())
+            .min(pinned.len());
+        pinned.insert(insert_at, id);
+        self.update(|config| config.quick_access = pinned)
     }
 
     pub fn upsert_snippet(&self, snippet: Snippet) -> Result<()> {
@@ -778,6 +828,39 @@ mod tests {
         let store = Store::open_at(paths.clone());
         assert!(!store.warnings().is_empty());
         assert!(paths.config_file.with_extension("toml.corrupt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quick_access_pin_reorder_and_delete() {
+        let dir = std::env::temp_dir().join(format!("xcord-test-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(Paths::with_root(&dir));
+        let first = SessionProfile::new("first");
+        let second = SessionProfile::new("second");
+        store.upsert_session(first.clone()).unwrap();
+        store.upsert_session(second.clone()).unwrap();
+
+        store.pin_quick_access(&first.id).unwrap();
+        store.pin_quick_access(&second.id).unwrap();
+        assert_eq!(
+            store.quick_access(),
+            vec![first.id.clone(), second.id.clone()]
+        );
+        store
+            .move_quick_access(&second.id, Some(&first.id), false)
+            .unwrap();
+        assert_eq!(
+            store.quick_access(),
+            vec![second.id.clone(), first.id.clone()]
+        );
+
+        let reopened = Store::open_at(Paths::with_root(&dir));
+        assert_eq!(
+            reopened.quick_access(),
+            vec![second.id.clone(), first.id.clone()]
+        );
+        reopened.delete_session(&second.id).unwrap();
+        assert_eq!(reopened.quick_access(), vec![first.id]);
         let _ = fs::remove_dir_all(&dir);
     }
 

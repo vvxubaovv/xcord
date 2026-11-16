@@ -177,6 +177,33 @@ impl SessionService for SessionManager {
             .map_err(|error| error.to_string())
     }
 
+    fn quick_access(&self) -> Vec<String> {
+        self.store.quick_access()
+    }
+
+    fn pin_quick_access(&self, id: &str) -> std::result::Result<(), String> {
+        self.store
+            .pin_quick_access(id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn unpin_quick_access(&self, id: &str) -> std::result::Result<(), String> {
+        self.store
+            .unpin_quick_access(id)
+            .map_err(|error| error.to_string())
+    }
+
+    fn move_quick_access(
+        &self,
+        id: &str,
+        target: Option<&str>,
+        after: bool,
+    ) -> std::result::Result<(), String> {
+        self.store
+            .move_quick_access(id, target, after)
+            .map_err(|error| error.to_string())
+    }
+
     fn snippets(&self) -> Vec<Snippet> {
         self.store.snippets()
     }
