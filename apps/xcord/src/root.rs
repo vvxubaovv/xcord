@@ -14,8 +14,8 @@ use async_channel::Receiver;
 use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, size, Bounds, ClipboardItem, Context, Div, DragMoveEvent, Entity, Font, Hsla,
-    KeyDownEvent, MouseButton, MouseUpEvent, PathPromptOptions, Render, Rgba, ScrollHandle,
+    div, point, px, rgb, size, Bounds, ClipboardItem, Context, Div, DragMoveEvent, Entity, Font,
+    Hsla, KeyDownEvent, MouseButton, MouseUpEvent, PathPromptOptions, Render, Rgba, ScrollHandle,
     SharedString, Stateful, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use tokio::sync::broadcast::error::RecvError;
@@ -276,6 +276,7 @@ pub struct XcordApp {
     quick_script: Option<String>,
     quick_error: Option<String>,
     detached_windows: usize,
+    tearoff_watch: Cell<bool>,
 
     automation: Automation,
     automation_open: bool,
@@ -494,6 +495,7 @@ impl XcordApp {
             quick_script: None,
             quick_error: None,
             detached_windows: 0,
+            tearoff_watch: Cell::new(false),
             automation,
             automation_open: false,
             automation_scripts: Vec::new(),
@@ -4815,6 +4817,12 @@ impl XcordApp {
                     cx.notify();
                 }),
             )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.start_tab_tearoff_watch(tab_id, window, cx);
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseUpEvent, window, cx| {
@@ -6946,7 +6954,72 @@ impl XcordApp {
         cx.notify();
     }
 
+    fn start_tab_tearoff_watch(
+        &mut self,
+        tab_id: TerminalId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(windows)]
+        {
+            if self.tearoff_watch.get() {
+                return;
+            }
+            let Some(rect) = screen_drag::client_rect() else {
+                return;
+            };
+            self.tearoff_watch.set(true);
+            cx.spawn_in(window, async move |this, cx| {
+                let mut outside = false;
+                loop {
+                    Timer::after(Duration::from_millis(30)).await;
+                    if !screen_drag::left_down() {
+                        break;
+                    }
+                    if let Some((x, y)) = screen_drag::cursor() {
+                        if !rect.contains(x, y) {
+                            outside = true;
+                        }
+                    }
+                }
+                let released_cursor = screen_drag::cursor();
+                if let Some((x, y)) = released_cursor {
+                    if !rect.contains(x, y) {
+                        outside = true;
+                    }
+                }
+                let released_outside = outside;
+                if released_outside {
+                    let _ = cx.update(|window, cx| {
+                        cx.stop_active_drag(window);
+                    });
+                }
+                let _ = this.update(cx, |this, cx| {
+                    this.tearoff_watch.set(false);
+                    if released_outside {
+                        this.open_detached_terminal_at(tab_id, screen_drag::cursor(), cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (tab_id, window, cx);
+        }
+    }
+
     fn open_detached_terminal(&mut self, tab_id: TerminalId, cx: &mut Context<Self>) {
+        self.open_detached_terminal_at(tab_id, None, cx);
+    }
+
+    fn open_detached_terminal_at(
+        &mut self,
+        tab_id: TerminalId,
+        cursor: Option<(i32, i32)>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id).cloned() else {
             self.set_notice(NoticeLevel::Warning, self.tr("Terminal tab not found."));
             cx.notify();
@@ -6961,14 +7034,30 @@ impl XcordApp {
         let detached_index = self.detached_windows;
         self.detached_windows += 1;
         let displays = cx.displays();
-        let display = if displays.len() > 1 {
+        let cursor_display = cursor.and_then(|(x, y)| {
+            let cursor = point(px(x as f32), px(y as f32));
             displays
-                .get(if detached_index % 2 == 0 { 1 } else { 0 })
+                .iter()
+                .find(|display| {
+                    let bounds = display.bounds();
+                    cursor.x >= bounds.origin.x
+                        && cursor.x < bounds.origin.x + bounds.size.width
+                        && cursor.y >= bounds.origin.y
+                        && cursor.y < bounds.origin.y + bounds.size.height
+                })
                 .cloned()
-        } else {
-            displays.first().cloned()
-        }
-        .or_else(|| cx.primary_display());
+        });
+        let display = cursor_display
+            .or_else(|| {
+                if displays.len() > 1 {
+                    displays
+                        .get(if detached_index % 2 == 0 { 1 } else { 0 })
+                        .cloned()
+                } else {
+                    displays.first().cloned()
+                }
+            })
+            .or_else(|| cx.primary_display());
         let bounds = Bounds::centered(
             display.map(|display| display.id()),
             size(px(1000.), px(720.)),
@@ -10505,5 +10594,120 @@ mod base64_capture_tests {
             decode_base64_output(""),
             Err(Base64DecodeError::Empty)
         ));
+    }
+}
+
+#[cfg(windows)]
+mod screen_drag {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> *mut c_void;
+        fn GetClientRect(window: *mut c_void, rect: *mut Rect) -> i32;
+        fn ClientToScreen(window: *mut c_void, point: *mut Point) -> i32;
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn GetAsyncKeyState(key: i32) -> i16;
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct ClientRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    impl ClientRect {
+        pub fn contains(&self, x: i32, y: i32) -> bool {
+            x >= self.left && x < self.right && y >= self.top && y < self.bottom
+        }
+    }
+
+    pub fn client_rect() -> Option<ClientRect> {
+        unsafe {
+            let window = GetForegroundWindow();
+            if window.is_null() {
+                return None;
+            }
+            let mut rect = Rect::default();
+            if GetClientRect(window, &mut rect) == 0 {
+                return None;
+            }
+            let mut top_left = Point {
+                x: rect.left,
+                y: rect.top,
+            };
+            let mut bottom_right = Point {
+                x: rect.right,
+                y: rect.bottom,
+            };
+            if ClientToScreen(window, &mut top_left) == 0
+                || ClientToScreen(window, &mut bottom_right) == 0
+            {
+                return None;
+            }
+            Some(ClientRect {
+                left: top_left.x,
+                top: top_left.y,
+                right: bottom_right.x,
+                bottom: bottom_right.y,
+            })
+        }
+    }
+
+    pub fn cursor() -> Option<(i32, i32)> {
+        unsafe {
+            let mut point = Point::default();
+            if GetCursorPos(&mut point) == 0 {
+                None
+            } else {
+                Some((point.x, point.y))
+            }
+        }
+    }
+
+    pub fn left_down() -> bool {
+        unsafe { GetAsyncKeyState(0x01) < 0 }
+    }
+}
+
+#[cfg(not(windows))]
+mod screen_drag {
+    #[derive(Clone, Copy)]
+    pub struct ClientRect;
+
+    impl ClientRect {
+        pub fn contains(&self, _x: i32, _y: i32) -> bool {
+            false
+        }
+    }
+
+    pub fn client_rect() -> Option<ClientRect> {
+        None
+    }
+
+    pub fn cursor() -> Option<(i32, i32)> {
+        None
+    }
+
+    pub fn left_down() -> bool {
+        false
     }
 }
