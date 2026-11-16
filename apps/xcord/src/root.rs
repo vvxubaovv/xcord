@@ -4135,6 +4135,11 @@ impl XcordApp {
                 .borrow()
                 .as_ref()
                 .is_some_and(|(target, _)| target == &id);
+            let located = self
+                .located_session
+                .borrow()
+                .as_deref()
+                .is_some_and(|located| located == profile.id.as_str());
             let subtitle = if profile.user.is_empty() {
                 profile.host.clone()
             } else {
@@ -4150,7 +4155,15 @@ impl XcordApp {
                     .items_center()
                     .gap_2()
                     .rounded_md()
-                    .bg(if hover {
+                    .border_1()
+                    .border_color(if located {
+                        rgbc(theme.accent)
+                    } else {
+                        rgba(theme.border, 0.0)
+                    })
+                    .bg(if located {
+                        rgba(theme.accent, 0.22)
+                    } else if hover {
                         rgba(theme.accent, 0.18)
                     } else {
                         rgba(theme.panel_alt, 0.0)
