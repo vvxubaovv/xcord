@@ -420,6 +420,10 @@ const APP_ZH: &[(&str, &str)] = &[
         "Terminal opened in a new window. Drag it to another display.",
         "已在新窗口打开终端。可将窗口拖到另一块显示屏。",
     ),
+    (
+        "Terminal moved to a new window. Drag it to another display.",
+        "终端已移到新窗口。可将窗口拖到另一块显示屏。",
+    ),
     ("Close window", "关闭窗口"),
     ("Detached", "独立窗口"),
     ("Closed", "已关闭"),

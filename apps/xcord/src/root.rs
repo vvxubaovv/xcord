@@ -276,6 +276,7 @@ pub struct XcordApp {
     quick_script: Option<String>,
     quick_error: Option<String>,
     detached_windows: usize,
+    detached_tabs: Rc<RefCell<HashSet<TerminalId>>>,
     tearoff_watch: Cell<bool>,
 
     automation: Automation,
@@ -495,6 +496,7 @@ impl XcordApp {
             quick_script: None,
             quick_error: None,
             detached_windows: 0,
+            detached_tabs: Rc::new(RefCell::new(HashSet::new())),
             tearoff_watch: Cell::new(false),
             automation,
             automation_open: false,
@@ -781,6 +783,10 @@ impl XcordApp {
 
     fn sync(&mut self, cx: &mut Context<Self>) {
         self.tabs = self.workspace.tabs();
+        {
+            let detached = self.detached_tabs.borrow();
+            self.tabs.retain(|tab| !detached.contains(&tab.id));
+        }
         let mut counts: HashMap<String, usize> = HashMap::new();
         for tab in &mut self.tabs {
             let count = counts.entry(tab.profile_id.clone()).or_insert(0);
@@ -796,7 +802,13 @@ impl XcordApp {
                 format!("{base} ({count})")
             };
         }
-        self.active = self.workspace.active();
+        self.active = self
+            .workspace
+            .active()
+            .filter(|id| self.tabs.iter().any(|tab| tab.id == *id));
+        if self.active.is_none() {
+            self.active = self.tabs.first().map(|tab| tab.id);
+        }
         if self
             .tab_menu
             .is_some_and(|id| !self.tabs.iter().any(|tab| tab.id == id))
@@ -7072,7 +7084,16 @@ impl XcordApp {
             ..Default::default()
         };
         let tab_title = tab.title.clone();
+        self.detached_tabs.borrow_mut().insert(tab_id);
+        self.sync(cx);
+        let registry = self.detached_tabs.clone();
+        let workspace_for_close = workspace.clone();
         match cx.open_window(options, move |window, cx| {
+            window.on_window_should_close(cx, move |_, _| {
+                registry.borrow_mut().remove(&tab_id);
+                workspace_for_close.close(tab_id);
+                true
+            });
             let view = cx.new(|cx| {
                 DetachedTerminal::new(
                     workspace, themes, highlights, settings, i18n, tab_id, tab_title, cx,
@@ -7091,10 +7112,12 @@ impl XcordApp {
                 self.tab_menu = None;
                 self.set_notice(
                     NoticeLevel::Info,
-                    self.tr("Terminal opened in a new window. Drag it to another display."),
+                    self.tr("Terminal moved to a new window. Drag it to another display."),
                 );
             }
             Err(error) => {
+                self.detached_tabs.borrow_mut().remove(&tab_id);
+                self.sync(cx);
                 self.set_notice(NoticeLevel::Error, error.to_string());
             }
         }

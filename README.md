@@ -68,11 +68,12 @@ guide, the threading model, and the session-open sequence.
 - **Detached terminal windows**: hold a tab and drag it outside the main
   window (or right-click a tab and choose **Open in new window**). The new native
   window shows the **same terminal tab**, not a new connection: it reuses the
-  existing `TerminalId` and SSH session, and output/input stay live in both
-  windows. The window is placed on the display under the cursor, or on the
-  second display when one is available, and its title bar can be dragged to any
-  monitor. Closing the detached window leaves the tab open in the main window;
-  closing the main window exits the application.
+  existing `TerminalId` and SSH session. The window is placed on the display
+  under the cursor, or on the second display when one is available, and its
+  title bar can be dragged to any
+  monitor. The tab is removed from the main window while it lives in the
+  detached window; closing that window closes the tab and its SSH session.
+  Closing the main window exits the application.
 - **Tab bar**: tabs use the configuration name; repeated connections to one
   profile are auto-numbered (`wsl`, `wsl (2)`, …). Drag tabs left/right to
   reorder. Tab groups are **independent of session groups**: right-click a tab
