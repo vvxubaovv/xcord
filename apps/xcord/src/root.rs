@@ -14,9 +14,9 @@ use async_channel::Receiver;
 use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, ClipboardItem, Context, Div, DragMoveEvent, Entity, Font, Hsla, KeyDownEvent,
-    MouseButton, MouseUpEvent, PathPromptOptions, Render, Rgba, ScrollHandle, SharedString,
-    Stateful, Timer, Window,
+    div, px, rgb, size, Bounds, ClipboardItem, Context, Div, DragMoveEvent, Entity, Font, Hsla,
+    KeyDownEvent, MouseButton, MouseUpEvent, PathPromptOptions, Render, Rgba, ScrollHandle,
+    SharedString, Stateful, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -29,6 +29,7 @@ use xcord_plugin_api::{
 };
 use xcord_store::{AuthKind, HostKeyPolicy, SessionProfile, Settings, Snippet, SnippetAction};
 
+use crate::detached_terminal::DetachedTerminal;
 use crate::script_editor::ScriptEditor;
 use crate::selectable_text::SelectableText;
 use crate::terminal_view::TerminalView;
@@ -274,6 +275,7 @@ pub struct XcordApp {
     quick_action: SnippetAction,
     quick_script: Option<String>,
     quick_error: Option<String>,
+    detached_windows: usize,
 
     automation: Automation,
     automation_open: bool,
@@ -491,6 +493,7 @@ impl XcordApp {
             quick_action: SnippetAction::Command,
             quick_script: None,
             quick_error: None,
+            detached_windows: 0,
             automation,
             automation_open: false,
             automation_scripts: Vec::new(),
@@ -549,6 +552,10 @@ impl XcordApp {
             notice: None,
             pending_focus: Some(PendingFocus::Terminal),
         };
+        window.on_window_should_close(cx, |_, cx| {
+            cx.quit();
+            true
+        });
         app.sync(cx);
         app.start_pumps(cx);
         window.set_window_title(&window_title);
@@ -4493,6 +4500,7 @@ impl XcordApp {
         let position = self.tabs.iter().position(|entry| entry.id == tab_id);
         let has_left = position.is_some_and(|index| index > 0);
         let has_right = position.is_some_and(|index| index + 1 < self.tabs.len());
+        let detach_window = tab_id;
         let close_current = tab_id;
         let close_all = tab_id;
         let close_right = tab_id;
@@ -4627,6 +4635,16 @@ impl XcordApp {
                             .flex()
                             .flex_col()
                             .gap_1()
+                            .child(
+                                button("detach-window", self.tr("Open in new window"), true, theme)
+                                    .w_full()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.open_detached_terminal(detach_window, cx);
+                                        }),
+                                    ),
+                            )
                             .child(
                                 button("close-current", self.tr("Close current"), true, theme)
                                     .w_full()
@@ -6925,6 +6943,72 @@ impl XcordApp {
         self.quick_commands_open = false;
         self.settings.compose_bar = true;
         self.pending_focus = Some(PendingFocus::Compose);
+        cx.notify();
+    }
+
+    fn open_detached_terminal(&mut self, tab_id: TerminalId, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id).cloned() else {
+            self.set_notice(NoticeLevel::Warning, self.tr("Terminal tab not found."));
+            cx.notify();
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let themes = self.themes.clone();
+        let highlights = self.highlights.clone();
+        let settings = self.settings.clone();
+        let i18n = self.i18n.clone();
+        let title = format!("{} — Xcord", tab.title);
+        let detached_index = self.detached_windows;
+        self.detached_windows += 1;
+        let displays = cx.displays();
+        let display = if displays.len() > 1 {
+            displays
+                .get(if detached_index % 2 == 0 { 1 } else { 0 })
+                .cloned()
+        } else {
+            displays.first().cloned()
+        }
+        .or_else(|| cx.primary_display());
+        let bounds = Bounds::centered(
+            display.map(|display| display.id()),
+            size(px(1000.), px(720.)),
+            cx,
+        );
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.clone().into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tab_title = tab.title.clone();
+        match cx.open_window(options, move |window, cx| {
+            let view = cx.new(|cx| {
+                DetachedTerminal::new(
+                    workspace, themes, highlights, settings, i18n, tab_id, tab_title, cx,
+                )
+            });
+            window.activate_window();
+            let focus = view.read(cx).focus_handle();
+            window.focus(&focus);
+            let focus_for_defer = focus.clone();
+            window.defer(cx, move |window, _| {
+                window.focus(&focus_for_defer);
+            });
+            view
+        }) {
+            Ok(_) => {
+                self.tab_menu = None;
+                self.set_notice(
+                    NoticeLevel::Info,
+                    self.tr("Terminal opened in a new window. Drag it to another display."),
+                );
+            }
+            Err(error) => {
+                self.set_notice(NoticeLevel::Error, error.to_string());
+            }
+        }
         cx.notify();
     }
 

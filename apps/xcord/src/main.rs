@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod detached_terminal;
 mod root;
 mod script_editor;
 mod selectable_text;
@@ -27,7 +28,12 @@ fn main() {
             |window, cx| cx.new(|cx| root::XcordApp::new(window, cx)),
         )
         .expect("could not open the Xcord window");
-        cx.on_window_closed(|cx| cx.quit()).detach();
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }

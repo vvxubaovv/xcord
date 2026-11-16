@@ -65,6 +65,12 @@ guide, the threading model, and the session-open sequence.
   Windows IME input handler. **Ctrl+V** and **Shift+Insert** paste,
   **Ctrl+C** copies a selection (otherwise sends interrupt), and
   **Ctrl+Shift+C/V** are also available.
+- **Detached terminal windows**: right-click a tab and choose **Open in new
+  window** to open that terminal in a separate native window. The new window is
+  placed on the second display when one is available, and its title bar can be
+  dragged to any monitor. Output and input stay live because both windows share
+  the same workspace. Closing the detached window leaves the tab open in the
+  main window; closing the main window exits the application.
 - **Tab bar**: tabs use the configuration name; repeated connections to one
   profile are auto-numbered (`wsl`, `wsl (2)`, …). Drag tabs left/right to
   reorder. Tab groups are **independent of session groups**: right-click a tab
