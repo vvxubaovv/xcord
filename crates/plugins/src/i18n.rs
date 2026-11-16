@@ -414,7 +414,9 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Quick command bar", "快捷命令栏"),
     ("Action", "动作类型"),
     ("Automation", "自动化"),
-    ("Open in new window", "在新窗口打开"),    ("Quick access", "快捷访问"),
+    ("Open in new window", "在新窗口打开"),    ("Quick access", "快捷访问"),    ("Locate", "定位"),
+    ("Session not found.", "找不到会话。"),
+
     ("Pin to Quick access", "固定到快捷访问"),
     ("Unpin from Quick access", "取消固定"),
     (

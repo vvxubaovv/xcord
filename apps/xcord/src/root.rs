@@ -304,6 +304,9 @@ pub struct XcordApp {
     detached_windows: usize,
     detached_tabs: Rc<RefCell<HashSet<TerminalId>>>,
     tearoff_watch: Cell<bool>,
+    session_scroll: ScrollHandle,
+    pending_session_scroll: RefCell<Option<String>>,
+    located_session: RefCell<Option<String>>,
 
     automation: Automation,
     automation_open: bool,
@@ -525,6 +528,9 @@ impl XcordApp {
             detached_windows: 0,
             detached_tabs: Rc::new(RefCell::new(HashSet::new())),
             tearoff_watch: Cell::new(false),
+            session_scroll: ScrollHandle::new(),
+            pending_session_scroll: RefCell::new(None),
+            located_session: RefCell::new(None),
             automation,
             automation_open: false,
             automation_scripts: Vec::new(),
@@ -3635,6 +3641,9 @@ impl XcordApp {
             .overflow_y_scroll()
             .px_2()
             .pb_2();
+        let scroll_target = self.pending_session_scroll.borrow().clone();
+        let mut scroll_index = None;
+        let mut child_index = 0usize;
         if groups.is_empty() {
             list = list.child(
                 div()
@@ -3663,6 +3672,10 @@ impl XcordApp {
                 .as_ref()
                 .is_some_and(|(target, _)| target == &group);
             let group_drag_theme = theme.clone();
+            let group_scroll_index = child_index;
+            let has_scroll_target = scroll_target
+                .as_deref()
+                .is_some_and(|target| profiles.iter().any(|profile| profile.id == target));
             list = list.child(
                 div()
                     .id(SharedString::from(format!("group-{group}")))
@@ -3744,8 +3757,13 @@ impl XcordApp {
                     .child(div().flex_1().child(self.tr(&group).to_uppercase()))
                     .child(format!("{}", profiles.len())),
             );
+            child_index += 1;
+            if has_scroll_target {
+                scroll_index = Some(group_scroll_index);
+            }
             if self.group_menu.as_deref() == Some(group.as_str()) {
                 list = list.child(self.render_group_menu(&group, cx));
+                child_index += 1;
             }
             if collapsed {
                 continue;
@@ -3753,12 +3771,22 @@ impl XcordApp {
             for profile in profiles {
                 let profile_id = profile.id.clone();
                 list = list.child(self.render_session_row(profile, cx));
+                child_index += 1;
                 if self.session_menu.as_deref() == Some(profile_id.as_str()) {
                     list = list.child(self.render_session_menu(&profile_id, cx));
+                    child_index += 1;
                 }
             }
         }
 
+        let list = list.track_scroll(&self.session_scroll);
+        if let Some(index) = scroll_index {
+            self.session_scroll.scroll_to_top_of_item(index);
+        }
+        if scroll_target.is_some() {
+            self.pending_session_scroll.replace(None);
+        }
+        let _ = child_index;
         div()
             .w(px(self.settings.sidebar_width.max(200.0)))
             .h_full()
@@ -3792,10 +3820,28 @@ impl XcordApp {
                             }))
                             .child(self.search.clone()),
                     )
-                    .child(primary_button(self.tr("New session"), theme).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.open_session_dialog(None, cx)),
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                primary_button(self.tr("New session"), theme)
+                                    .flex_1()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.open_session_dialog(None, cx)
+                                        }),
+                                    ),
+                            )
+                            .child(small_button(self.tr("Locate"), theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.locate_current_session(cx);
+                                }),
+                            )),
+                    )
                     .child(self.render_quick_access(cx)),
             )
             .child(list)
@@ -3833,6 +3879,11 @@ impl XcordApp {
 
     fn render_session_row(&self, profile: SessionProfile, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
+        let located = self
+            .located_session
+            .borrow()
+            .as_deref()
+            .is_some_and(|id| id == profile.id.as_str());
         let tab = self.tabs.iter().find(|tab| tab.profile_id == profile.id);
         let active = tab.map(|tab| Some(tab.id) == self.active).unwrap_or(false);
         let status_color = tab
@@ -3848,7 +3899,9 @@ impl XcordApp {
             .borrow()
             .as_ref()
             .is_some_and(|hover| hover.target.as_deref() == Some(profile.id.as_str()));
-        let row_bg = if drop_hover {
+        let row_bg = if located {
+            rgba(theme.accent, 0.22)
+        } else if drop_hover {
             rgba(theme.accent, 0.18)
         } else if active {
             rgbc(theme.panel_alt)
@@ -3880,6 +3933,12 @@ impl XcordApp {
             .items_center()
             .gap_1()
             .rounded_md()
+            .border_1()
+            .border_color(if located {
+                rgbc(theme.accent)
+            } else {
+                rgba(theme.border, 0.0)
+            })
             .bg(row_bg)
             .on_mouse_down(
                 MouseButton::Right,
@@ -3978,6 +4037,53 @@ impl XcordApp {
                             ),
                     ),
             )
+    }
+
+    fn locate_current_session(&mut self, cx: &mut Context<Self>) {
+        let Some(tab_id) = self.active else {
+            self.set_notice(NoticeLevel::Warning, self.tr("Open a terminal tab first."));
+            cx.notify();
+            return;
+        };
+        let Some(profile_id) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.profile_id.clone())
+        else {
+            self.set_notice(NoticeLevel::Warning, self.tr("Terminal tab not found."));
+            cx.notify();
+            return;
+        };
+        let Some(profile) = self.sessions.get(&profile_id) else {
+            self.set_notice(NoticeLevel::Warning, self.tr("Session not found."));
+            cx.notify();
+            return;
+        };
+        let group = if profile.group.trim().is_empty() {
+            "Sessions".to_string()
+        } else {
+            profile.group.clone()
+        };
+        self.collapsed_groups.borrow_mut().remove(&group);
+        self.search.update(cx, |input, cx| input.clear(cx));
+        self.session_menu = None;
+        self.group_menu = None;
+        self.pending_session_scroll
+            .replace(Some(profile_id.clone()));
+        self.located_session.replace(Some(profile_id.clone()));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            Timer::after(Duration::from_millis(2200)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.located_session.borrow().as_deref() == Some(profile_id.as_str()) {
+                    this.located_session.replace(None);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn render_quick_access(&self, cx: &mut Context<Self>) -> Div {
