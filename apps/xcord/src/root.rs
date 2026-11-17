@@ -14,9 +14,10 @@ use async_channel::Receiver;
 use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{
-    div, point, px, rgb, size, Bounds, ClipboardItem, Context, Div, DragMoveEvent, Entity, Font,
-    Hsla, KeyDownEvent, MouseButton, MouseUpEvent, PathPromptOptions, Render, Rgba, ScrollHandle,
-    SharedString, Stateful, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, point, px, rgb, size, Bounds, ClipboardItem, Context, Div, DragMoveEvent, Entity,
+    Focusable, Font, Hsla, KeyDownEvent, MouseButton, MouseUpEvent, PathPromptOptions, Render,
+    Rgba, ScrollHandle, SharedString, Stateful, Timer, TitlebarOptions, Window, WindowBounds,
+    WindowOptions,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -50,6 +51,7 @@ struct SessionForm {
     user: Entity<TextInput>,
     secret: Entity<TextInput>,
     key_path: Entity<TextInput>,
+    login_script: Entity<ScriptEditor>,
     auth: AuthMode,
     save_secret: bool,
     logging: bool,
@@ -60,6 +62,26 @@ struct GroupForm {
     name: Entity<TextInput>,
     editing: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Clone)]
+enum LoginStep {
+    Send(String),
+    Expect(String, u64),
+    Wait(u64),
+}
+
+struct LoginExpect {
+    pattern: String,
+    deadline: Instant,
+}
+
+struct LoginRun {
+    name: String,
+    steps: Vec<LoginStep>,
+    index: usize,
+    wait_until: Option<Instant>,
+    expect: Option<LoginExpect>,
 }
 
 #[derive(Clone)]
@@ -307,6 +329,8 @@ pub struct XcordApp {
     session_scroll: ScrollHandle,
     pending_session_scroll: RefCell<Option<String>>,
     located_session: RefCell<Option<String>>,
+    login_runs: RefCell<HashMap<TerminalId, LoginRun>>,
+    login_started: RefCell<HashSet<TerminalId>>,
 
     automation: Automation,
     automation_open: bool,
@@ -531,6 +555,8 @@ impl XcordApp {
             session_scroll: ScrollHandle::new(),
             pending_session_scroll: RefCell::new(None),
             located_session: RefCell::new(None),
+            login_runs: RefCell::new(HashMap::new()),
+            login_started: RefCell::new(HashSet::new()),
             automation,
             automation_open: false,
             automation_scripts: Vec::new(),
@@ -794,6 +820,7 @@ impl XcordApp {
             // Retry on the next tick instead of stopping the pump forever.
             let _ = this.update(cx, |app, cx| {
                 app.automation_tick(cx);
+                app.login_tick(cx);
             });
         })
         .detach();
@@ -883,6 +910,187 @@ impl XcordApp {
             self.terminal
                 .update(cx, |view, cx| view.set_active(active, cx));
             self.terminal_active = active;
+        }
+    }
+
+    fn parse_login_script(script: &str) -> Vec<LoginStep> {
+        fn unquote(text: &str) -> String {
+            let text = text.trim();
+            if text.len() >= 2 {
+                let first = text.as_bytes()[0] as char;
+                let last = text.as_bytes()[text.len() - 1] as char;
+                if first == last && (first == '"' || first == '\'') {
+                    return text[1..text.len() - 1].to_string();
+                }
+            }
+            text.to_string()
+        }
+
+        let mut steps = Vec::new();
+        for raw in script.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("sendline ") {
+                steps.push(LoginStep::Send(unquote(rest)));
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("send ") {
+                steps.push(LoginStep::Send(unquote(rest)));
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("wait ") {
+                if let Ok(ms) = rest.trim().parse::<u64>() {
+                    steps.push(LoginStep::Wait(ms.min(60_000)));
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("expect ") {
+                let mut pattern = rest.trim();
+                let mut timeout = 5_000u64;
+                if let Some((head, tail)) = pattern.rsplit_once(char::is_whitespace) {
+                    if let Ok(ms) = tail.parse::<u64>() {
+                        if !head.trim().is_empty() {
+                            pattern = head.trim();
+                            timeout = ms.min(120_000);
+                        }
+                    }
+                }
+                steps.push(LoginStep::Expect(unquote(pattern), timeout));
+                continue;
+            }
+            steps.push(LoginStep::Send(line.to_string()));
+        }
+        steps
+    }
+
+    fn maybe_start_login_scripts(&mut self) {
+        let tabs = self.workspace.tabs();
+        let mut started = self.login_started.borrow_mut();
+        let mut runs = self.login_runs.borrow_mut();
+        for tab in tabs {
+            if tab.status != TabStatus::Connected || started.contains(&tab.id) {
+                continue;
+            }
+            started.insert(tab.id);
+            let Some(profile) = self.sessions.get(&tab.profile_id) else {
+                continue;
+            };
+            let script = profile.login_script.trim();
+            if script.is_empty() {
+                continue;
+            }
+            let steps = Self::parse_login_script(script);
+            if steps.is_empty() {
+                continue;
+            }
+            runs.insert(
+                tab.id,
+                LoginRun {
+                    name: profile.name,
+                    steps,
+                    index: 0,
+                    wait_until: Some(Instant::now() + Duration::from_millis(350)),
+                    expect: None,
+                },
+            );
+        }
+    }
+
+    fn login_tick(&mut self, cx: &mut Context<Self>) {
+        self.maybe_start_login_scripts();
+        let now = Instant::now();
+        let ids = self.login_runs.borrow().keys().copied().collect::<Vec<_>>();
+        let mut writes = Vec::new();
+        let mut remove = Vec::new();
+        let mut finished = Vec::new();
+        let mut timed_out = Vec::new();
+        {
+            let mut runs = self.login_runs.borrow_mut();
+            for id in ids {
+                let Some(run) = runs.get_mut(&id) else {
+                    continue;
+                };
+                if let Some(until) = run.wait_until {
+                    if now < until {
+                        continue;
+                    }
+                    run.wait_until = None;
+                }
+                if let Some(expect) = &run.expect {
+                    let Some(text) = self.workspace.terminal_text(id, 200) else {
+                        remove.push(id);
+                        continue;
+                    };
+                    if text.contains(expect.pattern.trim_end()) {
+                        run.expect = None;
+                    } else if now >= expect.deadline {
+                        timed_out.push((run.name.clone(), expect.pattern.clone()));
+                        remove.push(id);
+                        continue;
+                    } else {
+                        continue;
+                    }
+                }
+                let mut complete = false;
+                while run.index < run.steps.len() {
+                    match &run.steps[run.index] {
+                        LoginStep::Send(text) => {
+                            let mut bytes = text.as_bytes().to_vec();
+                            bytes.push(b'\r');
+                            writes.push((id, bytes));
+                            run.index += 1;
+                        }
+                        LoginStep::Wait(ms) => {
+                            run.index += 1;
+                            run.wait_until = Some(now + Duration::from_millis(*ms));
+                            break;
+                        }
+                        LoginStep::Expect(pattern, timeout) => {
+                            run.index += 1;
+                            run.expect = Some(LoginExpect {
+                                pattern: pattern.clone(),
+                                deadline: now + Duration::from_millis(*timeout),
+                            });
+                            break;
+                        }
+                    }
+                }
+                if run.index >= run.steps.len() && run.expect.is_none() {
+                    complete = true;
+                }
+                if complete {
+                    finished.push(run.name.clone());
+                    remove.push(id);
+                }
+            }
+        }
+        for id in remove {
+            self.login_runs.borrow_mut().remove(&id);
+        }
+        for (id, bytes) in writes {
+            self.workspace.write(id, &bytes);
+        }
+        let changed = !finished.is_empty() || !timed_out.is_empty();
+        for name in finished {
+            self.set_notice(
+                NoticeLevel::Success,
+                self.tr_args("Login script finished for {name}.", &[("name", name)]),
+            );
+        }
+        for (name, pattern) in timed_out {
+            let _ = name;
+            self.set_notice(
+                NoticeLevel::Warning,
+                self.tr_args(
+                    "Login script timed out waiting for {pattern}.",
+                    &[("pattern", pattern)],
+                ),
+            );
+        }
+        if changed {
+            cx.notify();
         }
     }
 
@@ -1525,6 +1733,18 @@ impl XcordApp {
         );
         let key_path = Self::make_input(&theme, "~/.ssh/id_ed25519", false, cx);
         let group = Self::make_input(&theme, "Sessions", false, cx);
+        let login_script = cx.new(|cx| {
+            ScriptEditor::new(
+                rgbc(theme.foreground).into(),
+                rgbc(theme.muted).into(),
+                rgbc(theme.accent).into(),
+                rgbc(theme.danger).into(),
+                cx,
+            )
+        });
+        login_script.update(cx, |editor, cx| {
+            editor.set_value(profile.login_script.clone(), cx)
+        });
 
         name.update(cx, |input, cx| input.set_value(profile.name.clone(), cx));
         let group_value = if is_new {
@@ -1559,6 +1779,7 @@ impl XcordApp {
             user,
             secret,
             key_path,
+            login_script,
             auth,
             save_secret,
             logging: profile.logging,
@@ -1658,6 +1879,7 @@ impl XcordApp {
         } else {
             handles.push(form.key_path.read(cx).focus_handle_only());
         }
+        handles.push(form.login_script.read(cx).focus_handle(cx));
         let current = handles.iter().position(|handle| handle.is_focused(window));
         let next = match (current, reverse) {
             (Some(index), false) => (index + 1) % handles.len(),
@@ -1679,6 +1901,7 @@ impl XcordApp {
         let user = form.user.read(cx).value().trim().to_string();
         let secret = form.secret.read(cx).value().to_string();
         let key_path = form.key_path.read(cx).value().trim().to_string();
+        let login_script = form.login_script.read(cx).value().to_string();
         let auth = form.auth;
         let save_secret = form.save_secret;
         let logging = form.logging;
@@ -1722,6 +1945,7 @@ impl XcordApp {
             group
         };
         profile.logging = logging;
+        profile.login_script = login_script;
         profile.auth = match auth {
             AuthMode::Password => AuthKind::Password {
                 save: save_secret,
@@ -9258,6 +9482,45 @@ impl XcordApp {
                 theme,
             ));
         }
+
+        card = card.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgbc(theme.muted))
+                        .child(self.tr("Login script (runs after connect)")),
+                )
+                .child(
+                    div()
+                        .h(px(104.))
+                        .w_full()
+                        .overflow_hidden()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgbc(theme.border))
+                        .child(form.login_script.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(rgbc(theme.muted))
+                        .child(self.tr(
+                            "Commands: expect <text> [timeout_ms], send <text>, wait <ms>; other lines are sent as commands.",
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(rgbc(theme.muted))
+                        .child(self.tr(
+                            "The script is stored in config.toml in plain text; avoid embedding secrets.",
+                        )),
+                ),
+        );
 
         card = card
             .child(

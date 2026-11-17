@@ -414,7 +414,27 @@ const APP_ZH: &[(&str, &str)] = &[
     ("Quick command bar", "快捷命令栏"),
     ("Action", "动作类型"),
     ("Automation", "自动化"),
-    ("Open in new window", "在新窗口打开"),    ("Quick access", "快捷访问"),    ("Locate", "定位"),
+    ("Open in new window", "在新窗口打开"),    ("Quick access", "快捷访问"),    ("Locate", "定位"),    (
+        "Login script (runs after connect)",
+        "登录脚本（连接成功后运行）",
+    ),
+    (
+        "Commands: expect <text> [timeout_ms], send <text>, wait <ms>; other lines are sent as commands.",
+        "命令：expect <文本> [超时毫秒]、send <文本>、wait <毫秒>；其他行会作为命令发送。",
+    ),
+    (
+        "The script is stored in config.toml in plain text; avoid embedding secrets.",
+        "脚本以明文保存在 config.toml 中，请避免写入敏感密码。",
+    ),
+    (
+        "Login script finished for {name}.",
+        "登录脚本执行完成：{name}。",
+    ),
+    (
+        "Login script timed out waiting for {pattern}.",
+        "登录脚本等待超时：{pattern}。",
+    ),
+
     ("Session not found.", "找不到会话。"),
 
     ("Pin to Quick access", "固定到快捷访问"),

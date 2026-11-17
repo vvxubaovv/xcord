@@ -118,6 +118,20 @@ guide, the threading model, and the session-open sequence.
   reveals the active terminal's session in the sidebar. It clears the search,
   expands its group, scrolls the list to that group, and highlights the row for
   a couple of seconds.
+- **Login script**: every connection profile can carry a multiline login
+  script that runs after the SSH shell is ready. It supports
+  `expect <text> [timeout_ms]`, `send <text>`, `wait <ms>`, comments (`#`) and
+  bare command lines (sent as commands). Example for switching to root:
+  ```text
+  expect "$ "
+  send "sudo su -"
+  expect "Password:"
+  send "your-password"
+  expect "# "
+  ```
+  The script is editable directly in the session dialog and stored in
+  `config.toml`. It is plain text, so prefer SSH keys or passwordless `sudo`
+  instead of embedding a password when possible.
 - **Quick access**: pinned session links appear directly below **New session**.
   Right-click a session to pin or unpin it; click a pinned link to connect;
   drag pinned links to reorder them. The pin order is stored in `config.toml`;

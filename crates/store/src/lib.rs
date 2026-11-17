@@ -99,6 +99,9 @@ pub struct SessionProfile {
     pub auth: AuthKind,
     #[serde(default)]
     pub startup_command: Option<String>,
+    /// Commands/expectations run after the SSH shell is ready.
+    #[serde(default)]
+    pub login_script: String,
     #[serde(default = "default_term")]
     pub term: String,
     #[serde(default)]
@@ -136,6 +139,7 @@ impl SessionProfile {
             user: String::new(),
             auth: AuthKind::default(),
             startup_command: None,
+            login_script: String::new(),
             term: default_term(),
             color_scheme: None,
             keepalive_secs: 30,
@@ -807,12 +811,17 @@ mod tests {
         let mut session = SessionProfile::new("web");
         session.host = "example.com".into();
         session.user = "root".into();
+        session.login_script = "expect \"$ \"\nsend \"whoami\"".into();
         store.upsert_session(session.clone()).unwrap();
 
         let reopened = Store::open_at(Paths::with_root(&dir));
         assert_eq!(reopened.sessions().len(), 1);
         assert_eq!(reopened.sessions()[0].name, "web");
         assert_eq!(reopened.sessions()[0].host, "example.com");
+        assert_eq!(
+            reopened.sessions()[0].login_script,
+            "expect \"$ \"\nsend \"whoami\""
+        );
 
         reopened.delete_session(&session.id).unwrap();
         assert!(reopened.sessions().is_empty());
