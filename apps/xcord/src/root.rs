@@ -128,6 +128,7 @@ enum ResizeKind {
     Automation,
     AutomationLog,
     QuickBar,
+    Ai,
 }
 
 #[derive(Clone, Copy)]
@@ -2794,7 +2795,7 @@ impl XcordApp {
             }));
 
         div()
-            .w(px(400.))
+            .w(px(self.settings.ai_width.clamp(300.0, 760.0)))
             .min_w(px(0.))
             .h_full()
             .overflow_hidden()
@@ -4340,12 +4341,16 @@ impl XcordApp {
 
     fn render_resize_handle(&self, kind: ResizeKind, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme();
-        let vertical = matches!(kind, ResizeKind::Sidebar | ResizeKind::Automation);
+        let vertical = matches!(
+            kind,
+            ResizeKind::Sidebar | ResizeKind::Automation | ResizeKind::Ai
+        );
         let id = match kind {
             ResizeKind::Sidebar => "resize-sidebar",
             ResizeKind::Automation => "resize-automation",
             ResizeKind::AutomationLog => "resize-automation-log",
             ResizeKind::QuickBar => "resize-quick-bar",
+            ResizeKind::Ai => "resize-ai",
         };
         div()
             .id(id)
@@ -4392,6 +4397,7 @@ impl XcordApp {
             ResizeKind::Automation => self.settings.automation_width,
             ResizeKind::AutomationLog => self.settings.automation_log_height,
             ResizeKind::QuickBar => self.settings.quick_bar_height,
+            ResizeKind::Ai => self.settings.ai_width,
         };
         self.resize = Some(ResizeState {
             kind,
@@ -4425,6 +4431,10 @@ impl XcordApp {
             ResizeKind::QuickBar => {
                 self.settings.quick_bar_height =
                     (state.start_value - (y - state.start_y)).clamp(28.0, 180.0);
+            }
+            ResizeKind::Ai => {
+                self.settings.ai_width =
+                    (state.start_value - (x - state.start_x)).clamp(300.0, 760.0);
             }
         }
         cx.notify();
@@ -10499,7 +10509,16 @@ impl Render for XcordApp {
                     )
                 },
             )
-            .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
+            .when(self.ai_open, |body| {
+                body.child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .flex_shrink_0()
+                        .child(self.render_resize_handle(ResizeKind::Ai, cx))
+                        .child(self.render_ai_panel(cx)),
+                )
+            });
         let content = if self.automation_open && self.automation_fullscreen {
             modal_shell(self.render_automation(cx))
         } else if self.b64_upload_open {

@@ -59,9 +59,9 @@ guide, the threading model, and the session-open sequence.
 - **Real SSH-2**: password and public-key auth, PTY request, resize, keepalive,
   optional startup command, TOFU host keys in OpenSSH `known_hosts`.
 - **Resizable workspace**: drag the vertical splitters to resize the session
-  sidebar or the automation panel, drag the horizontal splitter above the quick
-  command bar to change its height, and drag the divider between the automation
-  editor and logs. Sizes are persisted in settings.
+  sidebar, automation panel, or AI panel, drag the horizontal splitter above
+  the quick command bar to change its height, and drag the divider between the
+  automation editor and logs. Sizes are persisted in settings.
 - **Terminal**: xterm-256color, truecolor, alt screen, scroll regions, SGR,
   wide characters, combining marks, OSC title/clipboard, bracketed paste,
   application cursor keys, scrollback, selection/copy/paste;

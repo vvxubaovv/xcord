@@ -257,6 +257,8 @@ pub struct Settings {
     pub automation_log_height: f32,
     #[serde(default = "default_quick_bar_height")]
     pub quick_bar_height: f32,
+    #[serde(default = "default_ai_width")]
+    pub ai_width: f32,
     pub compose_bar: bool,
     /// UI locale. Defaults to Simplified Chinese for existing configs.
     pub language: String,
@@ -300,6 +302,7 @@ impl Default for Settings {
             automation_width: 510.0,
             automation_log_height: 170.0,
             quick_bar_height: 38.0,
+            ai_width: 400.0,
             compose_bar: true,
             language: "zh-CN".into(),
             cursor_blink: true,
@@ -328,6 +331,10 @@ fn default_automation_log_height() -> f32 {
 
 fn default_quick_bar_height() -> f32 {
     38.0
+}
+
+fn default_ai_width() -> f32 {
+    400.0
 }
 
 fn default_editor_command() -> String {
