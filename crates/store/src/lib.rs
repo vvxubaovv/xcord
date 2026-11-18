@@ -181,6 +181,8 @@ pub struct Snippet {
     pub action: SnippetAction,
     #[serde(default)]
     pub script_id: String,
+    #[serde(default)]
+    pub script_file: String,
 }
 
 fn default_true() -> bool {
@@ -196,6 +198,7 @@ impl Snippet {
             send_enter: true,
             action: SnippetAction::Command,
             script_id: String::new(),
+            script_file: String::new(),
         }
     }
 }
@@ -906,6 +909,7 @@ mod tests {
         let mut snippet = Snippet::new("deploy", "");
         snippet.action = SnippetAction::Script;
         snippet.script_id = "deploy".into();
+        snippet.script_file = "C:/scripts/deploy.rhai".into();
         let config = WorkspaceConfig {
             snippets: vec![snippet],
             ..WorkspaceConfig::default()
@@ -914,6 +918,7 @@ mod tests {
         let parsed: WorkspaceConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.snippets[0].action, SnippetAction::Script);
         assert_eq!(parsed.snippets[0].script_id, "deploy");
+        assert_eq!(parsed.snippets[0].script_file, "C:/scripts/deploy.rhai");
 
         let old = r#"
 [[snippets]]
@@ -924,6 +929,7 @@ command = "ls -lah"
         let legacy: WorkspaceConfig = toml::from_str(old).unwrap();
         assert_eq!(legacy.snippets[0].action, SnippetAction::Command);
         assert!(legacy.snippets[0].script_id.is_empty());
+        assert!(legacy.snippets[0].script_file.is_empty());
     }
 
     #[test]

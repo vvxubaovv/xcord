@@ -75,7 +75,8 @@ impl SelectableText {
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        let (start, end) = self.selection?;
+        let (a, b) = self.selection?;
+        let (start, end) = (a.min(b), a.max(b));
         if start == end || !self.text.is_char_boundary(start) || !self.text.is_char_boundary(end) {
             return None;
         }

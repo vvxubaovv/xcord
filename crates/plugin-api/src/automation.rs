@@ -7,6 +7,28 @@ use tokio::sync::broadcast;
 
 use crate::workspace::TerminalId;
 
+/// Rhai API reference injected into AI copilot context and exposed by MCP tools.
+pub const AUTOMATION_SYNTAX: &str = r#"Xcord automation scripts are Rhai scripts that drive a live SSH terminal.
+Available functions:
+- send(text): send text without pressing Enter.
+- send_line(text): send text followed by Enter.
+- send_key(key): send a named key such as enter, tab, escape, ctrl+c, up, down.
+- expect(pattern, ms): wait for literal text, returning an object with pattern, text and before fields.
+- expect_regex(pattern, ms): wait for a regular expression.
+- expect_any([patterns], ms): wait for any of several patterns.
+- wait_idle(idle_ms, timeout): wait until terminal output becomes quiet.
+- read_screen() / read_scrollback(n): read terminal text.
+- sleep(ms), log(msg), fail(msg): helpers.
+
+Important semantics:
+- Expect/read listeners must start before send/send_line to see new output.
+- expect only matches output produced after the current send.
+- Scripts run on the active terminal and must be valid Rhai.
+Example:
+let m = expect_any(["ok", "failed"], 5000);
+if m.pattern == "ok" { log("done"); }
+"#;
+
 #[derive(Clone, Debug, Default)]
 pub struct ScriptInfo {
     pub id: String,
@@ -57,6 +79,7 @@ pub struct ScriptDiagnostic {
 #[derive(Clone, Debug)]
 pub enum AutomationEvent {
     Changed { run_id: u64 },
+    ScriptsChanged,
 }
 
 pub trait AutomationService {
@@ -64,8 +87,12 @@ pub trait AutomationService {
     fn script_source(&self, id: &str) -> Option<String>;
     fn validate(&self, source: &str) -> Option<ScriptDiagnostic>;
     fn create_script(&self, name: &str) -> Result<ScriptInfo, String>;
+    /// Overwrite an existing managed script. The UI reloads it after ScriptsChanged.
+    fn write_script(&self, id: &str, source: &str) -> Result<(), String>;
     fn scripts_dir(&self) -> String;
     fn run(&self, script_id: &str, terminal: TerminalId) -> Result<ScriptRunSnapshot, String>;
+    /// Run a script from an arbitrary file. The file is read at run time.
+    fn run_file(&self, path: &str, terminal: TerminalId) -> Result<ScriptRunSnapshot, String>;
     fn stop(&self, run_id: u64);
     /// UI-thread pump: executes queued send commands.
     fn pump(&self);

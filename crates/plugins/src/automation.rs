@@ -112,6 +112,9 @@ impl AutomationService for RcAutomation {
     fn create_script(&self, name: &str) -> std::result::Result<ScriptInfo, String> {
         self.0.create_script(name)
     }
+    fn write_script(&self, id: &str, source: &str) -> std::result::Result<(), String> {
+        self.0.write_script(id, source)
+    }
     fn scripts_dir(&self) -> String {
         self.0.scripts_dir.to_string_lossy().into_owned()
     }
@@ -121,6 +124,13 @@ impl AutomationService for RcAutomation {
         terminal: TerminalId,
     ) -> std::result::Result<ScriptRunSnapshot, String> {
         self.0.run(script_id, terminal)
+    }
+    fn run_file(
+        &self,
+        path: &str,
+        terminal: TerminalId,
+    ) -> std::result::Result<ScriptRunSnapshot, String> {
+        self.0.run_file(path, terminal)
     }
     fn stop(&self, run_id: u64) {
         self.0.stop(run_id)
@@ -276,17 +286,51 @@ impl AutomationState {
             .and_then(|stem| stem.to_str())
             .unwrap_or(&stem)
             .to_string();
-        Ok(ScriptInfo {
+        let info = ScriptInfo {
             name: id.clone(),
             id,
             path: path.to_string_lossy().into_owned(),
-        })
+        };
+        let _ = self.events.send(AutomationEvent::ScriptsChanged);
+        Ok(info)
+    }
+
+    fn write_script(&self, id: &str, source: &str) -> std::result::Result<(), String> {
+        if source.len() > 1_000_000 {
+            return Err("Script is larger than 1 MB.".to_string());
+        }
+        let path = self
+            .script_path(id)
+            .ok_or_else(|| "Script not found.".to_string())?;
+        std::fs::write(&path, source).map_err(|error| error.to_string())?;
+        let _ = self.events.send(AutomationEvent::ScriptsChanged);
+        Ok(())
     }
 
     fn run(
         &self,
         script_id: &str,
         terminal: TerminalId,
+    ) -> std::result::Result<ScriptRunSnapshot, String> {
+        let path = self
+            .script_path(script_id)
+            .ok_or_else(|| "Script not found.".to_string())?;
+        self.run_path(path, terminal, Some(script_id.to_string()))
+    }
+
+    fn run_file(
+        &self,
+        path: &str,
+        terminal: TerminalId,
+    ) -> std::result::Result<ScriptRunSnapshot, String> {
+        self.run_path(PathBuf::from(path), terminal, None)
+    }
+
+    fn run_path(
+        &self,
+        path: PathBuf,
+        terminal: TerminalId,
+        script_id: Option<String>,
     ) -> std::result::Result<ScriptRunSnapshot, String> {
         if self
             .runs
@@ -297,9 +341,6 @@ impl AutomationState {
         {
             return Err("A script is already running.".to_string());
         }
-        let path = self
-            .script_path(script_id)
-            .ok_or_else(|| "Script not found.".to_string())?;
         let source = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
         let source = source
             .strip_prefix('\u{feff}')
@@ -308,11 +349,12 @@ impl AutomationState {
         if source.len() > 1_000_000 {
             return Err("Script is larger than 1 MB.".to_string());
         }
+        let script_id = script_id.unwrap_or_else(|| path.to_string_lossy().into_owned());
         let run_id = self.next_run.fetch_add(1, Ordering::Relaxed);
         let name = path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .unwrap_or(script_id)
+            .unwrap_or(&script_id)
             .to_string();
         let shared = Arc::new((
             Mutex::new(SharedRun {
@@ -333,7 +375,7 @@ impl AutomationState {
         let commands = Arc::new(Mutex::new(Vec::new()));
         let run = Arc::new(Run {
             id: run_id,
-            script_id: script_id.to_string(),
+            script_id: script_id.clone(),
             name,
             terminal,
             shared: shared.clone(),

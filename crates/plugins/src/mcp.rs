@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 use xcord_cordis::{Context, Plugin, PluginMeta, Result};
 use xcord_plugin_api::{
-    services, Commands, McpResourceRegistry, McpResources, McpServerStatus, McpStatus,
+    services, Automation, Commands, McpResourceRegistry, McpResources, McpServerStatus, McpStatus,
     McpToolRegistry, McpTools, PostOffice, ResourceContent, ResourceSpec, Runtime, Sessions,
     ToolSpec, Workspace,
 };
@@ -44,6 +44,7 @@ impl Plugin for McpPlugin {
             services::SESSIONS,
             services::WORKSPACE,
             services::COMMANDS,
+            services::AUTOMATION,
         ]
     }
 
@@ -52,6 +53,7 @@ impl Plugin for McpPlugin {
         let sessions = (*ctx.require::<Sessions>(services::SESSIONS)?).clone();
         let workspace = (*ctx.require::<Workspace>(services::WORKSPACE)?).clone();
         let commands = (*ctx.require::<Commands>(services::COMMANDS)?).clone();
+        let automation = (*ctx.require::<Automation>(services::AUTOMATION)?).clone();
 
         let tools = Rc::new(McpToolRegistry::new());
         let resources = Rc::new(McpResourceRegistry::new());
@@ -60,6 +62,7 @@ impl Plugin for McpPlugin {
             sessions.clone(),
             workspace.clone(),
             commands.clone(),
+            automation.clone(),
         );
         register_resources(&resources, sessions.clone(), workspace.clone());
 
@@ -386,6 +389,7 @@ fn register_tools(
     sessions: Sessions,
     workspace: Workspace,
     commands: Commands,
+    automation: Automation,
 ) {
     let no_args = json!({"type": "object", "properties": {}});
     tools.register(
@@ -730,6 +734,141 @@ fn register_tools(
                 } else {
                     Err(format!("unknown command `{id}`"))
                 }
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "automation_syntax".into(),
+            title: "Automation syntax".into(),
+            description: "Return the Rhai API reference for Xcord automation scripts.".into(),
+            input_schema: no_args.clone(),
+            read_only: true,
+        },
+        |_ctx, _args| Ok(Value::String(xcord_plugin_api::AUTOMATION_SYNTAX.into())),
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "automation_list_scripts".into(),
+            title: "List automation scripts".into(),
+            description: "List managed Rhai automation scripts with id, name and path.".into(),
+            input_schema: no_args.clone(),
+            read_only: true,
+        },
+        {
+            let automation = automation.clone();
+            move |_ctx, _args| {
+                let list: Vec<Value> = automation
+                    .scripts()
+                    .into_iter()
+                    .map(|script| {
+                        json!({
+                            "id": script.id,
+                            "name": script.name,
+                            "path": script.path,
+                        })
+                    })
+                    .collect();
+                Ok(Value::Array(list))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "automation_read_script".into(),
+            title: "Read automation script".into(),
+            description: "Read a managed automation script by id.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"script_id": {"type": "string"}},
+                "required": ["script_id"]
+            }),
+            read_only: true,
+        },
+        {
+            let automation = automation.clone();
+            move |_ctx, args| {
+                let id = args
+                    .get("script_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "script_id is required".to_string())?;
+                let source = automation
+                    .script_source(id)
+                    .ok_or_else(|| format!("unknown automation script `{id}`"))?;
+                Ok(json!({"id": id, "source": source}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "automation_write_script".into(),
+            title: "Write automation script".into(),
+            description: "Replace the full source of an existing managed automation script. This is a mutating tool.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "script_id": {"type": "string"},
+                    "source": {"type": "string"}
+                },
+                "required": ["script_id", "source"]
+            }),
+            read_only: false,
+        },
+        {
+            let automation = automation.clone();
+            move |_ctx, args| {
+                let id = args
+                    .get("script_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "script_id is required".to_string())?;
+                let source = args
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "source is required".to_string())?;
+                automation.write_script(id, source)?;
+                Ok(json!({"ok": true, "script_id": id}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "automation_create_script".into(),
+            title: "Create automation script".into(),
+            description: "Create a new managed Rhai script and optionally write its source. This is a mutating tool.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "source": {"type": "string"}
+                },
+                "required": ["name", "source"]
+            }),
+            read_only: false,
+        },
+        {
+            let automation = automation.clone();
+            move |_ctx, args| {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "name is required".to_string())?;
+                let source = args
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "source is required".to_string())?;
+                let script = automation.create_script(name)?;
+                automation.write_script(&script.id, source)?;
+                Ok(json!({
+                    "ok": true,
+                    "id": script.id,
+                    "name": script.name,
+                    "path": script.path,
+                }))
             }
         },
     );

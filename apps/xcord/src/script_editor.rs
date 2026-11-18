@@ -7,9 +7,10 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, Bounds, ClipboardItem, Context, CursorStyle, FocusHandle, Focusable, Font, FontWeight,
-    Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    Render, ScrollHandle, ShapedLine, TextRun, Window,
+    canvas, div, px, Bounds, ClipboardItem, Context, CursorStyle, ElementInputHandler,
+    EntityInputHandler, FocusHandle, Focusable, Font, FontWeight, Hsla, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, ShapedLine,
+    SharedString, TextRun, UTF16Selection, Window,
 };
 
 const FONT_SIZE: f32 = 11.5;
@@ -29,6 +30,9 @@ pub struct ScriptEditor {
     accent: Hsla,
     danger: Hsla,
     error_line: Option<usize>,
+    plain: bool,
+    placeholder: Option<SharedString>,
+    marked_range: Option<Range<usize>>,
     revision: u64,
     scroll: ScrollHandle,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -57,6 +61,9 @@ impl ScriptEditor {
             accent,
             danger,
             error_line: None,
+            plain: false,
+            placeholder: None,
+            marked_range: None,
             revision: 0,
             scroll: ScrollHandle::new(),
             bounds: Rc::new(Cell::new(None)),
@@ -66,12 +73,30 @@ impl ScriptEditor {
         }
     }
 
+    pub fn new_plain(
+        foreground: Hsla,
+        muted: Hsla,
+        accent: Hsla,
+        danger: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut editor = Self::new(foreground, muted, accent, danger, cx);
+        editor.plain = true;
+        editor
+    }
+
+    pub fn set_placeholder(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = Some(text.into());
+        cx.notify();
+    }
+
     pub fn value(&self) -> &str {
         &self.content
     }
 
     pub fn set_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
         self.content = value.into();
+        self.marked_range = None;
         self.anchor = self.content.len();
         self.head = self.content.len();
         self.undo.clear();
@@ -106,6 +131,40 @@ impl ScriptEditor {
 
     fn selection(&self) -> Range<usize> {
         self.anchor.min(self.head)..self.anchor.max(self.head)
+    }
+
+    fn offset_from_utf16(&self, offset: usize) -> usize {
+        let mut utf8_offset = 0;
+        let mut utf16_count = 0;
+        for ch in self.content.chars() {
+            if utf16_count >= offset {
+                break;
+            }
+            utf16_count += ch.len_utf16();
+            utf8_offset += ch.len_utf8();
+        }
+        utf8_offset
+    }
+
+    fn offset_to_utf16(&self, offset: usize) -> usize {
+        let mut utf16_offset = 0;
+        let mut utf8_count = 0;
+        for ch in self.content.chars() {
+            if utf8_count >= offset {
+                break;
+            }
+            utf8_count += ch.len_utf8();
+            utf16_offset += ch.len_utf16();
+        }
+        utf16_offset
+    }
+
+    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
     }
 
     fn cursor_line_column(&self) -> (usize, usize) {
@@ -410,6 +469,26 @@ impl ScriptEditor {
         let word = keystroke.modifiers.control || keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
 
+        if self.marked_range.is_some() && !word {
+            cx.stop_propagation();
+            return;
+        }
+
+        // Do not handle printable keys here. Let the platform translate them
+        // into WM_CHAR/WM_IME messages so IME composition (Chinese, Japanese,
+        // etc.) can start; ElementInputHandler inserts the committed text.
+        if !word && !keystroke.modifiers.alt {
+            let printable = keystroke
+                .key_char
+                .as_ref()
+                .is_some_and(|text| text.chars().any(|ch| !ch.is_control()))
+                || keystroke.key.chars().count() == 1
+                || keystroke.key == "space";
+            if printable {
+                return;
+            }
+        }
+
         if word {
             match keystroke.key.as_str() {
                 "a" => {
@@ -508,14 +587,7 @@ impl ScriptEditor {
             }
             "enter" => self.insert("\n", cx),
             "tab" => self.insert("    ", cx),
-            "space" => self.insert(" ", cx),
-            _ => {
-                if let Some(text) = keystroke.key_char.as_deref() {
-                    if !text.is_empty() && text.chars().all(|ch| !ch.is_control()) {
-                        self.insert(text, cx);
-                    }
-                }
-            }
+            _ => {}
         }
         cx.stop_propagation();
     }
@@ -527,11 +599,137 @@ impl Focusable for ScriptEditor {
     }
 }
 
+impl EntityInputHandler for ScriptEditor {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.range_from_utf16(&range_utf16);
+        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        actual_range.replace(self.range_to_utf16(&range));
+        Some(self.content[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let range = self.selection();
+        Some(UTF16Selection {
+            range: self.range_to_utf16(&range),
+            reversed: self.anchor > self.head,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|range| self.range_from_utf16(range))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selection());
+        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        self.snapshot();
+        self.content.replace_range(range.clone(), new_text);
+        self.anchor = range.start + new_text.len();
+        self.head = self.anchor;
+        self.marked_range = None;
+        self.revision = self.revision.wrapping_add(1);
+        self.scroll_to_head();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|range| self.range_from_utf16(range))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selection());
+        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        self.content.replace_range(range.clone(), new_text);
+        self.marked_range =
+            (!new_text.is_empty()).then_some(range.start..range.start + new_text.len());
+        let selected = new_selected_range_utf16
+            .as_ref()
+            .map(|selection| self.range_from_utf16(selection))
+            .map(|selection| range.start + selection.start..range.start + selection.end)
+            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.anchor = selected.start;
+        self.head = selected.end;
+        self.revision = self.revision.wrapping_add(1);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let bounds = self.bounds.get()?;
+        let local = bounds.localize(&point)?;
+        let line_height = if self.plain { 22.0 } else { LINE_HEIGHT };
+        let gutter = if self.plain { 0.0 } else { GUTTER };
+        let line_count = self.content.split('\n').count().max(1);
+        let line = (((local.y - bounds.top() - px(PADDING)) / px(line_height)).max(0.0) as usize)
+            .min(line_count - 1);
+        let column = ((local.x - bounds.left() - px(PADDING) - px(gutter))
+            / px(self.char_width.max(1.0)))
+        .max(0.0) as usize;
+        let offset = self.offset_for_line_column(line, column);
+        Some(self.range_to_utf16(&(offset..offset)).start)
+    }
+}
+
 impl Render for ScriptEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor_font = if self.plain { "Segoe UI" } else { "Consolas" };
+        let font_size = if self.plain { 14.0 } else { FONT_SIZE };
+        let line_height = if self.plain { 22.0 } else { LINE_HEIGHT };
         let font = Font {
             weight: FontWeight::NORMAL,
-            ..gpui::font("Consolas")
+            ..gpui::font(editor_font)
         };
         let run = TextRun {
             len: 1,
@@ -544,7 +742,7 @@ impl Render for ScriptEditor {
         let measure: ShapedLine =
             window
                 .text_system()
-                .shape_line("M".into(), px(FONT_SIZE), &[run], None);
+                .shape_line("M".into(), px(font_size), &[run], None);
         self.char_width = f32::from(measure.width).max(1.0);
 
         let lines = self.content.split('\n').collect::<Vec<_>>();
@@ -554,13 +752,15 @@ impl Render for ScriptEditor {
             .id("script-editor-lines")
             .flex()
             .flex_col()
+            .justify_start()
             .p(px(PADDING))
             .flex_1()
             .min_h(px(0.))
             .track_scroll(&self.scroll)
             .overflow_y_scroll()
-            .font_family("Consolas")
-            .text_size(px(FONT_SIZE));
+            .font_family(editor_font)
+            .text_size(px(font_size))
+            .line_height(px(line_height));
         for (index, line) in lines.iter().enumerate() {
             let line_start = self.line_start(index);
             let line_end = self.line_end(index);
@@ -572,24 +772,26 @@ impl Render for ScriptEditor {
                 .id(("script-editor-line", index))
                 .w_full()
                 .flex()
+                .flex_shrink_0()
                 .items_start()
-                .h(px(LINE_HEIGHT))
+                .h(px(line_height))
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .rounded_sm()
-                .when(error, |row| {
+                .when(error && !self.plain, |row| {
                     row.bg(Hsla {
                         a: 0.22,
                         ..self.danger
                     })
                 })
-                .when(active && !error, |row| {
+                .when(active && !error && !self.plain, |row| {
                     row.bg(Hsla {
                         a: 0.18,
                         ..self.accent
                     })
-                })
-                .child(
+                });
+            if !self.plain {
+                row = row.child(
                     div()
                         .w(px(GUTTER))
                         .flex_shrink_0()
@@ -603,11 +805,12 @@ impl Render for ScriptEditor {
                         .child(if error {
                             format!("!{:>3}", index + 1)
                         } else if active {
-                            format!("▶{:>3}", index + 1)
+                            format!("\u{25b6}{:>3}", index + 1)
                         } else {
                             format!("{:>4}", index + 1)
                         }),
                 );
+            }
             if selected_start < selected_end {
                 row = row
                     .child(
@@ -633,8 +836,20 @@ impl Render for ScriptEditor {
                 let after = &self.content[self.head.min(line_end)..line_end];
                 row = row
                     .child(div().text_color(self.foreground).child(before.to_string()))
-                    .child(div().w(px(1.5)).h(px(15.)).flex_shrink_0().bg(self.accent))
-                    .child(div().text_color(self.foreground).child(after.to_string()));
+                    .child(
+                        div()
+                            .w(px(1.5))
+                            .h(px(line_height - 4.0))
+                            .flex_shrink_0()
+                            .bg(self.accent),
+                    );
+                if self.content.is_empty() {
+                    if let Some(placeholder) = self.placeholder.clone() {
+                        row = row.child(div().text_color(self.muted).child(placeholder));
+                    }
+                } else {
+                    row = row.child(div().text_color(self.foreground).child(after.to_string()));
+                }
             } else {
                 row = row.child(div().text_color(self.foreground).child((*line).to_string()));
             }
@@ -677,6 +892,24 @@ impl Render for ScriptEditor {
                     }
                 }
             })
+            .child(
+                canvas(move |bounds, _, _| bounds, {
+                    let editor = cx.entity();
+                    let editor_bounds = self.bounds.clone();
+                    move |_bounds, _paint, window, cx| {
+                        eprintln!("script-editor-ime-paint");
+                        let bounds = editor_bounds.get().unwrap_or(_bounds);
+                        let focus = editor.read(cx).focus_handle.clone();
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, editor.clone()),
+                            cx,
+                        );
+                    }
+                })
+                .w(px(1.))
+                .h(px(1.)),
+            )
             .child(rows)
     }
 }

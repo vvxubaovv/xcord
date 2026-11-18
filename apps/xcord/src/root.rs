@@ -311,7 +311,7 @@ pub struct XcordApp {
     terminal: Entity<TerminalView>,
     search: Entity<TextInput>,
     compose: Entity<TextInput>,
-    ai_input: Entity<TextInput>,
+    ai_input: Entity<ScriptEditor>,
     ai_scroll: ScrollHandle,
     ai_follow: Cell<bool>,
     ai_jump_target: Cell<Option<usize>>,
@@ -349,6 +349,7 @@ pub struct XcordApp {
     quick_editing: Option<String>,
     quick_action: SnippetAction,
     quick_script: Option<String>,
+    quick_script_file: Option<String>,
     quick_error: Option<String>,
     detached_windows: usize,
     detached_tabs: Rc<RefCell<HashSet<TerminalId>>>,
@@ -496,8 +497,17 @@ impl XcordApp {
             false,
             cx,
         );
-        let ai_input =
-            Self::make_input(&theme, &i18n.t("app", "Ask about this session…"), false, cx);
+        let ai_input = cx.new(|cx| {
+            let mut editor = ScriptEditor::new_plain(
+                rgbc(theme.foreground).into(),
+                rgbc(theme.muted).into(),
+                rgbc(theme.accent).into(),
+                rgbc(theme.danger).into(),
+                cx,
+            );
+            editor.set_placeholder(i18n.t("app", "Ask about this session…"), cx);
+            editor
+        });
         let ftp_remote_input = Self::make_input(&theme, "/", false, cx);
         let ftp_local_input = Self::make_input(&theme, &i18n.t("app", "Local folder"), false, cx);
         let ftp_new_dir = Self::make_input(&theme, &i18n.t("app", "New folder"), false, cx);
@@ -576,6 +586,7 @@ impl XcordApp {
             quick_editing: None,
             quick_action: SnippetAction::Command,
             quick_script: None,
+            quick_script_file: None,
             quick_error: None,
             detached_windows: 0,
             detached_tabs: Rc::new(RefCell::new(HashSet::new())),
@@ -645,6 +656,7 @@ impl XcordApp {
             notice: None,
             pending_focus: Some(PendingFocus::Terminal),
         };
+        cx.observe(&app.ai_input, |_, _, cx| cx.notify()).detach();
         window.on_window_should_close(cx, |_, cx| {
             cx.quit();
             true
@@ -2506,7 +2518,8 @@ impl XcordApp {
         self.ai_scroll.scroll_to_bottom();
         match self.ai.send(&prompt) {
             Ok(()) => {
-                self.ai_input.update(cx, |input, cx| input.clear(cx));
+                self.ai_input
+                    .update(cx, |input, cx| input.set_value("", cx));
                 self.pending_focus = Some(PendingFocus::AiInput);
             }
             Err(error) => self.set_notice(NoticeLevel::Error, error),
@@ -2550,6 +2563,8 @@ impl XcordApp {
     fn render_ai_panel(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let snapshot: AiSnapshot = self.ai.snapshot();
+        let ai_input_lines = self.ai_input.read(cx).value().lines().count().max(10);
+        let ai_input_height = (ai_input_lines as f32 * 22.0 + 12.0).clamp(232.0, 360.0);
         let message_count = snapshot.messages.len();
         let char_count = snapshot
             .messages
@@ -2770,29 +2785,29 @@ impl XcordApp {
             .child(
                 div()
                     .flex()
-                    .items_center()
+                    .items_end()
                     .gap_2()
                     .child(
                         div()
                             .flex_1()
-                            .h(px(34.))
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .h(px(ai_input_height))
                             .bg(rgbc(theme.background))
                             .border_1()
                             .border_color(rgbc(theme.border))
                             .rounded_md()
                             .child(self.ai_input.clone()),
                     )
-                    .child(primary_button(self.tr("Send"), theme).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.send_ai(cx)),
-                    )),
-            )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "enter" {
-                    this.send_ai(cx);
-                    cx.stop_propagation();
-                }
-            }));
+                    .child(
+                        primary_button(self.tr("Send"), theme)
+                            .flex_shrink_0()
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.send_ai(cx)),
+                            ),
+                    ),
+            );
 
         div()
             .w(px(self.settings.ai_width.clamp(300.0, 760.0)))
@@ -3643,7 +3658,7 @@ impl XcordApp {
                 .tab_group_form
                 .as_ref()
                 .map(|form| form.name.read(cx).focus_handle_only()),
-            PendingFocus::AiInput => Some(self.ai_input.read(cx).focus_handle_only()),
+            PendingFocus::AiInput => Some(self.ai_input.read(cx).focus_handle(cx)),
             PendingFocus::AiBase => self
                 .ai_config
                 .as_ref()
@@ -3658,6 +3673,17 @@ impl XcordApp {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
+        if control && !shift && keystroke.key == "c" {
+            let selected = self
+                .automation_log
+                .as_ref()
+                .and_then(|log| log.read(cx).selected_text());
+            if let Some(text) = selected {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                cx.stop_propagation();
+                return;
+            }
+        }
         if control && !shift && keystroke.key == "s" && self.automation_open {
             self.save_automation_source(cx);
             cx.stop_propagation();
@@ -4098,36 +4124,6 @@ impl XcordApp {
                     .child(self.render_quick_access(cx)),
             )
             .child(list)
-            .child(
-                div()
-                    .p_2()
-                    .border_t_1()
-                    .border_color(rgbc(theme.border))
-                    .flex()
-                    .gap_2()
-                    .child(
-                        small_button(self.tr("Plugins"), theme)
-                            .flex_1()
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.plugins_panel = true;
-                                    this.refresh_plugins();
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-                    .child(
-                        small_button(self.tr("Settings"), theme)
-                            .flex_1()
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.open_settings(cx);
-                                }),
-                            ),
-                    ),
-            )
     }
 
     fn render_session_row(&self, profile: SessionProfile, cx: &mut Context<Self>) -> Div {
@@ -5739,6 +5735,26 @@ impl XcordApp {
         })
     }
 
+    fn automation_help_text(&self) -> String {
+        [
+            "send(text) — 发送文本，不回车",
+            "send_line(text) — 发送文本并回车",
+            "send_key(key) — enter/tab/escape/ctrl+c/up…",
+            "expect(pattern, ms) — 等待文本，返回 pattern/text/before",
+            "expect_regex(pattern, ms) — 正则等待",
+            "expect_any([..], ms) — 等待任意一个模式",
+            "wait_idle(idle_ms, timeout) — 等待输出静止",
+            "read_screen() / read_scrollback(n) — 读取终端文本",
+            "sleep(ms) / log(msg) / fail(msg) — 工具函数",
+            "",
+            "let m = expect_any([\"ok\", \"failed\"], 5000);",
+            "if m.pattern == \"ok\" { log(\"done\"); }",
+            "// 监听仅在 send/send_line 之前开始",
+            "// expect 只匹配本次发送后的新输出",
+        ]
+        .join("\n")
+    }
+
     fn render_automation_help(&self, compact: bool) -> impl IntoElement {
         let theme = self.theme();
         let size = if compact { 9.5 } else { 10.5 };
@@ -6113,11 +6129,24 @@ impl XcordApp {
     }
 
     fn on_automation_event(&mut self, event: AutomationEvent, cx: &mut Context<Self>) {
-        let AutomationEvent::Changed { run_id } = event;
-        if self.automation_run_id == Some(run_id) {
-            self.automation_run = self.automation.run_snapshot(run_id);
-            self.automation_tick(cx);
-            if self.automation_open {
+        match event {
+            AutomationEvent::Changed { run_id } => {
+                if self.automation_run_id == Some(run_id) {
+                    self.automation_run = self.automation.run_snapshot(run_id);
+                    self.automation_tick(cx);
+                    if self.automation_open {
+                        cx.notify();
+                    }
+                }
+            }
+            AutomationEvent::ScriptsChanged => {
+                self.automation_scripts = self.automation.scripts();
+                if self.automation_selected.is_some() {
+                    self.reload_automation_source(cx);
+                }
+                if self.automation_open {
+                    self.ensure_automation_editor(cx);
+                }
                 cx.notify();
             }
         }
@@ -6502,6 +6531,25 @@ impl XcordApp {
                             }),
                     )
                     .child(div().flex_1())
+                    .child(self.tiny_text_button("AI 编辑", cx, |this, cx| {
+                        let name = this
+                            .automation_selected_script()
+                            .map(|script| script.name)
+                            .unwrap_or_else(|| "new script".to_string());
+                        let source = this
+                            .automation_editor
+                            .as_ref()
+                            .map(|editor| editor.read(cx).value().to_string())
+                            .unwrap_or_else(|| this.automation_source.clone());
+                        let prompt = format!(
+                            "I am editing the Xcord automation script `{name}`.\n\n                             Current source:\n```rhai\n{source}\n```\n\n                             Review it and help me generate or modify it. When I ask for a change,                              return the complete replacement script. If writes are allowed, use the                              automation_write_script or automation_create_script tool to apply it."
+                        );
+                        this.ai_open = true;
+                        this.ai_input
+                            .update(cx, |input, cx| input.set_value(prompt, cx));
+                        this.pending_focus = Some(PendingFocus::AiInput);
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .id("automation-fullscreen")
@@ -6678,6 +6726,12 @@ impl XcordApp {
                                     .child(self.tr("Syntax help")),
                             )
                             .child(div().flex_1())
+                            .child(self.tiny_text_button("复制", cx, |this, cx| {
+                                let text = this.automation_help_text();
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                let message = this.tr("已复制语法帮助");
+                                this.set_notice(NoticeLevel::Success, message);
+                            }))
                             .child(self.tiny_text_button(
                                 if self.automation_help_open {
                                     self.tr("Hide")
@@ -7601,6 +7655,7 @@ impl XcordApp {
         self.quick_editing = None;
         self.quick_action = SnippetAction::Command;
         self.quick_script = None;
+        self.quick_script_file = None;
         self.quick_error = None;
         self.quick_name.update(cx, |input, cx| input.clear(cx));
         self.quick_command.update(cx, |input, cx| input.clear(cx));
@@ -7612,6 +7667,8 @@ impl XcordApp {
         self.quick_editing = Some(snippet.id.clone());
         self.quick_action = snippet.action;
         self.quick_script = (!snippet.script_id.is_empty()).then(|| snippet.script_id.clone());
+        self.quick_script_file =
+            (!snippet.script_file.is_empty()).then(|| snippet.script_file.clone());
         self.quick_error = None;
         let display_name = self.snippet_label(&snippet.name);
         self.quick_name
@@ -7625,10 +7682,36 @@ impl XcordApp {
         self.quick_editing = None;
         self.quick_action = SnippetAction::Command;
         self.quick_script = None;
+        self.quick_script_file = None;
         self.quick_error = None;
         self.quick_name.update(cx, |input, cx| input.clear(cx));
         self.quick_command.update(cx, |input, cx| input.clear(cx));
         cx.notify();
+    }
+
+    fn pick_quick_script_file(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(self.tr("Select an automation script file").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path = path.to_string_lossy().into_owned();
+            let _ = this.update(cx, |this, cx| {
+                this.quick_script_file = Some(path);
+                this.quick_script = None;
+                this.quick_error = None;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn save_quick_command(&mut self, cx: &mut Context<Self>) {
@@ -7640,26 +7723,35 @@ impl XcordApp {
             return;
         }
         let script_id = self.quick_script.clone().unwrap_or_default();
+        let script_file = self.quick_script_file.clone().unwrap_or_default();
         if self.quick_action == SnippetAction::Command && command.trim().is_empty() {
             self.quick_error = Some(self.tr("Quick command cannot be empty."));
             cx.notify();
             return;
         }
         if self.quick_action == SnippetAction::Script {
-            if script_id.is_empty() {
-                self.quick_error = Some(self.tr("Select an automation script."));
-                cx.notify();
-                return;
-            }
-            if !self
-                .automation
-                .scripts()
-                .iter()
-                .any(|script| script.id == script_id)
-            {
-                self.quick_error = Some(self.tr("Automation script not found."));
-                cx.notify();
-                return;
+            if !script_file.trim().is_empty() {
+                if !Path::new(&script_file).is_file() {
+                    self.quick_error = Some(self.tr("Script file not found. Choose it again."));
+                    cx.notify();
+                    return;
+                }
+            } else {
+                if script_id.is_empty() {
+                    self.quick_error = Some(self.tr("Select an automation script or file."));
+                    cx.notify();
+                    return;
+                }
+                if !self
+                    .automation
+                    .scripts()
+                    .iter()
+                    .any(|script| script.id == script_id)
+                {
+                    self.quick_error = Some(self.tr("Automation script not found."));
+                    cx.notify();
+                    return;
+                }
             }
         }
         let mut snippet = self
@@ -7675,11 +7767,17 @@ impl XcordApp {
         snippet.name = name;
         snippet.command = command;
         snippet.action = self.quick_action;
-        snippet.script_id = if self.quick_action == SnippetAction::Script {
-            script_id
+        if self.quick_action == SnippetAction::Script && !script_file.trim().is_empty() {
+            snippet.script_file = script_file;
+            snippet.script_id = String::new();
         } else {
-            String::new()
-        };
+            snippet.script_file = String::new();
+            snippet.script_id = if self.quick_action == SnippetAction::Script {
+                script_id
+            } else {
+                String::new()
+            };
+        }
         snippet.send_enter = self.quick_action == SnippetAction::Command;
         if let Err(error) = self.sessions.save_snippet(snippet.clone()) {
             self.quick_error = Some(error);
@@ -7885,7 +7983,11 @@ impl XcordApp {
     fn execute_quick_command(&mut self, snippet: Snippet, cx: &mut Context<Self>) {
         self.quick_commands_open = false;
         if snippet.action == SnippetAction::Script {
-            self.run_automation_from_quick(&snippet.script_id, cx);
+            if !snippet.script_file.trim().is_empty() {
+                self.run_automation_from_quick_file(&snippet.script_file, cx);
+            } else {
+                self.run_automation_from_quick(&snippet.script_id, cx);
+            }
             return;
         }
         let Some(id) = self.active else {
@@ -7986,6 +8088,70 @@ impl XcordApp {
         cx.notify();
     }
 
+    fn run_automation_from_quick_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(tab) = self.active else {
+            self.set_notice(NoticeLevel::Warning, self.tr("Open a terminal tab first."));
+            cx.notify();
+            return;
+        };
+        let path_buf = PathBuf::from(path);
+        if !path_buf.is_file() {
+            self.set_notice(
+                NoticeLevel::Warning,
+                self.tr("Script file not found. Choose it again."),
+            );
+            cx.notify();
+            return;
+        }
+        let source = match std::fs::read_to_string(&path_buf) {
+            Ok(source) => source,
+            Err(error) => {
+                self.set_notice(NoticeLevel::Error, error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        if source.len() > 1_000_000 {
+            self.set_notice(NoticeLevel::Error, self.tr("Script is larger than 1 MB."));
+            cx.notify();
+            return;
+        }
+        if let Some(diagnostic) = self.automation.validate(&source) {
+            let message = format!(
+                "{} {} {}, {} {}: {}",
+                self.tr("Syntax error"),
+                self.tr("Line"),
+                diagnostic.line,
+                self.tr("Column"),
+                diagnostic.column,
+                diagnostic.message
+            );
+            self.set_notice(NoticeLevel::Error, message);
+            cx.notify();
+            return;
+        }
+        match self.automation.run_file(path, tab) {
+            Ok(run) => {
+                let name = path_buf
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(path)
+                    .to_string();
+                self.automation_run_id = Some(run.run_id);
+                self.automation_run = Some(run);
+                self.automation_error = None;
+                self.automation_tick(cx);
+                let message = self.tr_args("Running script file: {name}", &[("name", name)]);
+                self.set_notice(NoticeLevel::Info, message);
+            }
+            Err(error) => {
+                self.automation_error = Some(error.clone());
+                self.set_notice(NoticeLevel::Error, error);
+            }
+        }
+        cx.notify();
+    }
+
     fn render_quick_command_bar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let snippets = self.sessions.snippets();
@@ -8010,11 +8176,19 @@ impl XcordApp {
             let is_script = snippet.action == SnippetAction::Script;
             let label = self.snippet_label(&snippet.name);
             let label = if is_script {
-                let script = scripts
-                    .iter()
-                    .find(|script| script.id == snippet.script_id)
-                    .map(|script| script.name.clone())
-                    .unwrap_or_else(|| self.tr("Missing script"));
+                let script = if !snippet.script_file.trim().is_empty() {
+                    Path::new(&snippet.script_file)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| self.tr("Script file"))
+                } else {
+                    scripts
+                        .iter()
+                        .find(|script| script.id == snippet.script_id)
+                        .map(|script| script.name.clone())
+                        .unwrap_or_else(|| self.tr("Missing script"))
+                };
                 format!("▶ {label} · {script}")
             } else {
                 format!("$ {label}")
@@ -8419,8 +8593,53 @@ impl XcordApp {
                                     )
                             })
                             .when(self.quick_action == SnippetAction::Script, |panel| {
+                                let file_label = self
+                                    .quick_script_file
+                                    .clone()
+                                    .unwrap_or_else(|| self.tr("No external script file selected."));
                                 panel
                                     .child(self.tr("Automation script"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .text_size(px(10.))
+                                                    .text_color(if self.quick_script_file.is_some() {
+                                                        rgbc(theme.accent)
+                                                    } else {
+                                                        rgbc(theme.muted)
+                                                    })
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .child(file_label),
+                                            )
+                                            .child(small_button(self.tr("Choose file"), theme).on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.pick_quick_script_file(cx)
+                                                }),
+                                            ))
+                                            .when(self.quick_script_file.is_some(), |row| {
+                                                row.child(small_button(self.tr("Clear"), theme).on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.quick_script_file = None;
+                                                        cx.notify();
+                                                    }),
+                                                ))
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(rgbc(theme.muted))
+                                            .child(self.tr("Or choose a managed script.")),
+                                    )
                                     .child(
                                         div()
                                             .id("quick-script-list")
@@ -8467,6 +8686,7 @@ impl XcordApp {
                                                                 MouseButton::Left,
                                                                 cx.listener(move |this, _, _, cx| {
                                                                     this.quick_script = Some(id.clone());
+                                                                    this.quick_script_file = None;
                                                                     cx.notify();
                                                                 }),
                                                             )
@@ -10617,7 +10837,7 @@ fn render_ai_message(
             cx.listener(move |this, _, window, cx| {
                 this.ai_selected_message.set(Some(index));
                 this.ai_menu_open.set(false);
-                let handle = this.ai_input.read(cx).focus_handle_only();
+                let handle = this.ai_input.read(cx).focus_handle(cx);
                 window.focus(&handle);
                 cx.notify();
             }),
@@ -10627,7 +10847,7 @@ fn render_ai_message(
             cx.listener(move |this, _, window, cx| {
                 this.ai_selected_message.set(Some(index));
                 this.ai_menu_open.set(true);
-                let handle = this.ai_input.read(cx).focus_handle_only();
+                let handle = this.ai_input.read(cx).focus_handle(cx);
                 window.focus(&handle);
                 cx.stop_propagation();
                 cx.notify();

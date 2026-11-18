@@ -15,6 +15,7 @@ use xcord_cordis::{Context, Plugin, PluginMeta, Result};
 use xcord_plugin_api::{
     services, Ai, AiAssistant, AiMessageView, AiSnapshot, Command, Commands, I18n, McpTools,
     PostOffice, Runtime, RuntimeHandle, Sessions, TerminalId, ToolSpec, Ui, UiCommand, Workspace,
+    AUTOMATION_SYNTAX,
 };
 
 const INTERNAL_AI: &str = "ai/internal";
@@ -341,10 +342,16 @@ impl AiService {
         *self.status.borrow_mut() = self.i18n.t("ai", "Thinking…");
         *self.error.borrow_mut() = None;
 
-        let system = match self.terminal_context() {
-            Some(context) => format!("{}\n\n{}", settings.ai_system_prompt, context),
-            None => settings.ai_system_prompt.clone(),
-        };
+        let mut system = settings.ai_system_prompt.clone();
+        system.push_str("\n\nAutomation script context (Rhai):\n");
+        system.push_str(AUTOMATION_SYNTAX);
+        system.push_str(
+            "\nAutomation tools are available through MCP. Use automation_list_scripts and              automation_read_script before editing. Use automation_write_script or              automation_create_script only when writes are allowed, and preserve the user's intent.              After changing a script, the editor reloads automatically.",
+        );
+        if let Some(context) = self.terminal_context() {
+            system.push_str("\n\n");
+            system.push_str(&context);
+        }
         let tools = self.tools.list();
         let allow_writes = settings.ai_allow_writes;
         let history = self.messages.borrow().clone();
