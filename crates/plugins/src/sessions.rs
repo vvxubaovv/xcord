@@ -68,12 +68,22 @@ impl SessionService for SessionManager {
         if name.is_empty() {
             return Err("Group name cannot be empty.".to_string());
         }
-        if self.store.config().groups.iter().any(|group| group == name) {
-            return Ok(());
+        let parts = name.split('/').map(str::trim).collect::<Vec<_>>();
+        if parts.iter().any(|part| part.is_empty()) {
+            return Err("Group path has an empty segment.".to_string());
         }
-        let name = name.to_string();
+        let mut prefixes = Vec::new();
+        for index in 1..=parts.len() {
+            prefixes.push(parts[..index].join("/"));
+        }
         self.store
-            .update(|config| config.groups.push(name))
+            .update(|config| {
+                for prefix in prefixes {
+                    if !config.groups.iter().any(|group| group == &prefix) {
+                        config.groups.push(prefix);
+                    }
+                }
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -90,16 +100,22 @@ impl SessionService for SessionManager {
         }
         let old = old.to_string();
         let new = new.to_string();
+        let old_prefix = format!("{old}/");
+        let new_prefix = format!("{new}/");
         self.store
             .update(|config| {
                 for group in &mut config.groups {
                     if group == &old {
                         *group = new.clone();
+                    } else if let Some(suffix) = group.strip_prefix(&old_prefix) {
+                        *group = format!("{new_prefix}{suffix}");
                     }
                 }
                 for session in &mut config.sessions {
                     if session.group == old {
                         session.group = new.clone();
+                    } else if let Some(suffix) = session.group.strip_prefix(&old_prefix) {
+                        session.group = format!("{new_prefix}{suffix}");
                     }
                 }
             })
@@ -151,11 +167,18 @@ impl SessionService for SessionManager {
             .min(sessions.len());
         sessions.insert(insert_at, session);
         let group = group.to_string();
+        let mut prefixes = Vec::new();
+        let parts = group.split('/').collect::<Vec<_>>();
+        for index in 1..=parts.len() {
+            prefixes.push(parts[..index].join("/"));
+        }
         self.store
             .update(|config| {
                 config.sessions = sessions;
-                if !config.groups.iter().any(|existing| existing == &group) {
-                    config.groups.push(group);
+                for prefix in prefixes {
+                    if !config.groups.iter().any(|existing| existing == &prefix) {
+                        config.groups.push(prefix);
+                    }
                 }
             })
             .map_err(|error| error.to_string())

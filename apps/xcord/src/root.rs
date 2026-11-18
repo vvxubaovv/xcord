@@ -389,6 +389,7 @@ pub struct XcordApp {
     session_form: Option<SessionForm>,
     session_menu: Option<String>,
     group_menu: Option<String>,
+    sidebar_menu: bool,
     group_form: Option<GroupForm>,
     tab_groups: RefCell<Vec<TabGroupState>>,
     tab_group_of: RefCell<HashMap<TerminalId, String>>,
@@ -624,6 +625,7 @@ impl XcordApp {
             session_form: None,
             session_menu: None,
             group_menu: None,
+            sidebar_menu: false,
             group_form: None,
             tab_groups: RefCell::new(Vec::new()),
             tab_group_of: RefCell::new(HashMap::new()),
@@ -1349,7 +1351,12 @@ impl XcordApp {
     fn open_tab_group_dialog(&mut self, cx: &mut Context<Self>) {
         self.tab_group_pending = None;
         let theme = self.theme.clone();
-        let name = Self::make_input(&theme, &self.tr("Group name"), false, cx);
+        let name = Self::make_input(
+            &theme,
+            "分组名称（可用 Parent/Child 创建子分组）",
+            false,
+            cx,
+        );
         self.tab_group_form = Some(TabGroupForm { name, error: None });
         self.pending_focus = Some(PendingFocus::TabGroupName);
         cx.notify();
@@ -1591,6 +1598,24 @@ impl XcordApp {
             .retain(|selected| remote_paths.contains(selected.as_str()));
         self.ftp_local_selected
             .retain(|selected| local_paths.contains(selected.as_str()));
+    }
+
+    fn open_session_dialog_in_group(&mut self, group: &str, cx: &mut Context<Self>) {
+        self.open_session_dialog(None, cx);
+        if let Some(form) = &self.session_form {
+            form.group
+                .update(cx, |input, cx| input.set_value(group.to_string(), cx));
+        }
+        cx.notify();
+    }
+
+    fn open_group_dialog_with_parent(&mut self, parent: &str, cx: &mut Context<Self>) {
+        self.open_group_dialog(cx);
+        let name = format!("{parent}/");
+        if let Some(form) = &self.group_form {
+            form.name.update(cx, |input, cx| input.set_value(name, cx));
+        }
+        cx.notify();
     }
 
     fn open_group_dialog(&mut self, cx: &mut Context<Self>) {
@@ -2644,6 +2669,7 @@ impl XcordApp {
                 cx.listener(|this, _, _, cx| {
                     this.ai_selected_message.set(None);
                     this.ai_menu_open.set(true);
+                    cx.stop_propagation();
                     cx.notify();
                 }),
             )
@@ -3018,15 +3044,6 @@ impl XcordApp {
                 button("ai-menu-copy-all", self.tr("Copy chat"), theme).on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.copy_ai_transcript(cx)),
-                ),
-            )
-            .child(
-                button("ai-menu-cancel", self.tr("Cancel"), theme).on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.ai_menu_open.set(false);
-                        cx.notify();
-                    }),
                 ),
             )
     }
@@ -3669,6 +3686,32 @@ impl XcordApp {
         }
     }
 
+    fn dismiss_context_menus(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if self.session_menu.take().is_some() {
+            changed = true;
+        }
+        if self.group_menu.take().is_some() {
+            changed = true;
+        }
+        if self.sidebar_menu {
+            self.sidebar_menu = false;
+            changed = true;
+        }
+        if self.tab_menu.take().is_some() {
+            changed = true;
+        }
+        if self.tab_group_menu.take().is_some() {
+            changed = true;
+        }
+        if self.ai_menu_open.replace(false) {
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     fn global_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
@@ -3778,6 +3821,10 @@ impl XcordApp {
                 cx.stop_propagation();
             } else if self.session_menu.is_some() {
                 self.session_menu = None;
+                cx.notify();
+                cx.stop_propagation();
+            } else if self.sidebar_menu {
+                self.sidebar_menu = false;
                 cx.notify();
                 cx.stop_propagation();
             } else if self.group_menu.is_some() {
@@ -3911,6 +3958,52 @@ impl XcordApp {
             groups.retain(|(_, profiles)| !profiles.is_empty());
         }
 
+        // Groups are stored as slash-separated paths. Build a stable tree whose
+        // parents always appear before their children, including ancestors that
+        // have no sessions of their own.
+        let mut known_groups = Vec::new();
+        fn add_group_path(path: &str, out: &mut Vec<String>) {
+            let parts = path.split('/').collect::<Vec<_>>();
+            for index in 1..=parts.len() {
+                let prefix = parts[..index].join("/");
+                if !out.iter().any(|existing| existing == &prefix) {
+                    out.push(prefix);
+                }
+            }
+        }
+        for (name, _) in &groups {
+            add_group_path(name, &mut known_groups);
+        }
+        let mut profiles_by_group: HashMap<String, Vec<SessionProfile>> =
+            groups.into_iter().collect();
+        for name in &known_groups {
+            profiles_by_group.entry(name.clone()).or_default();
+        }
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for name in &known_groups {
+            let parent = name
+                .rsplit_once('/')
+                .map(|(parent, _)| parent.to_string())
+                .unwrap_or_default();
+            children.entry(parent).or_default().push(name.clone());
+        }
+        fn walk_groups(
+            parent: &str,
+            depth: usize,
+            children: &HashMap<String, Vec<String>>,
+            out: &mut Vec<(String, usize)>,
+        ) {
+            let Some(items) = children.get(parent) else {
+                return;
+            };
+            for item in items {
+                out.push((item.clone(), depth));
+                walk_groups(item, depth + 1, children, out);
+            }
+        }
+        let mut ordered_groups = Vec::new();
+        walk_groups("", 0, &children, &mut ordered_groups);
+
         let mut list = div()
             .id("session-list")
             .flex()
@@ -3923,7 +4016,7 @@ impl XcordApp {
         let scroll_target = self.pending_session_scroll.borrow().clone();
         let mut scroll_index = None;
         let mut child_index = 0usize;
-        if groups.is_empty() {
+        if ordered_groups.is_empty() {
             list = list.child(
                 div()
                     .p_3()
@@ -3932,7 +4025,32 @@ impl XcordApp {
                     .child(self.tr("No sessions match. Create one to get started.")),
             );
         }
-        for (group, profiles) in groups {
+        for (group, depth) in ordered_groups {
+            let profiles = profiles_by_group.remove(&group).unwrap_or_default();
+            let hidden = {
+                let mut prefix = String::new();
+                let mut hidden = false;
+                let parts = group.split('/').collect::<Vec<_>>();
+                for part in parts.iter().take(parts.len().saturating_sub(1)) {
+                    if !prefix.is_empty() {
+                        prefix.push('/');
+                    }
+                    prefix.push_str(part);
+                    if self.collapsed_groups.borrow().contains(&prefix) {
+                        hidden = true;
+                        break;
+                    }
+                }
+                hidden
+            };
+            if hidden {
+                continue;
+            }
+            let leaf = group
+                .rsplit('/')
+                .next()
+                .unwrap_or(group.as_str())
+                .to_string();
             let group_drag = group.clone();
             let group_drop = group.clone();
             let group_session_drop = group.clone();
@@ -3959,6 +4077,7 @@ impl XcordApp {
                 div()
                     .id(SharedString::from(format!("group-{group}")))
                     .px_2()
+                    .pl(px(8.0 + depth as f32 * 14.0))
                     .pt_3()
                     .pb_1()
                     .flex()
@@ -3981,6 +4100,7 @@ impl XcordApp {
                         cx.listener(move |this, _, _, cx| {
                             this.group_menu = Some(group_menu_target.clone());
                             this.session_menu = None;
+                            this.sidebar_menu = false;
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -4033,7 +4153,7 @@ impl XcordApp {
                         },
                     ))
                     .child(div().w(px(9.)).child(if collapsed { "▸" } else { "▾" }))
-                    .child(div().flex_1().child(self.tr(&group).to_uppercase()))
+                    .child(div().flex_1().child(self.tr(&leaf).to_uppercase()))
                     .child(format!("{}", profiles.len())),
             );
             child_index += 1;
@@ -4049,7 +4169,11 @@ impl XcordApp {
             }
             for profile in profiles {
                 let profile_id = profile.id.clone();
-                list = list.child(self.render_session_row(profile, cx));
+                list = list.child(
+                    div()
+                        .pl(px(depth as f32 * 14.0))
+                        .child(self.render_session_row(profile, cx)),
+                );
                 child_index += 1;
                 if self.session_menu.as_deref() == Some(profile_id.as_str()) {
                     list = list.child(self.render_session_menu(&profile_id, cx));
@@ -4058,7 +4182,21 @@ impl XcordApp {
             }
         }
 
-        let list = list.track_scroll(&self.session_scroll);
+        if self.sidebar_menu {
+            list = list.child(self.render_sidebar_menu(cx));
+        }
+        let list = list
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.sidebar_menu = true;
+                    this.group_menu = None;
+                    this.session_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .track_scroll(&self.session_scroll);
         if let Some(index) = scroll_index {
             self.session_scroll.scroll_to_top_of_item(index);
         }
@@ -4193,6 +4331,8 @@ impl XcordApp {
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| {
                     this.session_menu = Some(menu_id.clone());
+                    this.group_menu = None;
+                    this.sidebar_menu = false;
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -4695,7 +4835,7 @@ impl XcordApp {
                 .id(SharedString::from(format!(
                     "session-menu-{suffix}-{profile_id}"
                 )))
-                .flex_1()
+                .min_w(px(84.))
                 .h(px(26.))
                 .flex()
                 .items_center()
@@ -4834,13 +4974,6 @@ impl XcordApp {
                         cx.listener(move |this, _, window, cx| {
                             this.connect_profile(connect_id.clone(), window, cx, true);
                         }),
-                    ))
-                    .child(button("cancel", self.tr("Cancel"), theme).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.session_menu = None;
-                            cx.notify();
-                        }),
                     )),
             )
             .child(group_row)
@@ -4887,10 +5020,57 @@ impl XcordApp {
         cx.notify();
     }
 
+    fn render_sidebar_menu(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let button = |suffix: &str, label: &str, theme: &Theme| {
+            div()
+                .id(SharedString::from(format!("sidebar-menu-{suffix}")))
+                .min_w(px(96.))
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(rgbc(theme.background))
+                .text_size(px(10.5))
+                .text_color(rgbc(theme.foreground))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel)))
+                .child(label.to_string())
+        };
+        div()
+            .mx_2()
+            .mb_1()
+            .p_1()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel_alt))
+            .child(button("new-session", "新建连接", theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.sidebar_menu = false;
+                    this.open_session_dialog_in_group("Sessions", cx);
+                }),
+            ))
+            .child(button("new-group", "新建分组", theme).on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.sidebar_menu = false;
+                    this.open_group_dialog(cx);
+                }),
+            ))
+    }
+
     fn render_group_menu(&self, group: &str, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let rename_group = group.to_string();
         let collapse_group = group.to_string();
+        let new_session_group = group.to_string();
+        let new_subgroup_parent = group.to_string();
         let collapsed = self.collapsed_groups.borrow().contains(group);
         let button = |suffix: &str, label: String, theme: &Theme| {
             div()
@@ -4913,11 +5093,29 @@ impl XcordApp {
             .mb_1()
             .p_1()
             .flex()
+            .flex_wrap()
             .gap_1()
             .rounded_md()
             .border_1()
             .border_color(rgbc(theme.border))
             .bg(rgbc(theme.panel_alt))
+            .child(
+                button("new-session", "新建连接".to_string(), theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.group_menu = None;
+                        this.open_session_dialog_in_group(&new_session_group, cx);
+                    }),
+                ),
+            )
+            .child(
+                button("new-group-child", "新建分组".to_string(), theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_group_dialog_with_parent(&new_subgroup_parent, cx);
+                    }),
+                ),
+            )
             .child(
                 button("rename", self.tr("Rename group"), theme).on_mouse_up(
                     MouseButton::Left,
@@ -4926,12 +5124,6 @@ impl XcordApp {
                     }),
                 ),
             )
-            .child(button("new", self.tr("New group"), theme).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    this.open_group_dialog(cx);
-                }),
-            ))
             .child(
                 button(
                     "collapse",
@@ -4947,13 +5139,6 @@ impl XcordApp {
                     }),
                 ),
             )
-            .child(button("cancel", self.tr("Cancel"), theme).on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.group_menu = None;
-                    cx.notify();
-                }),
-            ))
     }
 
     fn toggle_group(&mut self, group: &str, cx: &mut Context<Self>) {
@@ -10707,6 +10892,14 @@ impl Render for XcordApp {
             .font(ui_font())
             .text_size(px(13.))
             .on_key_down(cx.listener(Self::global_key))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| this.dismiss_context_menus(cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.dismiss_context_menus(cx)),
+            )
             .capture_any_mouse_up(cx.listener(|this, _, _, cx| this.finish_resize(cx)))
             .child(self.render_header(cx));
         let body = div()
