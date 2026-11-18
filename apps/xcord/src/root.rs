@@ -14,10 +14,10 @@ use async_channel::Receiver;
 use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{
-    div, point, px, rgb, size, Bounds, ClipboardItem, Context, Div, DragMoveEvent, Entity,
-    Focusable, Font, Hsla, KeyDownEvent, MouseButton, MouseUpEvent, PathPromptOptions, Render,
-    Rgba, ScrollHandle, SharedString, Stateful, Timer, TitlebarOptions, Window, WindowBounds,
-    WindowOptions,
+    div, point, px, rgb, size, Bounds, ClipboardItem, Context, CursorStyle, Div, DragMoveEvent,
+    Entity, Focusable, Font, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
+    PathPromptOptions, Render, Rgba, ScrollHandle, SharedString, Stateful, Timer, TitlebarOptions,
+    Window, WindowBounds, WindowOptions,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -120,6 +120,32 @@ struct DragHover {
     group: String,
     target: Option<String>,
     after: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResizeKind {
+    Sidebar,
+    Automation,
+    AutomationLog,
+    QuickBar,
+}
+
+#[derive(Clone, Copy)]
+struct ResizeState {
+    kind: ResizeKind,
+    start_x: f32,
+    start_y: f32,
+    start_value: f32,
+}
+
+struct ResizeDrag;
+
+struct ResizeDragPreview;
+
+impl Render for ResizeDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(1.)).h(px(1.))
+    }
 }
 
 struct SessionDragPreview {
@@ -331,6 +357,7 @@ pub struct XcordApp {
     located_session: RefCell<Option<String>>,
     login_runs: RefCell<HashMap<TerminalId, LoginRun>>,
     login_started: RefCell<HashSet<TerminalId>>,
+    resize: Option<ResizeState>,
 
     automation: Automation,
     automation_open: bool,
@@ -557,6 +584,7 @@ impl XcordApp {
             located_session: RefCell::new(None),
             login_runs: RefCell::new(HashMap::new()),
             login_started: RefCell::new(HashSet::new()),
+            resize: None,
             automation,
             automation_open: false,
             automation_scripts: Vec::new(),
@@ -4012,7 +4040,7 @@ impl XcordApp {
         }
         let _ = child_index;
         div()
-            .w(px(self.settings.sidebar_width.max(200.0)))
+            .w(px(self.settings.sidebar_width.clamp(200.0, 480.0)))
             .h_full()
             .flex()
             .flex_col()
@@ -4308,6 +4336,108 @@ impl XcordApp {
             });
         })
         .detach();
+    }
+
+    fn render_resize_handle(&self, kind: ResizeKind, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme();
+        let vertical = matches!(kind, ResizeKind::Sidebar | ResizeKind::Automation);
+        let id = match kind {
+            ResizeKind::Sidebar => "resize-sidebar",
+            ResizeKind::Automation => "resize-automation",
+            ResizeKind::AutomationLog => "resize-automation-log",
+            ResizeKind::QuickBar => "resize-quick-bar",
+        };
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .when(vertical, |handle| {
+                handle
+                    .w(px(8.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .child(div().w(px(1.)).h_full().bg(rgbc(theme.border)))
+            })
+            .when(!vertical, |handle| {
+                handle
+                    .h(px(8.))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .child(div().w_full().h(px(1.)).bg(rgbc(theme.border)))
+            })
+            .bg(rgba(theme.border, 0.18))
+            .hover(|style| style.bg(rgba(theme.accent, 0.55)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.begin_resize(kind, event, cx);
+                }),
+            )
+            .on_drag(ResizeDrag, move |_, _, _, cx| cx.new(|_| ResizeDragPreview))
+            .on_drag_move::<ResizeDrag>(cx.listener(
+                move |this, event: &DragMoveEvent<ResizeDrag>, _, cx| {
+                    this.resize_drag_move(event, cx);
+                },
+            ))
+    }
+
+    fn begin_resize(&mut self, kind: ResizeKind, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let start_value = match kind {
+            ResizeKind::Sidebar => self.settings.sidebar_width,
+            ResizeKind::Automation => self.settings.automation_width,
+            ResizeKind::AutomationLog => self.settings.automation_log_height,
+            ResizeKind::QuickBar => self.settings.quick_bar_height,
+        };
+        self.resize = Some(ResizeState {
+            kind,
+            start_x: f32::from(event.position.x),
+            start_y: f32::from(event.position.y),
+            start_value,
+        });
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn resize_drag_move(&mut self, event: &DragMoveEvent<ResizeDrag>, cx: &mut Context<Self>) {
+        let Some(state) = self.resize else {
+            return;
+        };
+        let x = f32::from(event.event.position.x);
+        let y = f32::from(event.event.position.y);
+        match state.kind {
+            ResizeKind::Sidebar => {
+                self.settings.sidebar_width =
+                    (state.start_value + x - state.start_x).clamp(200.0, 480.0);
+            }
+            ResizeKind::Automation => {
+                self.settings.automation_width =
+                    (state.start_value - (x - state.start_x)).clamp(320.0, 760.0);
+            }
+            ResizeKind::AutomationLog => {
+                self.settings.automation_log_height =
+                    (state.start_value - (y - state.start_y)).clamp(70.0, 420.0);
+            }
+            ResizeKind::QuickBar => {
+                self.settings.quick_bar_height =
+                    (state.start_value - (y - state.start_y)).clamp(28.0, 180.0);
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_resize(&mut self, cx: &mut Context<Self>) {
+        if self.resize.take().is_none() {
+            return;
+        }
+        if let Err(error) = self.sessions.save_settings(self.settings.clone()) {
+            self.set_notice(NoticeLevel::Error, error);
+        }
+        cx.notify();
     }
 
     fn render_quick_access(&self, cx: &mut Context<Self>) -> Div {
@@ -6324,7 +6454,7 @@ impl XcordApp {
             .unwrap_or_else(|| self.tr("No active terminal"));
         let editor = self.automation_editor.clone();
         div()
-            .w(px(510.))
+            .w(px(self.settings.automation_width.clamp(320.0, 760.0)))
             .h_full()
             .flex()
             .flex_col()
@@ -6580,9 +6710,10 @@ impl XcordApp {
                             .child(self.tr("No script selected."))
                     }),
             )
+            .child(self.render_resize_handle(ResizeKind::AutomationLog, cx))
             .child(
                 div()
-                    .h(px(170.))
+                    .h(px(self.settings.automation_log_height.clamp(70.0, 420.0)))
                     .mx_3()
                     .my_2()
                     .flex()
@@ -7938,7 +8069,7 @@ impl XcordApp {
                 .child(format!("＋ {}", self.tr("New"))),
         );
         div()
-            .h(px(38.))
+            .h(px(self.settings.quick_bar_height.clamp(28.0, 180.0)))
             .px_3()
             .flex()
             .items_center()
@@ -8693,6 +8824,7 @@ impl XcordApp {
                     .overflow_hidden()
                     .child(self.terminal.clone()),
             );
+            main = main.child(self.render_resize_handle(ResizeKind::QuickBar, cx));
             main = main.child(self.render_quick_command_bar(cx));
             if self.settings.compose_bar {
                 main = main.child(self.render_compose(cx));
@@ -10345,16 +10477,27 @@ impl Render for XcordApp {
             .font(ui_font())
             .text_size(px(13.))
             .on_key_down(cx.listener(Self::global_key))
+            .capture_any_mouse_up(cx.listener(|this, _, _, cx| this.finish_resize(cx)))
             .child(self.render_header(cx));
         let body = div()
             .flex_1()
             .min_h(px(0.))
             .flex()
             .child(self.render_sidebar(cx))
+            .child(self.render_resize_handle(ResizeKind::Sidebar, cx))
             .child(self.render_main(cx))
             .when(
                 self.automation_open && !self.automation_fullscreen,
-                |body| body.child(self.render_automation_panel(cx)),
+                |body| {
+                    body.child(
+                        div()
+                            .h_full()
+                            .flex()
+                            .flex_shrink_0()
+                            .child(self.render_resize_handle(ResizeKind::Automation, cx))
+                            .child(self.render_automation_panel(cx)),
+                    )
+                },
             )
             .when(self.ai_open, |body| body.child(self.render_ai_panel(cx)));
         let content = if self.automation_open && self.automation_fullscreen {

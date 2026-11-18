@@ -251,6 +251,12 @@ pub struct Settings {
     #[serde(default = "default_editor_command")]
     pub editor_command: String,
     pub sidebar_width: f32,
+    #[serde(default = "default_automation_width")]
+    pub automation_width: f32,
+    #[serde(default = "default_automation_log_height")]
+    pub automation_log_height: f32,
+    #[serde(default = "default_quick_bar_height")]
+    pub quick_bar_height: f32,
     pub compose_bar: bool,
     /// UI locale. Defaults to Simplified Chinese for existing configs.
     pub language: String,
@@ -291,6 +297,9 @@ impl Default for Settings {
             download_ask: false,
             editor_command: default_editor_command(),
             sidebar_width: 260.0,
+            automation_width: 510.0,
+            automation_log_height: 170.0,
+            quick_bar_height: 38.0,
             compose_bar: true,
             language: "zh-CN".into(),
             cursor_blink: true,
@@ -307,6 +316,18 @@ impl Default for Settings {
             ai_system_prompt: default_ai_system_prompt(),
         }
     }
+}
+
+fn default_automation_width() -> f32 {
+    510.0
+}
+
+fn default_automation_log_height() -> f32 {
+    170.0
+}
+
+fn default_quick_bar_height() -> f32 {
+    38.0
 }
 
 fn default_editor_command() -> String {
