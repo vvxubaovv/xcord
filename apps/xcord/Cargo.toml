@@ -14,7 +14,10 @@ xcord-vt = { path = "../../crates/vt" }
 async-channel = "2"
 env_logger = "0.11"
 log.workspace = true
+serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+serde_yaml = "0.9"
+sha2 = "0.10"
 tokio.workspace = true
 unicode-segmentation = "1"
 base64 = "0.22"

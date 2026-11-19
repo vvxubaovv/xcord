@@ -35,6 +35,7 @@ use crate::script_editor::ScriptEditor;
 use crate::selectable_text::SelectableText;
 use crate::terminal_view::TerminalView;
 use crate::text_input::TextInput;
+use crate::transfer::{self, PortableProfile};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthMode {
@@ -353,6 +354,8 @@ pub struct XcordApp {
     quick_error: Option<String>,
     detached_windows: usize,
     detached_tabs: Rc<RefCell<HashSet<TerminalId>>>,
+    transfer_open: bool,
+    transfer_status: Option<String>,
     tearoff_watch: Cell<bool>,
     session_scroll: ScrollHandle,
     pending_session_scroll: RefCell<Option<String>>,
@@ -373,6 +376,7 @@ pub struct XcordApp {
     automation_editor: Option<Entity<ScriptEditor>>,
     automation_log: Option<Entity<SelectableText>>,
     automation_log_owner: Rc<Cell<Option<usize>>>,
+    automation_help: Entity<SelectableText>,
     automation_diagnostic: Option<ScriptDiagnostic>,
     automation_editor_revision: u64,
     automation_help_open: bool,
@@ -524,6 +528,20 @@ impl XcordApp {
             false,
             cx,
         );
+        let automation_help_owner = Rc::new(Cell::new(None));
+        let automation_help = cx.new(|cx| {
+            let mut help = SelectableText::new(
+                0,
+                automation_help_owner.clone(),
+                Self::automation_help_plain_text(),
+                rgbc(theme.foreground),
+                10.0,
+                rgbc(theme.selection),
+                cx,
+            );
+            help.set_monospace(true, cx);
+            help
+        });
         let terminal = cx.new(|cx| {
             TerminalView::new(
                 workspace.clone(),
@@ -591,6 +609,8 @@ impl XcordApp {
             quick_error: None,
             detached_windows: 0,
             detached_tabs: Rc::new(RefCell::new(HashSet::new())),
+            transfer_open: false,
+            transfer_status: None,
             tearoff_watch: Cell::new(false),
             session_scroll: ScrollHandle::new(),
             pending_session_scroll: RefCell::new(None),
@@ -610,6 +630,7 @@ impl XcordApp {
             automation_editor: None,
             automation_log: None,
             automation_log_owner: Rc::new(Cell::new(None)),
+            automation_help,
             automation_diagnostic: None,
             automation_editor_revision: 0,
             automation_help_open: true,
@@ -3725,10 +3746,11 @@ impl XcordApp {
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
         if control && !shift && keystroke.key == "c" {
-            let selected = self
-                .automation_log
-                .as_ref()
-                .and_then(|log| log.read(cx).selected_text());
+            let selected = self.automation_help.read(cx).selected_text().or_else(|| {
+                self.automation_log
+                    .as_ref()
+                    .and_then(|log| log.read(cx).selected_text())
+            });
             if let Some(text) = selected {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 cx.stop_propagation();
@@ -3823,6 +3845,10 @@ impl XcordApp {
             } else if self.session_form.is_some() {
                 self.close_session_dialog(cx);
                 cx.stop_propagation();
+            } else if self.transfer_open {
+                self.transfer_open = false;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.settings_form.is_some() {
                 self.settings_form = None;
                 cx.notify();
@@ -3900,6 +3926,11 @@ impl XcordApp {
             .child(self.header_button(self.tr("Plugins"), cx, |this, cx| {
                 this.plugins_panel = true;
                 this.refresh_plugins();
+                cx.notify();
+            }))
+            .child(self.header_button("导入导出", cx, |this, cx| {
+                this.transfer_open = true;
+                this.transfer_status = None;
                 cx.notify();
             }))
             .child(self.header_button(self.tr("Settings"), cx, |this, cx| this.open_settings(cx)))
@@ -5985,17 +6016,17 @@ impl XcordApp {
         })
     }
 
-    fn automation_help_text(&self) -> String {
+    fn automation_help_plain_text() -> String {
         [
-            "send(text) — 发送文本，不回车",
-            "send_line(text) — 发送文本并回车",
-            "send_key(key) — enter/tab/escape/ctrl+c/up…",
-            "expect(pattern, ms) — 等待文本，返回 pattern/text/before",
-            "expect_regex(pattern, ms) — 正则等待",
-            "expect_any([..], ms) — 等待任意一个模式",
-            "wait_idle(idle_ms, timeout) — 等待输出静止",
-            "read_screen() / read_scrollback(n) — 读取终端文本",
-            "sleep(ms) / log(msg) / fail(msg) — 工具函数",
+            "send(text)                发送文本，不回车",
+            "send_line(text)           发送文本并回车",
+            "send_key(key)             enter/tab/escape/ctrl+c/up…",
+            "expect(pattern, ms)       等待文本，返回 pattern/text/before",
+            "expect_regex(pattern, ms) 正则等待",
+            "expect_any([..], ms)      等待任意一个模式",
+            "wait_idle(idle_ms, timeout) 等待输出静止",
+            "read_screen() / read_scrollback(n) 读取终端文本",
+            "sleep(ms) / log(msg) / fail(msg) 工具函数",
             "",
             "let m = expect_any([\"ok\", \"failed\"], 5000);",
             "if m.pattern == \"ok\" { log(\"done\"); }",
@@ -6005,74 +6036,15 @@ impl XcordApp {
         .join("\n")
     }
 
-    fn render_automation_help(&self, compact: bool) -> impl IntoElement {
+    fn render_automation_help(&self, _compact: bool) -> impl IntoElement {
         let theme = self.theme();
-        let size = if compact { 9.5 } else { 10.5 };
-        let mut help = div()
-            .id("automation-help")
-            .flex()
-            .flex_col()
-            .gap_1()
+        div()
             .p_2()
             .rounded_md()
             .bg(rgbc(theme.panel))
             .border_1()
             .border_color(rgbc(theme.border))
-            .text_size(px(size))
-            .font_family("Consolas");
-        let lines = [
-            ("send(text)", "发送文本，不回车"),
-            ("send_line(text)", "发送文本并回车"),
-            ("send_key(key)", "enter/tab/escape/ctrl+c/up…"),
-            ("expect(pattern, ms)", "等待文本，返回 pattern/text/before"),
-            ("expect_regex(pattern, ms)", "正则等待"),
-            ("expect_any([..], ms)", "等待任意一个模式"),
-            ("wait_idle(idle_ms, timeout)", "等待输出静止"),
-            ("read_screen() / read_scrollback(n)", "读取终端文本"),
-            ("sleep(ms) / log(msg) / fail(msg)", "工具函数"),
-        ];
-        for (signature, description) in lines {
-            help = help.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(if compact { 168. } else { 205. }))
-                            .flex_shrink_0()
-                            .text_color(rgbc(theme.accent))
-                            .child(signature),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .text_color(rgbc(theme.muted))
-                            .child(description),
-                    ),
-            );
-        }
-        help.child(div().h(px(1.)).bg(rgbc(theme.border)).my_1())
-            .child(
-                div()
-                    .text_color(rgbc(theme.muted))
-                    .child("let m = expect_any([\"ok\", \"failed\"], 5000);"),
-            )
-            .child(
-                div()
-                    .text_color(rgbc(theme.muted))
-                    .child("if m.pattern == \"ok\" { log(\"done\"); }"),
-            )
-            .child(
-                div()
-                    .text_color(rgbc(theme.muted))
-                    .child("// 监听从 send/send_line 之前开始"),
-            )
-            .child(
-                div()
-                    .text_color(rgbc(theme.muted))
-                    .child("// expect 只匹配本次发送后的新输出"),
-            )
+            .child(self.automation_help.clone())
     }
 
     fn reload_automation_source(&mut self, cx: &mut Context<Self>) {
@@ -6976,12 +6948,6 @@ impl XcordApp {
                                     .child(self.tr("Syntax help")),
                             )
                             .child(div().flex_1())
-                            .child(self.tiny_text_button("复制", cx, |this, cx| {
-                                let text = this.automation_help_text();
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
-                                let message = this.tr("已复制语法帮助");
-                                this.set_notice(NoticeLevel::Success, message);
-                            }))
                             .child(self.tiny_text_button(
                                 if self.automation_help_open {
                                     self.tr("Hide")
@@ -8414,6 +8380,391 @@ impl XcordApp {
             }
         }
         cx.notify();
+    }
+
+    fn portable_profile(&self, profile: &SessionProfile) -> PortableProfile {
+        let (auth, key_path) = match &profile.auth {
+            AuthKind::Password { .. } => ("password".to_string(), String::new()),
+            AuthKind::PublicKey { path, .. } => ("public_key".to_string(), path.clone()),
+            AuthKind::Agent => ("agent".to_string(), String::new()),
+            AuthKind::None => ("none".to_string(), String::new()),
+        };
+        PortableProfile {
+            name: profile.name.clone(),
+            group: if profile.group.trim().is_empty() {
+                "Sessions".to_string()
+            } else {
+                profile.group.clone()
+            },
+            host: profile.host.clone(),
+            port: profile.port,
+            user: profile.user.clone(),
+            auth,
+            key_path,
+            password: self.sessions.password(profile),
+            passphrase: self.sessions.passphrase(profile),
+            login_script: profile.login_script.clone(),
+            startup_command: profile.startup_command.clone(),
+            term: if profile.term.trim().is_empty() {
+                "xterm-256color".to_string()
+            } else {
+                profile.term.clone()
+            },
+            keepalive_secs: profile.keepalive_secs.max(1),
+            logging: profile.logging,
+            tags: profile.tags.clone(),
+        }
+    }
+
+    fn apply_imported_profiles(
+        &mut self,
+        imported: Vec<PortableProfile>,
+        mut warnings: Vec<String>,
+        source: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let mut imported_count = 0usize;
+        let mut failed_count = 0usize;
+        for item in imported {
+            if item.host.trim().is_empty() {
+                failed_count += 1;
+                continue;
+            }
+            let name = if item.name.trim().is_empty() {
+                item.host.clone()
+            } else {
+                item.name.trim().to_string()
+            };
+            let group = if item.group.trim().is_empty() {
+                "Sessions".to_string()
+            } else {
+                item.group.trim().to_string()
+            };
+            let mut profile = SessionProfile::new(name.clone());
+            profile.group = group.clone();
+            profile.host = item.host.trim().to_string();
+            profile.port = if item.port == 0 { 22 } else { item.port };
+            profile.user = item.user;
+            profile.login_script = item.login_script;
+            profile.startup_command = item.startup_command;
+            profile.term = if item.term.trim().is_empty() {
+                "xterm-256color".to_string()
+            } else {
+                item.term
+            };
+            profile.keepalive_secs = item.keepalive_secs.max(1);
+            profile.logging = item.logging;
+            profile.tags = item.tags;
+            profile.auth = match item.auth.as_str() {
+                "public_key" => AuthKind::PublicKey {
+                    path: item.key_path,
+                    save_passphrase: item.passphrase.is_some(),
+                    secret_id: None,
+                },
+                "agent" => AuthKind::Agent,
+                "none" => AuthKind::None,
+                _ => AuthKind::Password {
+                    save: item.password.is_some(),
+                    secret_id: None,
+                },
+            };
+            if let Err(_) = self.sessions.create_group(&group) {
+                // The group is best effort; the profile can still be saved.
+            }
+            match self.sessions.save(profile.clone()) {
+                Ok(()) => {
+                    if let Some(password) = item.password {
+                        if let Err(error) = self.sessions.store_password(&profile, &password) {
+                            failed_count += 1;
+                            warnings.push(format!("{name}: password not saved: {error}"));
+                        }
+                    }
+                    if let Some(passphrase) = item.passphrase {
+                        if let Err(error) = self.sessions.store_passphrase(&profile, &passphrase) {
+                            failed_count += 1;
+                            warnings.push(format!("{name}: passphrase not saved: {error}"));
+                        }
+                    }
+                    imported_count += 1;
+                }
+                Err(error) => {
+                    failed_count += 1;
+                    warnings.push(format!("{name}: {error}"));
+                }
+            }
+        }
+        self.sync(cx);
+        let mut status =
+            format!("{source}: imported {imported_count} connection(s), {failed_count} failed");
+        if !warnings.is_empty() {
+            status.push_str(" — ");
+            status.push_str(&warnings.join("; "));
+        }
+        self.transfer_status = Some(status);
+        self.set_notice(
+            if failed_count == 0 {
+                NoticeLevel::Success
+            } else {
+                NoticeLevel::Warning
+            },
+            self.tr_args(
+                "Import finished: {count} profile(s)",
+                &[("count", imported_count.to_string())],
+            ),
+        );
+        cx.notify();
+    }
+
+    fn export_yaml_to(&mut self, directory: &Path, cx: &mut Context<Self>) {
+        let profiles = self
+            .sessions
+            .list()
+            .iter()
+            .map(|profile| self.portable_profile(profile))
+            .collect::<Vec<_>>();
+        let yaml = match transfer::export_yaml(&profiles) {
+            Ok(yaml) => yaml,
+            Err(error) => {
+                self.transfer_status = Some(format!("YAML export failed: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let path = directory.join(format!("xcord-sessions-{stamp}.yaml"));
+        match std::fs::write(&path, yaml) {
+            Ok(()) => {
+                self.transfer_status = Some(format!(
+                    "Exported {} connection(s) to {}",
+                    profiles.len(),
+                    path.display()
+                ));
+            }
+            Err(error) => self.transfer_status = Some(format!("YAML export failed: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn import_yaml_from(&mut self, path: &Path, cx: &mut Context<Self>) {
+        match std::fs::read_to_string(path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| transfer::import_yaml(&text))
+        {
+            Ok(profiles) => self.apply_imported_profiles(profiles, Vec::new(), "YAML", cx),
+            Err(error) => {
+                self.transfer_status = Some(format!("YAML import failed: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn import_xshell_from(&mut self, path: &Path, cx: &mut Context<Self>) {
+        match transfer::import_xshell(path) {
+            Ok(report) => {
+                self.apply_imported_profiles(report.profiles, report.warnings, "Xshell", cx)
+            }
+            Err(error) => {
+                self.transfer_status = Some(format!("Xshell import failed: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn export_xshell_to(&mut self, directory: &Path, cx: &mut Context<Self>) {
+        let profiles = self
+            .sessions
+            .list()
+            .iter()
+            .map(|profile| self.portable_profile(profile))
+            .collect::<Vec<_>>();
+        match transfer::export_xshell(directory, &profiles) {
+            Ok(report) => {
+                let mut status = format!(
+                    "Exported {} Xshell session(s) to {}",
+                    report.count,
+                    directory.display()
+                );
+                if !report.warnings.is_empty() {
+                    status.push_str(" — ");
+                    status.push_str(&report.warnings.join("; "));
+                }
+                self.transfer_status = Some(status);
+            }
+            Err(error) => self.transfer_status = Some(format!("Xshell export failed: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn pick_export_yaml(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select a folder for the YAML export".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.export_yaml_to(&path, cx));
+        })
+        .detach();
+    }
+
+    fn pick_import_yaml(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select a YAML connection file".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.import_yaml_from(&path, cx));
+        })
+        .detach();
+    }
+
+    fn pick_import_xshell(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select an Xshell session folder".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.import_xshell_from(&path, cx));
+        })
+        .detach();
+    }
+
+    fn pick_export_xshell(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select a folder for Xshell .xsh files".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| this.export_xshell_to(&path, cx));
+        })
+        .detach();
+    }
+
+    fn render_transfer_panel(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let status = self
+            .transfer_status
+            .clone()
+            .unwrap_or_else(|| "选择导入或导出方式。".to_string());
+        div()
+            .w(px(620.))
+            .p(px(22.))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child("导入 / 导出连接"),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("transfer-close")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.transfer_open = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.muted))
+                    .child("YAML 会包含密码明文，请妥善保管导出文件。Xshell 导入支持 5/6 的 SID+RC4 加密密码；Xshell 7+ 主密码保护的密码可能无法解密。"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(primary_button("导出 YAML", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.pick_export_yaml(cx)),
+                    ))
+                    .child(secondary_button("导入 YAML", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.pick_import_yaml(cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(secondary_button("导入 Xshell", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.pick_import_xshell(cx)),
+                    ))
+                    .child(secondary_button("导出 Xshell", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.pick_export_xshell(cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .text_size(px(10.5))
+                    .text_color(rgbc(theme.foreground))
+                    .child(status),
+            )
     }
 
     fn render_quick_command_bar(&self, cx: &mut Context<Self>) -> Div {
@@ -11030,6 +11381,8 @@ impl Render for XcordApp {
             // GPUI version paint correctly but their children miss mouse
             // hit-testing, which made fields and Test/Save buttons dead.
             modal_shell(self.render_session_dialog(cx))
+        } else if self.transfer_open {
+            modal_shell(self.render_transfer_panel(cx))
         } else if self.settings_form.is_some() {
             modal_shell(self.render_settings_panel(cx))
         } else if self.ai_config.is_some() {

@@ -6,6 +6,7 @@ mod script_editor;
 mod selectable_text;
 mod terminal_view;
 mod text_input;
+mod transfer;
 
 use gpui::{
     px, size, App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions,

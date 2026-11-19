@@ -22,6 +22,7 @@ pub struct SelectableText {
     text: String,
     color: Rgba,
     font_size: f32,
+    monospace: bool,
     selection_color: Rgba,
     focus_handle: FocusHandle,
     selection: Option<(usize, usize)>,
@@ -45,6 +46,7 @@ impl SelectableText {
             text,
             color,
             font_size,
+            monospace: false,
             selection_color,
             focus_handle: cx.focus_handle(),
             selection: None,
@@ -62,6 +64,14 @@ impl SelectableText {
             let len = self.text.len();
             self.selection = Some((start.min(len), end.min(len)));
         }
+        cx.notify();
+    }
+
+    pub fn set_monospace(&mut self, monospace: bool, cx: &mut Context<Self>) {
+        if self.monospace == monospace {
+            return;
+        }
+        self.monospace = monospace;
         cx.notify();
     }
 
@@ -209,6 +219,11 @@ impl Render for SelectableText {
             .w_full()
             .min_w(px(0.))
             .text_size(px(self.font_size))
+            .font_family(if self.monospace {
+                "Consolas"
+            } else {
+                "Microsoft YaHei UI"
+            })
             .line_height(px(self.font_size * 1.45))
             .text_color(self.color)
             .track_focus(&self.focus_handle)
