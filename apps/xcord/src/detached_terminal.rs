@@ -5,16 +5,25 @@
 //! the native title bar is the drag target for moving the window to another
 //! monitor.
 
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::prelude::*;
-use gpui::{div, px, rgb, Context, FocusHandle, MouseButton, Render, Rgba, Window};
+use gpui::{
+    div, px, rgb, Context, CursorStyle, FocusHandle, MouseButton, MouseDownEvent, Render, Rgba,
+    Timer, Window,
+};
+#[cfg(windows)]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use xcord_plugin_api::{
     Highlights, I18n, TerminalId, Themes, Ui, UiCommand, UiHost, Workspace, WorkspaceEvent,
 };
 use xcord_store::Settings;
 
+use crate::root::screen_drag;
 use crate::terminal_view::TerminalView;
 
 struct DetachedUiHost;
@@ -33,6 +42,12 @@ pub struct DetachedTerminal {
     title: String,
     i18n: I18n,
     closed: bool,
+    workspace: Workspace,
+    tab_id: TerminalId,
+    detached_tabs: Rc<std::cell::RefCell<HashSet<TerminalId>>>,
+    main_hwnd: isize,
+    detached_hwnd: Cell<isize>,
+    drag_started: Cell<bool>,
 }
 
 impl DetachedTerminal {
@@ -44,6 +59,8 @@ impl DetachedTerminal {
         i18n: I18n,
         tab: TerminalId,
         title: String,
+        main_hwnd: isize,
+        detached_tabs: Rc<std::cell::RefCell<HashSet<TerminalId>>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let themes_for_header = themes.clone();
@@ -106,11 +123,86 @@ impl DetachedTerminal {
             title,
             i18n,
             closed: false,
+            workspace,
+            tab_id: tab,
+            detached_tabs,
+            main_hwnd,
+            detached_hwnd: Cell::new(0),
+            drag_started: Cell::new(false),
         }
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    fn start_window_drag(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag_started.get() {
+            return;
+        }
+        window.activate_window();
+        let raw_hwnd = window
+            .window_handle()
+            .ok()
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                _ => None,
+            });
+        let Some(hwnd) = raw_hwnd.or_else(screen_drag::foreground_window) else {
+            return;
+        };
+        let Some((left, top, _, _)) = screen_drag::window_rect(hwnd) else {
+            return;
+        };
+        let Some((start_x, start_y)) = screen_drag::cursor() else {
+            return;
+        };
+        self.detached_hwnd.set(hwnd);
+        self.drag_started.set(true);
+        let main_hwnd = self.main_hwnd;
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(16)).await;
+                if !screen_drag::left_down() {
+                    break;
+                }
+                if let Some((x, y)) = screen_drag::cursor() {
+                    screen_drag::move_window(hwnd, left + x - start_x, top + y - start_y);
+                }
+            }
+            let reattach = main_hwnd != 0
+                && screen_drag::cursor().is_some_and(|(x, y)| {
+                    screen_drag::window_rect(main_hwnd)
+                        .is_some_and(|(l, t, r, b)| x >= l && x < r && y >= t && y < b)
+                });
+            let _ = this.update(cx, |this, cx| {
+                this.drag_started.set(false);
+                if reattach {
+                    this.reattach(cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn reattach(&mut self, cx: &mut Context<Self>) {
+        self.detached_tabs.borrow_mut().remove(&self.tab_id);
+        self.workspace.select(self.tab_id);
+        if self.main_hwnd != 0 {
+            screen_drag::activate_window(self.main_hwnd);
+        }
+        let hwnd = self.detached_hwnd.get();
+        if hwnd != 0 {
+            screen_drag::close_window(hwnd);
+        }
+        cx.notify();
     }
 
     fn color(value: [u8; 3]) -> Rgba {
@@ -141,26 +233,36 @@ impl Render for DetachedTerminal {
                     .border_color(Self::color(theme.border))
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(Self::color(theme.foreground))
-                            .child(self.title.clone()),
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor(CursorStyle::OpenHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::start_window_drag))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(Self::color(theme.foreground))
+                                    .child(self.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(if self.closed {
+                                        Self::color(theme.danger)
+                                    } else {
+                                        Self::color(theme.muted)
+                                    })
+                                    .child(if self.closed {
+                                        self.i18n.t("app", "Closed")
+                                    } else {
+                                        self.i18n.t("app", "Detached")
+                                    }),
+                            )
+                            .child(div().flex_1()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(9.5))
-                            .text_color(if self.closed {
-                                Self::color(theme.danger)
-                            } else {
-                                Self::color(theme.muted)
-                            })
-                            .child(if self.closed {
-                                self.i18n.t("app", "Closed")
-                            } else {
-                                self.i18n.t("app", "Detached")
-                            }),
-                    )
-                    .child(div().flex_1())
                     .child(
                         div()
                             .id("detached-close")

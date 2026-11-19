@@ -87,6 +87,36 @@ impl SessionService for SessionManager {
             .map_err(|error| error.to_string())
     }
 
+    fn delete_group(&self, name: &str) -> std::result::Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() || name == "Sessions" {
+            return Err("The default group cannot be deleted.".to_string());
+        }
+        if !self.store.config().groups.iter().any(|group| group == name) {
+            return Err("Group no longer exists.".to_string());
+        }
+        let parent = name
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_else(|| "Sessions".to_string());
+        let prefix = format!("{name}/");
+        self.store
+            .update(|config| {
+                config
+                    .groups
+                    .retain(|group| group != name && !group.starts_with(&prefix));
+                if !config.groups.iter().any(|group| group == &parent) {
+                    config.groups.push(parent.clone());
+                }
+                for session in &mut config.sessions {
+                    if session.group == name || session.group.starts_with(&prefix) {
+                        session.group = parent.clone();
+                    }
+                }
+            })
+            .map_err(|error| error.to_string())
+    }
+
     fn rename_group(&self, old: &str, new: &str) -> std::result::Result<(), String> {
         let new = new.trim();
         if new.is_empty() {

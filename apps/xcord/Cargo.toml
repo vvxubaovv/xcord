@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 gpui = "0.2.2"
+raw-window-handle = "0.6"
 xcord-cordis = { path = "../../crates/cordis" }
 xcord-plugin-api = { path = "../../crates/plugin-api" }
 xcord-builtins = { path = "../../crates/plugins" }

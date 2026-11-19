@@ -8320,6 +8320,7 @@ dependencies = [
  "env_logger",
  "gpui",
  "log",
+ "raw-window-handle",
  "serde_json",
  "tokio",
  "unicode-segmentation",

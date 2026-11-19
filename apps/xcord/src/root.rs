@@ -2813,6 +2813,14 @@ impl XcordApp {
                     .flex()
                     .items_end()
                     .gap_2()
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        let control =
+                            event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+                        if control && event.keystroke.key == "enter" {
+                            this.send_ai(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
                     .child(
                         div()
                             .flex_1()
@@ -4008,7 +4016,7 @@ impl XcordApp {
             .id("session-list")
             .flex()
             .flex_col()
-            .gap_1()
+            .gap(px(1.))
             .flex_1()
             .overflow_y_scroll()
             .px_2()
@@ -4077,9 +4085,9 @@ impl XcordApp {
                 div()
                     .id(SharedString::from(format!("group-{group}")))
                     .px_2()
-                    .pl(px(8.0 + depth as f32 * 14.0))
-                    .pt_3()
-                    .pb_1()
+                    .pl(px(8.0 + depth as f32 * 20.0))
+                    .pt(px(6.))
+                    .pb(px(0.))
                     .flex()
                     .items_center()
                     .gap_1()
@@ -4153,7 +4161,7 @@ impl XcordApp {
                         },
                     ))
                     .child(div().w(px(9.)).child(if collapsed { "▸" } else { "▾" }))
-                    .child(div().flex_1().child(self.tr(&leaf).to_uppercase()))
+                    .child(div().flex_1().child(self.tr(&leaf)))
                     .child(format!("{}", profiles.len())),
             );
             child_index += 1;
@@ -4171,7 +4179,7 @@ impl XcordApp {
                 let profile_id = profile.id.clone();
                 list = list.child(
                     div()
-                        .pl(px(depth as f32 * 14.0))
+                        .pl(px(28.0 + depth as f32 * 20.0))
                         .child(self.render_session_row(profile, cx)),
                 );
                 child_index += 1;
@@ -4346,7 +4354,7 @@ impl XcordApp {
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .py_2()
+                    .py(px(1.))
                     .rounded_md()
                     .cursor_pointer()
                     .hover(move |style| style.bg(hover_bg))
@@ -4411,6 +4419,7 @@ impl XcordApp {
                             .child(
                                 div()
                                     .text_size(px(12.5))
+                                    .line_height(px(15.))
                                     .text_color(rgbc(theme.foreground))
                                     .overflow_hidden()
                                     .text_ellipsis()
@@ -4419,6 +4428,7 @@ impl XcordApp {
                             .child(
                                 div()
                                     .text_size(px(10.))
+                                    .line_height(px(12.))
                                     .text_color(rgbc(theme.muted))
                                     .overflow_hidden()
                                     .text_ellipsis()
@@ -4830,6 +4840,7 @@ impl XcordApp {
         let edit_id = profile_id.to_string();
         let duplicate_id = profile_id.to_string();
         let connect_id = profile_id.to_string();
+        let delete_id = profile_id.to_string();
         let button = |suffix: &str, label: String, theme: &Theme| {
             div()
                 .id(SharedString::from(format!(
@@ -4974,6 +4985,12 @@ impl XcordApp {
                         cx.listener(move |this, _, window, cx| {
                             this.connect_profile(connect_id.clone(), window, cx, true);
                         }),
+                    ))
+                    .child(button("delete", "删除连接".to_string(), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.delete_session(&delete_id, cx);
+                        }),
                     )),
             )
             .child(group_row)
@@ -5006,6 +5023,45 @@ impl XcordApp {
         }
         self.drag_hover.replace(None);
         self.sync(cx);
+        cx.notify();
+    }
+
+    fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        let name = self
+            .sessions
+            .get(id)
+            .map(|profile| profile.name)
+            .unwrap_or_else(|| id.to_string());
+        if let Err(error) = self.sessions.delete(id) {
+            self.set_notice(NoticeLevel::Error, error);
+        } else {
+            self.session_menu = None;
+            self.sync(cx);
+            self.set_notice(
+                NoticeLevel::Info,
+                self.tr_args("Connection deleted: {name}", &[("name", name)]),
+            );
+        }
+        cx.notify();
+    }
+
+    fn delete_group(&mut self, group: &str, cx: &mut Context<Self>) {
+        if let Err(error) = self.sessions.delete_group(group) {
+            self.set_notice(NoticeLevel::Error, error);
+            cx.notify();
+            return;
+        }
+        {
+            let prefix = format!("{group}/");
+            let mut collapsed = self.collapsed_groups.borrow_mut();
+            collapsed.retain(|item| item != group && !item.starts_with(&prefix));
+        }
+        self.group_menu = None;
+        self.sync(cx);
+        self.set_notice(
+            NoticeLevel::Info,
+            self.tr_args("Group deleted: {name}", &[("name", group.to_string())]),
+        );
         cx.notify();
     }
 
@@ -5071,6 +5127,7 @@ impl XcordApp {
         let collapse_group = group.to_string();
         let new_session_group = group.to_string();
         let new_subgroup_parent = group.to_string();
+        let delete_group = group.to_string();
         let collapsed = self.collapsed_groups.borrow().contains(group);
         let button = |suffix: &str, label: String, theme: &Theme| {
             div()
@@ -5136,6 +5193,14 @@ impl XcordApp {
                         this.toggle_group(&collapse_group, cx);
                         this.group_menu = None;
                         cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                button("delete-group", "删除分组".to_string(), theme).on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.delete_group(&delete_group, cx);
                     }),
                 ),
             )
@@ -8127,17 +8192,31 @@ impl XcordApp {
         let tab_title = tab.title.clone();
         self.detached_tabs.borrow_mut().insert(tab_id);
         self.sync(cx);
+        let main_hwnd = screen_drag::foreground_window().unwrap_or(0);
         let registry = self.detached_tabs.clone();
+        let registry_for_view = registry.clone();
         let workspace_for_close = workspace.clone();
         match cx.open_window(options, move |window, cx| {
             window.on_window_should_close(cx, move |_, _| {
+                let still_detached = registry.borrow().contains(&tab_id);
                 registry.borrow_mut().remove(&tab_id);
-                workspace_for_close.close(tab_id);
+                if still_detached {
+                    workspace_for_close.close(tab_id);
+                }
                 true
             });
             let view = cx.new(|cx| {
                 DetachedTerminal::new(
-                    workspace, themes, highlights, settings, i18n, tab_id, tab_title, cx,
+                    workspace,
+                    themes,
+                    highlights,
+                    settings,
+                    i18n,
+                    tab_id,
+                    tab_title,
+                    main_hwnd,
+                    registry_for_view,
+                    cx,
                 )
             });
             window.activate_window();
@@ -11852,7 +11931,7 @@ mod base64_capture_tests {
 }
 
 #[cfg(windows)]
-mod screen_drag {
+pub(crate) mod screen_drag {
     use std::ffi::c_void;
 
     #[repr(C)]
@@ -11878,6 +11957,18 @@ mod screen_drag {
         fn ClientToScreen(window: *mut c_void, point: *mut Point) -> i32;
         fn GetCursorPos(point: *mut Point) -> i32;
         fn GetAsyncKeyState(key: i32) -> i16;
+        fn GetWindowRect(window: *mut c_void, rect: *mut Rect) -> i32;
+        fn SetWindowPos(
+            window: *mut c_void,
+            insert_after: *mut c_void,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+        fn SetForegroundWindow(window: *mut c_void) -> i32;
+        fn PostMessageW(window: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
     }
 
     #[derive(Clone, Copy)]
@@ -11940,6 +12031,54 @@ mod screen_drag {
     pub fn left_down() -> bool {
         unsafe { GetAsyncKeyState(0x01) < 0 }
     }
+
+    pub fn window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+        unsafe {
+            let mut rect = Rect::default();
+            if GetWindowRect(hwnd as *mut c_void, &mut rect) == 0 {
+                None
+            } else {
+                Some((rect.left, rect.top, rect.right, rect.bottom))
+            }
+        }
+    }
+
+    pub fn move_window(hwnd: isize, x: i32, y: i32) {
+        const SWP_NOSIZE: u32 = 0x0001;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        unsafe {
+            SetWindowPos(
+                hwnd as *mut c_void,
+                std::ptr::null_mut(),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    pub fn activate_window(hwnd: isize) {
+        unsafe {
+            SetForegroundWindow(hwnd as *mut c_void);
+        }
+    }
+
+    pub fn close_window(hwnd: isize) {
+        const WM_CLOSE: u32 = 0x0010;
+        unsafe {
+            PostMessageW(hwnd as *mut c_void, WM_CLOSE, 0, 0);
+        }
+    }
+
+    pub fn foreground_window() -> Option<isize> {
+        unsafe {
+            let window = GetForegroundWindow();
+            (!window.is_null()).then_some(window as isize)
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -11963,5 +12102,19 @@ mod screen_drag {
 
     pub fn left_down() -> bool {
         false
+    }
+
+    pub fn window_rect(_hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
+
+    pub fn move_window(_hwnd: isize, _x: i32, _y: i32) {}
+
+    pub fn activate_window(_hwnd: isize) {}
+
+    pub fn close_window(_hwnd: isize) {}
+
+    pub fn foreground_window() -> Option<isize> {
+        None
     }
 }

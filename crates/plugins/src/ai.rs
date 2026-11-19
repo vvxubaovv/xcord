@@ -19,7 +19,7 @@ use xcord_plugin_api::{
 };
 
 const INTERNAL_AI: &str = "ai/internal";
-const MAX_TOOL_ROUNDS: usize = 6;
+const MAX_TOOL_ROUNDS: usize = 10;
 const MAX_TOOL_RESULT: usize = 14_000;
 
 const AI_ZH: &[(&str, &str)] = &[
@@ -222,7 +222,12 @@ impl AiService {
     }
 
     fn push_delta(&self, text: &str) {
-        self.stream_text.borrow_mut().push_str(text);
+        let mut stream = self.stream_text.borrow_mut();
+        stream.push_str(text);
+        if normalize_dsml_markup(&stream).contains("<|DSML|") {
+            // Do not flash raw DSML tool-call markup in the chat bubble.
+            stream.clear();
+        }
     }
 
     fn apply_event(&self, event: AiEvent) {
@@ -496,6 +501,165 @@ impl AiAssistant for AiService {
     }
 }
 
+fn normalize_dsml_markup(input: &str) -> String {
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == '<' {
+            let mut cursor = index + 1;
+            while cursor < chars.len() && chars[cursor].is_whitespace() {
+                cursor += 1;
+            }
+            let closing = chars.get(cursor) == Some(&'/');
+            if closing {
+                cursor += 1;
+                while cursor < chars.len() && chars[cursor].is_whitespace() {
+                    cursor += 1;
+                }
+            }
+            if chars
+                .get(cursor)
+                .is_some_and(|ch| *ch == '|' || *ch == '｜')
+            {
+                cursor += 1;
+                while cursor < chars.len() && chars[cursor].is_whitespace() {
+                    cursor += 1;
+                }
+                let start = cursor;
+                while cursor < chars.len() && chars[cursor].is_ascii_alphabetic() {
+                    cursor += 1;
+                }
+                let token = chars[start..cursor].iter().collect::<String>();
+                while cursor < chars.len() && chars[cursor].is_whitespace() {
+                    cursor += 1;
+                }
+                if token.eq_ignore_ascii_case("DSML")
+                    && chars
+                        .get(cursor)
+                        .is_some_and(|ch| *ch == '|' || *ch == '｜')
+                {
+                    output.push_str(if closing { "</|DSML|" } else { "<|DSML|" });
+                    index = cursor + 1;
+                    continue;
+                }
+            }
+        }
+        output.push(chars[index]);
+        index += 1;
+    }
+    output
+}
+
+fn dsml_attribute(attrs: &str, key: &str) -> Option<String> {
+    let pattern = format!("{key}=\"");
+    let start = attrs.find(&pattern)? + pattern.len();
+    let end = attrs[start..].find('"')? + start;
+    Some(attrs[start..end].to_string())
+}
+
+fn dsml_parameter_value(value: &str, string: bool) -> Value {
+    let trimmed = value.trim();
+    if string {
+        return Value::String(value.to_string());
+    }
+    serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(trimmed.to_string()))
+}
+
+/// DeepSeek V4 may emit tool calls as DSML markup in the text stream instead of
+/// structured OpenAI `tool_calls`. Parse that markup so those calls still run.
+fn parse_dsml_tool_calls(raw: &str) -> Option<(String, Vec<ApiToolCall>)> {
+    let normalized = normalize_dsml_markup(raw);
+    let marker = "<|DSML|";
+    if !normalized.contains(marker) {
+        return None;
+    }
+    let (start_tag, end_tag) = if normalized.contains("<|DSML| calls>") {
+        ("<|DSML| calls>", "</|DSML| calls>")
+    } else if normalized.contains("<|DSML|calls>") {
+        ("<|DSML|calls>", "</|DSML|calls>")
+    } else if normalized.contains("<|DSML| tool_calls>") {
+        ("<|DSML| tool_calls>", "</|DSML| tool_calls>")
+    } else if normalized.contains("<|DSML|tool_calls>") {
+        ("<|DSML|tool_calls>", "</|DSML|tool_calls>")
+    } else {
+        return None;
+    };
+    let block_start = normalized.find(start_tag)?;
+    let after_start = block_start + start_tag.len();
+    let block_end = normalized[after_start..].find(end_tag)? + after_start + end_tag.len();
+    let block = &normalized[after_start..block_end - end_tag.len()];
+
+    let mut calls = Vec::new();
+    let invoke_marker = format!("{marker} invoke");
+    let invoke_marker_compact = format!("{marker}invoke");
+    let mut cursor = 0usize;
+    while let Some((relative, marker_len)) = block[cursor..]
+        .find(&invoke_marker)
+        .map(|relative| (relative, invoke_marker.len()))
+        .or_else(|| {
+            block[cursor..]
+                .find(&invoke_marker_compact)
+                .map(|relative| (relative, invoke_marker_compact.len()))
+        })
+    {
+        let invoke_start = cursor + relative;
+        let open_end = block[invoke_start..].find('>')? + invoke_start + 1;
+        let attrs = &block[invoke_start + marker_len..open_end - 1];
+        let name = dsml_attribute(attrs, "name")?;
+        let close = block[open_end..].find("</|DSML| invoke>")? + open_end;
+        let body = &block[open_end..close];
+        let mut arguments = serde_json::Map::new();
+        let param_marker = format!("{marker} parameter");
+        let param_marker_compact = format!("{marker}parameter");
+        let mut param_cursor = 0usize;
+        while let Some((relative_param, marker_len)) = body[param_cursor..]
+            .find(&param_marker)
+            .map(|relative| (relative, param_marker.len()))
+            .or_else(|| {
+                body[param_cursor..]
+                    .find(&param_marker_compact)
+                    .map(|relative| (relative, param_marker_compact.len()))
+            })
+        {
+            let param_start = param_cursor + relative_param;
+            let Some(param_open_end_rel) = body[param_start..].find('>') else {
+                break;
+            };
+            let param_open_end = param_start + param_open_end_rel + 1;
+            let param_attrs = &body[param_start + marker_len..param_open_end - 1];
+            let Some(param_name) = dsml_attribute(param_attrs, "name") else {
+                break;
+            };
+            let Some(param_close_rel) = body[param_open_end..].find("</|DSML| parameter>") else {
+                break;
+            };
+            let param_close = param_open_end + param_close_rel;
+            let string = dsml_attribute(param_attrs, "string")
+                .map(|value| value == "true")
+                .unwrap_or(true);
+            arguments.insert(
+                param_name,
+                dsml_parameter_value(&body[param_open_end..param_close], string),
+            );
+            param_cursor = param_close + "</|DSML| parameter>".len();
+        }
+        let id = format!("dsml-call-{}", calls.len() + 1);
+        calls.push(ApiToolCall {
+            id: id.clone(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name,
+                arguments: Value::Object(arguments).to_string(),
+            },
+        });
+        cursor = close + "</|DSML| invoke>".len();
+    }
+    let mut cleaned = normalized;
+    cleaned.replace_range(block_start..block_end, "");
+    Some((cleaned.trim().to_string(), calls))
+}
+
 async fn run_chat(
     office: PostOffice,
     api_key: String,
@@ -560,12 +724,24 @@ async fn run_chat(
         }
 
         let result = read_response(response, &office).await?;
-        let content = if result.content.trim().is_empty() {
+        let mut content_text = result.content;
+        let mut tool_calls = result.tool_calls;
+        if tool_calls.is_empty() {
+            if let Some((cleaned, parsed)) = parse_dsml_tool_calls(&content_text) {
+                content_text = cleaned;
+                tool_calls = parsed;
+            } else {
+                let normalized = normalize_dsml_markup(&content_text);
+                if let Some(position) = normalized.find("<|DSML|") {
+                    content_text = normalized[..position].trim().to_string();
+                }
+            }
+        }
+        let content = if content_text.trim().is_empty() {
             None
         } else {
-            Some(result.content)
+            Some(content_text)
         };
-        let tool_calls = result.tool_calls;
 
         if tool_calls.is_empty() {
             messages.push(ApiMessage::assistant(content, Vec::new()));
@@ -606,9 +782,50 @@ async fn run_chat(
         }
     }
 
-    Err(format!(
-        "stopped after {MAX_TOOL_ROUNDS} tool rounds without a final answer"
-    ))
+    // If the model kept requesting tools, make one final request without
+    // tools so the user still gets an answer grounded in the collected results.
+    let final_system = format!(
+        "{system}\n\nTool budget is exhausted. Do not call any tools now.          Give the user the best final answer using the tool results above.          If information is missing, say so explicitly and suggest the next step."
+    );
+    let mut final_messages = Vec::with_capacity(messages.len() + 1);
+    final_messages.push(json!({"role": "system", "content": final_system}));
+    for message in &messages {
+        final_messages.push(serde_json::to_value(message).map_err(|e| e.to_string())?);
+    }
+    let body = json!({
+        "model": model,
+        "messages": final_messages,
+        "stream": true,
+        "temperature": 0.2
+    });
+    post_status(&office, "Finalizing answer…");
+    let response = client
+        .post(&url)
+        .bearer_auth(&api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("final answer request failed: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "provider returned {status} while finalizing: {}",
+            truncate(&text, 800)
+        ));
+    }
+    let result = read_response(response, &office).await?;
+    let final_content = parse_dsml_tool_calls(&result.content)
+        .map(|(cleaned, _)| cleaned)
+        .unwrap_or(result.content)
+        .trim()
+        .to_string();
+    if final_content.is_empty() {
+        return Err("The model did not produce a final answer.".to_string());
+    }
+    messages.push(ApiMessage::assistant(Some(final_content), Vec::new()));
+    post_finish(&office, messages);
+    Ok(())
 }
 
 struct StreamResult {
@@ -892,6 +1109,41 @@ mod tests {
         assert_eq!(result.content, "checking");
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].function.name, "list_tabs");
+    }
+
+    #[test]
+    fn parses_dsml_tool_calls_from_content() {
+        let text = r#"<|DSML| calls>
+<|DSML| invoke name="terminal_read">
+<|DSML| parameter name="max_lines" string="false">40</|DSML| parameter>
+<|DSML| parameter name="tab_id" string="false">1</|DSML| parameter>
+</|DSML| invoke>
+</|DSML| calls>"#;
+        let (content, calls) = parse_dsml_tool_calls(text).expect("DSML should parse");
+        assert!(content.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "terminal_read");
+        let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(arguments["max_lines"], 40);
+        assert_eq!(arguments["tab_id"], 1);
+    }
+
+    #[test]
+    fn parses_dsml_with_spaces_and_newlines() {
+        let text = r#"< | DSML | calls>
+< | DSML | invoke name="terminal_read">
+< | DSML | parameter name="tab_id" string="false">1</
+|DSML| parameter>
+< | DSML | parameter name="max_lines" string="false"
+>60</|DSML| parameter>
+</|DSML| invoke>
+</|DSML| calls>"#;
+        let (_, calls) = parse_dsml_tool_calls(text).expect("spaced DSML should parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "terminal_read");
+        let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(arguments["tab_id"], 1);
+        assert_eq!(arguments["max_lines"], 60);
     }
 
     #[test]
