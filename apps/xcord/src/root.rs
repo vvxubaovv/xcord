@@ -417,6 +417,8 @@ pub struct XcordApp {
     palette: Option<PaletteState>,
     plugins_panel: bool,
     ai_open: bool,
+    ai_history_open: bool,
+    ai_active_seen: Cell<Option<TerminalId>>,
     plugin_infos: Vec<PluginInfo>,
 
     tabs: Vec<TabInfo>,
@@ -671,6 +673,8 @@ impl XcordApp {
             palette: None,
             plugins_panel: false,
             ai_open: false,
+            ai_history_open: false,
+            ai_active_seen: Cell::new(None),
             plugin_infos: Vec::new(),
             tabs: Vec::new(),
             active: None,
@@ -934,6 +938,13 @@ impl XcordApp {
             .filter(|id| self.tabs.iter().any(|tab| tab.id == *id));
         if self.active.is_none() {
             self.active = self.tabs.first().map(|tab| tab.id);
+        }
+        if self.ai_active_seen.replace(self.active) != self.active {
+            if let Some(pinned) = self.ai.context_terminal() {
+                if Some(pinned) != self.active {
+                    self.ai.set_context_terminal(None);
+                }
+            }
         }
         if self
             .tab_menu
@@ -2755,16 +2766,37 @@ impl XcordApp {
             }
         }
 
+        let stopping_label = self.tr("Stopping AI…");
         if snapshot.streaming {
             messages = messages.child(
                 div()
-                    .text_size(px(10.5))
-                    .text_color(rgbc(theme.accent))
-                    .child(if snapshot.status.is_empty() {
-                        self.tr("Thinking…")
-                    } else {
-                        self.ai_status(&snapshot.status)
-                    }),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgba(theme.accent, 0.10))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(10.5))
+                            .text_color(rgbc(theme.accent))
+                            .child(if snapshot.status.is_empty() {
+                                self.tr("Thinking…")
+                            } else {
+                                self.ai_status(&snapshot.status)
+                            }),
+                    )
+                    .child(small_button("停止", theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.ai.cancel();
+                            this.set_notice(NoticeLevel::Info, stopping_label.clone());
+                            cx.notify();
+                        }),
+                    )),
             );
         }
         if let Some(error) = &snapshot.error {
@@ -2930,6 +2962,17 @@ impl XcordApp {
                                     }
                                 }),
                             ))
+                            .child(small_button("新对话", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.new_ai_conversation(cx)),
+                            ))
+                            .child(small_button("历史", theme).on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.ai_history_open = !this.ai_history_open;
+                                    cx.notify();
+                                }),
+                            ))
                             .child(small_button(self.tr("Settings"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.open_ai_config(cx)),
@@ -2955,6 +2998,7 @@ impl XcordApp {
             )
             .child(self.render_ai_context_bar(&snapshot, cx))
             .child(self.render_ai_context_menu(cx))
+            .child(self.render_ai_history(cx))
             .child(
                 div()
                     .flex_1()
@@ -3022,6 +3066,102 @@ impl XcordApp {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.ai_menu_open.set(false);
         cx.notify();
+    }
+
+    fn new_ai_conversation(&mut self, cx: &mut Context<Self>) {
+        match self.ai.new_conversation() {
+            Ok(()) => {
+                self.ai_history_open = false;
+                self.ai_jump_target.set(None);
+                self.pending_focus = Some(PendingFocus::AiInput);
+                self.set_notice(NoticeLevel::Info, self.tr("Started a new AI conversation."));
+            }
+            Err(error) => self.set_notice(NoticeLevel::Error, error),
+        }
+        cx.notify();
+    }
+
+    fn open_ai_conversation(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.ai.open_conversation(id) {
+            Ok(()) => {
+                self.ai_history_open = false;
+                self.ai_jump_target.set(None);
+                self.ai_scroll.scroll_to_bottom();
+            }
+            Err(error) => self.set_notice(NoticeLevel::Error, error),
+        }
+        cx.notify();
+    }
+
+    fn render_ai_history(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if !self.ai_history_open {
+            return div().into_any_element();
+        }
+        let theme = self.theme();
+        let snapshot = self.ai.snapshot();
+        let mut panel = div()
+            .id("ai-history-list")
+            .mx_2()
+            .mb_1()
+            .p_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(220.))
+            .overflow_y_scroll()
+            .rounded_md()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel_alt));
+        if snapshot.conversations.is_empty() {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(10.))
+                    .text_color(rgbc(theme.muted))
+                    .child(self.tr("No saved conversations yet.")),
+            );
+        }
+        for conversation in snapshot.conversations.iter().take(30) {
+            let id = conversation.id.clone();
+            panel = panel.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "ai-history-{}",
+                        conversation.id
+                    )))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.panel)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.open_ai_conversation(&id, cx)),
+                    )
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(10.5))
+                            .text_color(rgbc(theme.foreground))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(conversation.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.))
+                            .text_color(rgbc(theme.muted))
+                            .child(format!("{}", conversation.message_count)),
+                    ),
+            );
+        }
+        panel.into_any_element()
     }
 
     fn render_ai_context_menu(&self, cx: &mut Context<Self>) -> Div {
@@ -3274,7 +3414,9 @@ impl XcordApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.ai.set_context_terminal(Some(id));
+                            // Selecting a tab keeps the copilot following the
+                            // active terminal instead of pinning a stale one.
+                            this.ai.set_context_terminal(None);
                             this.workspace.select(id);
                             this.sync(cx);
                             this.pending_focus = Some(PendingFocus::AiInput);
@@ -3800,6 +3942,13 @@ impl XcordApp {
             }
         }
         if keystroke.key == "escape" {
+            if self.ai_open && self.ai.snapshot().streaming {
+                self.ai.cancel();
+                self.set_notice(NoticeLevel::Info, self.tr("Stopping AI…"));
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
             if self.palette.is_some() {
                 self.palette = None;
                 cx.notify();
@@ -8551,10 +8700,7 @@ impl XcordApp {
     }
 
     fn import_yaml_from(&mut self, path: &Path, cx: &mut Context<Self>) {
-        match std::fs::read_to_string(path)
-            .map_err(|error| error.to_string())
-            .and_then(|text| transfer::import_yaml(&text))
-        {
+        match transfer::read_text_file(path).and_then(|text| transfer::import_yaml(&text)) {
             Ok(profiles) => self.apply_imported_profiles(profiles, Vec::new(), "YAML", cx),
             Err(error) => {
                 self.transfer_status = Some(format!("YAML import failed: {error}"));

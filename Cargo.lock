@@ -8334,6 +8334,7 @@ version = "0.1.3"
 dependencies = [
  "async-channel 2.5.0",
  "base64 0.22.1",
+ "encoding_rs",
  "env_logger",
  "gpui",
  "log",

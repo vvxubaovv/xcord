@@ -15,6 +15,14 @@ pub struct AiMessageView {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct AiConversationView {
+    pub id: String,
+    pub title: String,
+    pub updated: String,
+    pub message_count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct AiSnapshot {
     pub messages: Vec<AiMessageView>,
     pub streaming: bool,
@@ -30,12 +38,20 @@ pub struct AiSnapshot {
     pub context_title: Option<String>,
     /// True when no tab was pinned and the active tab is used.
     pub context_follows_active: bool,
+    /// Archived conversations, newest first.
+    pub conversations: Vec<AiConversationView>,
 }
 
 /// The copilot facade. All methods run on the UI thread.
 pub trait AiAssistant: 'static {
     fn snapshot(&self) -> AiSnapshot;
     fn send(&self, prompt: &str) -> Result<(), String>;
+    /// Ask the currently streaming request to stop as soon as possible.
+    fn cancel(&self);
+    /// Archive the current conversation (if any) and start a fresh one.
+    fn new_conversation(&self) -> Result<(), String>;
+    /// Load an archived conversation into the panel.
+    fn open_conversation(&self, id: &str) -> Result<(), String>;
     fn clear(&self);
     /// Re-read key presence after the shell updates the vault.
     fn refresh_key(&self);

@@ -5,7 +5,9 @@
 //! through the same MCP registry exposed to external clients.
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -19,8 +21,12 @@ use xcord_plugin_api::{
 };
 
 const INTERNAL_AI: &str = "ai/internal";
-const MAX_TOOL_ROUNDS: usize = 10;
+const MAX_TOOL_ROUNDS: usize = 32;
 const MAX_TOOL_RESULT: usize = 14_000;
+/// Keep long conversations inside the provider context window. Older user
+/// turns are dropped only when the history exceeds this rough character budget.
+const MAX_CONTEXT_CHARS: usize = 400_000;
+const COMPACT_TOOL_RESULT: usize = 4_000;
 
 const AI_ZH: &[(&str, &str)] = &[
     ("Thinking…", "思考中…"),
@@ -74,19 +80,24 @@ impl Plugin for AiPlugin {
             translations.unregister(translation_handle);
         });
 
+        let history_path = xcord_store::config_dir().join("ai-conversations.json");
+        let history = load_history(&history_path);
         let service = Rc::new(AiService {
             sessions,
             workspace,
             tools,
             i18n,
             runtime: runtime.handle(),
-            messages: RefCell::new(Vec::new()),
+            messages: RefCell::new(history.current),
             streaming: Cell::new(false),
             stream_text: RefCell::new(String::new()),
             status: RefCell::new(String::new()),
             error: RefCell::new(None),
             has_key: Cell::new(false),
             context_terminal: Cell::new(None),
+            cancel: RefCell::new(None),
+            history_path,
+            archives: RefCell::new(history.conversations),
         });
         service.refresh_key();
 
@@ -130,7 +141,7 @@ impl Plugin for AiPlugin {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ApiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,12 +195,76 @@ struct FunctionCall {
     arguments: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ConversationRecord {
+    id: String,
+    title: String,
+    updated: String,
+    messages: Vec<ApiMessage>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct HistoryFile {
+    #[serde(default)]
+    current: Vec<ApiMessage>,
+    #[serde(default)]
+    conversations: Vec<ConversationRecord>,
+}
+
+fn load_history(path: &PathBuf) -> HistoryFile {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn conversation_title(messages: &[ApiMessage]) -> String {
+    messages
+        .iter()
+        .find(|message| message.role == "user")
+        .and_then(|message| message.content.as_deref())
+        .map(|text| {
+            let line = text.lines().next().unwrap_or("").trim();
+            let line = if line.is_empty() { text.trim() } else { line };
+            line.chars().take(60).collect::<String>()
+        })
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "Conversation".to_string())
+}
+
 enum AiEvent {
     Delta(String),
     Status(String),
     Progress(Vec<ApiMessage>),
     Finish(Vec<ApiMessage>),
+    Cancelled(Vec<ApiMessage>),
     Error(String),
+}
+
+#[derive(Clone)]
+struct CancelHandle {
+    sender: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl CancelHandle {
+    fn new() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(false);
+        Self {
+            sender: Arc::new(sender),
+        }
+    }
+
+    fn cancel(&self) {
+        let _ = self.sender.send(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    fn receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.sender.subscribe()
+    }
 }
 
 pub struct AiService {
@@ -205,6 +280,9 @@ pub struct AiService {
     error: RefCell<Option<String>>,
     has_key: Cell<bool>,
     context_terminal: Cell<Option<TerminalId>>,
+    cancel: RefCell<Option<CancelHandle>>,
+    history_path: PathBuf,
+    archives: RefCell<Vec<ConversationRecord>>,
 }
 
 impl AiService {
@@ -237,6 +315,7 @@ impl AiService {
             AiEvent::Progress(messages) => {
                 *self.messages.borrow_mut() = messages;
                 self.stream_text.borrow_mut().clear();
+                self.persist_history();
             }
             AiEvent::Finish(messages) => {
                 *self.messages.borrow_mut() = messages;
@@ -244,6 +323,22 @@ impl AiService {
                 self.streaming.set(false);
                 self.status.borrow_mut().clear();
                 *self.error.borrow_mut() = None;
+                self.cancel.borrow_mut().take();
+                self.persist_history();
+            }
+            AiEvent::Cancelled(messages) => {
+                *self.messages.borrow_mut() = messages;
+                let partial = std::mem::take(&mut *self.stream_text.borrow_mut());
+                if !partial.trim().is_empty() {
+                    self.messages
+                        .borrow_mut()
+                        .push(ApiMessage::assistant(Some(partial), Vec::new()));
+                }
+                self.streaming.set(false);
+                self.status.borrow_mut().clear();
+                *self.error.borrow_mut() = None;
+                self.cancel.borrow_mut().take();
+                self.persist_history();
             }
             AiEvent::Error(error) => {
                 let partial = std::mem::take(&mut *self.stream_text.borrow_mut());
@@ -255,8 +350,40 @@ impl AiService {
                 *self.error.borrow_mut() = Some(error);
                 self.streaming.set(false);
                 self.status.borrow_mut().clear();
+                self.persist_history();
             }
         }
+    }
+
+    fn persist_history(&self) {
+        let history = HistoryFile {
+            current: self.messages.borrow().clone(),
+            conversations: self.archives.borrow().clone(),
+        };
+        let Ok(text) = serde_json::to_string_pretty(&history) else {
+            return;
+        };
+        if let Some(parent) = self.history_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&self.history_path, text);
+    }
+
+    fn archive_current(&self) -> bool {
+        let messages = self.messages.borrow().clone();
+        if messages.is_empty() {
+            return false;
+        }
+        let record = ConversationRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: conversation_title(&messages),
+            updated: chrono::Utc::now().to_rfc3339(),
+            messages,
+        };
+        let mut archives = self.archives.borrow_mut();
+        archives.insert(0, record);
+        archives.truncate(50);
+        true
     }
 
     fn terminal_context(&self) -> Option<String> {
@@ -265,14 +392,12 @@ impl AiService {
             return None;
         }
         let tabs = self.workspace.tabs();
-        let explicit = self
-            .context_terminal
-            .get()
-            .filter(|id| tabs.iter().any(|tab| tab.id == *id));
-        if self.context_terminal.get().is_some() && explicit.is_none() {
-            self.context_terminal.set(None);
-        }
-        let id = explicit.or_else(|| self.workspace.active())?;
+        // Always use the currently active tab. Pinning a terminal became stale
+        // as soon as the user switched tabs, so the copilot follows selection.
+        let id = self
+            .workspace
+            .active()
+            .filter(|id| tabs.iter().any(|tab| tab.id == *id))?;
         let tab = tabs.into_iter().find(|tab| tab.id == id)?;
         let text = self.workspace.terminal_text(id, 220)?;
         let text = if text.len() > 9000 {
@@ -286,11 +411,7 @@ impl AiService {
         };
         Some(format!(
             "{}: id={} title={:?} {}@{}:{} status={}.\nRecent terminal output (may include stale text):\n```\n{}\n```",
-            if explicit.is_some() {
-                "User-pinned conversation tab"
-            } else {
-                "Current active tab"
-            },
+            "Current active tab",
             tab.id.raw(),
             tab.title,
             tab.user,
@@ -342,6 +463,9 @@ impl AiService {
             let mut messages = self.messages.borrow_mut();
             messages.push(ApiMessage::user(prompt));
         }
+        self.persist_history();
+        let cancel_handle = CancelHandle::new();
+        *self.cancel.borrow_mut() = Some(cancel_handle.clone());
         self.streaming.set(true);
         self.stream_text.borrow_mut().clear();
         *self.status.borrow_mut() = self.i18n.t("ai", "Thinking…");
@@ -374,6 +498,7 @@ impl AiService {
                 history,
                 tools,
                 allow_writes,
+                cancel_handle,
             )
             .await;
             if let Err(error) = result {
@@ -456,7 +581,10 @@ impl AiAssistant for AiService {
         if self.context_terminal.get().is_some() && explicit.is_none() {
             self.context_terminal.set(None);
         }
-        let context = explicit.or_else(|| self.workspace.active());
+        let context = self
+            .workspace
+            .active()
+            .filter(|id| tabs.iter().any(|tab| tab.id == *id));
         let context_title = context
             .and_then(|id| tabs.into_iter().find(|tab| tab.id == id))
             .map(|tab| tab.title);
@@ -472,7 +600,18 @@ impl AiAssistant for AiService {
             include_terminal: settings.ai_include_terminal,
             context_terminal: context,
             context_title,
-            context_follows_active: explicit.is_none(),
+            context_follows_active: true,
+            conversations: self
+                .archives
+                .borrow()
+                .iter()
+                .map(|conversation| xcord_plugin_api::AiConversationView {
+                    id: conversation.id.clone(),
+                    title: conversation.title.clone(),
+                    updated: conversation.updated.clone(),
+                    message_count: conversation.messages.len(),
+                })
+                .collect(),
         }
     }
 
@@ -488,7 +627,59 @@ impl AiAssistant for AiService {
         self.spawn_request(prompt.to_string())
     }
 
+    fn cancel(&self) {
+        if !self.streaming.get() {
+            return;
+        }
+        if let Some(handle) = self.cancel.borrow().as_ref() {
+            handle.cancel();
+        }
+        *self.status.borrow_mut() = self.i18n.t("ai", "Stopping…");
+    }
+
+    fn new_conversation(&self) -> std::result::Result<(), String> {
+        if self.streaming.get() {
+            return Err(self.i18n.t("ai", "Stop the current response first."));
+        }
+        self.archive_current();
+        self.messages.borrow_mut().clear();
+        self.stream_text.borrow_mut().clear();
+        *self.error.borrow_mut() = None;
+        self.status.borrow_mut().clear();
+        self.persist_history();
+        Ok(())
+    }
+
+    fn open_conversation(&self, id: &str) -> std::result::Result<(), String> {
+        if self.streaming.get() {
+            return Err(self.i18n.t("ai", "Stop the current response first."));
+        }
+        if !self
+            .archives
+            .borrow()
+            .iter()
+            .any(|conversation| conversation.id == id)
+        {
+            return Err(self.i18n.t("ai", "Conversation not found."));
+        }
+        self.archive_current();
+        let index = self
+            .archives
+            .borrow()
+            .iter()
+            .position(|conversation| conversation.id == id)
+            .ok_or_else(|| self.i18n.t("ai", "Conversation not found."))?;
+        let record = self.archives.borrow_mut().remove(index);
+        *self.messages.borrow_mut() = record.messages;
+        self.stream_text.borrow_mut().clear();
+        *self.error.borrow_mut() = None;
+        self.status.borrow_mut().clear();
+        self.persist_history();
+        Ok(())
+    }
+
     fn clear(&self) {
+        self.cancel.borrow_mut().take();
         self.messages.borrow_mut().clear();
         self.stream_text.borrow_mut().clear();
         *self.error.borrow_mut() = None;
@@ -660,6 +851,57 @@ fn parse_dsml_tool_calls(raw: &str) -> Option<(String, Vec<ApiToolCall>)> {
     Some((cleaned.trim().to_string(), calls))
 }
 
+fn api_message_chars(message: &ApiMessage) -> usize {
+    let mut total = message.content.as_ref().map(String::len).unwrap_or(0);
+    for call in &message.tool_calls {
+        total += call.function.name.len() + call.function.arguments.len();
+    }
+    total
+}
+
+/// Drop the oldest complete user turns until the request fits the context
+/// budget. A user turn is a `user` message plus the assistant/tool messages
+/// that follow it, so the provider never sees orphaned tool results.
+fn compact_history(mut messages: Vec<ApiMessage>) -> Vec<ApiMessage> {
+    let total = || messages.iter().map(api_message_chars).sum::<usize>();
+    if total() <= MAX_CONTEXT_CHARS {
+        return messages;
+    }
+
+    let user_starts = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == "user")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut drop_count = 0usize;
+    while total() > MAX_CONTEXT_CHARS && user_starts.len() > 1 {
+        drop_count += 1;
+        let cut = user_starts[drop_count];
+        messages.drain(0..cut);
+        return compact_history(messages);
+    }
+
+    // A single turn can still be huge (many large tool results). Trim old
+    // tool output and assistant text before giving up on the request.
+    for message in &mut messages {
+        match message.role.as_str() {
+            "tool" => {
+                if let Some(content) = &mut message.content {
+                    *content = truncate(content, COMPACT_TOOL_RESULT);
+                }
+            }
+            "assistant" => {
+                if let Some(content) = &mut message.content {
+                    *content = truncate(content, COMPACT_TOOL_RESULT);
+                }
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
 async fn run_chat(
     office: PostOffice,
     api_key: String,
@@ -669,7 +911,12 @@ async fn run_chat(
     mut messages: Vec<ApiMessage>,
     tools: Vec<ToolSpec>,
     allow_writes: bool,
+    cancel: CancelHandle,
 ) -> std::result::Result<(), String> {
+    let mut cancel_rx = cancel.receiver();
+    if messages.len() > 1 {
+        messages = compact_history(messages);
+    }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
         .build()
@@ -690,6 +937,13 @@ async fn run_chat(
         .collect();
 
     for _round in 0..MAX_TOOL_ROUNDS {
+        if cancel.is_cancelled() {
+            post_event(&office, AiEvent::Cancelled(messages));
+            return Ok(());
+        }
+        if messages.len() > 1 {
+            messages = compact_history(messages);
+        }
         let mut request_messages = Vec::with_capacity(messages.len() + 1);
         request_messages.push(json!({"role": "system", "content": system}));
         for message in &messages {
@@ -707,13 +961,14 @@ async fn run_chat(
         }
 
         post_status(&office, "Thinking…");
-        let response = client
-            .post(&url)
-            .bearer_auth(&api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| format!("request failed: {error}"))?;
+        let request = client.post(&url).bearer_auth(&api_key).json(&body).send();
+        let response = tokio::select! {
+            result = request => result.map_err(|error| format!("request failed: {error}"))?,
+            _ = cancel_rx.changed() => {
+                post_event(&office, AiEvent::Cancelled(messages));
+                return Ok(());
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -723,7 +978,13 @@ async fn run_chat(
             ));
         }
 
-        let result = read_response(response, &office).await?;
+        let result = tokio::select! {
+            result = read_response(response, &office) => result?,
+            _ = cancel_rx.changed() => {
+                post_event(&office, AiEvent::Cancelled(messages));
+                return Ok(());
+            }
+        };
         let mut content_text = result.content;
         let mut tool_calls = result.tool_calls;
         if tool_calls.is_empty() {
@@ -771,7 +1032,13 @@ async fn run_chat(
                     "tool `{tool_name}` changes state and terminal writes are disabled; ask the user to enable them"
                 ))
             } else {
-                call_tool(office.clone(), tool_name.clone(), arguments).await
+                tokio::select! {
+                    result = call_tool(office.clone(), tool_name.clone(), arguments) => result,
+                    _ = cancel_rx.changed() => {
+                        post_event(&office, AiEvent::Cancelled(messages));
+                        return Ok(());
+                    }
+                }
             };
             let text = match output {
                 Ok(value) => value_to_text(value),
@@ -799,13 +1066,14 @@ async fn run_chat(
         "temperature": 0.2
     });
     post_status(&office, "Finalizing answer…");
-    let response = client
-        .post(&url)
-        .bearer_auth(&api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| format!("final answer request failed: {error}"))?;
+    let request = client.post(&url).bearer_auth(&api_key).json(&body).send();
+    let response = tokio::select! {
+        result = request => result.map_err(|error| format!("final answer request failed: {error}"))?,
+        _ = cancel_rx.changed() => {
+            post_event(&office, AiEvent::Cancelled(messages));
+            return Ok(());
+        }
+    };
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
@@ -814,7 +1082,13 @@ async fn run_chat(
             truncate(&text, 800)
         ));
     }
-    let result = read_response(response, &office).await?;
+    let result = tokio::select! {
+        result = read_response(response, &office) => result?,
+        _ = cancel_rx.changed() => {
+            post_event(&office, AiEvent::Cancelled(messages));
+            return Ok(());
+        }
+    };
     let final_content = parse_dsml_tool_calls(&result.content)
         .map(|(cleaned, _)| cleaned)
         .unwrap_or(result.content)
@@ -1144,6 +1418,42 @@ mod tests {
         let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(arguments["tab_id"], 1);
         assert_eq!(arguments["max_lines"], 60);
+    }
+
+    #[test]
+    fn compact_history_drops_old_turns_but_keeps_user_boundary() {
+        let mut first = ApiMessage::user("old");
+        first.content = Some("x".repeat(MAX_CONTEXT_CHARS + 10));
+        let messages = vec![
+            first,
+            ApiMessage::assistant(Some("old answer".into()), Vec::new()),
+            ApiMessage::user("latest"),
+            ApiMessage::assistant(Some("latest answer".into()), Vec::new()),
+        ];
+        let compacted = compact_history(messages);
+        assert_eq!(compacted.first().map(|m| m.role.as_str()), Some("user"));
+        assert_eq!(
+            compacted.first().and_then(|m| m.content.as_deref()),
+            Some("latest")
+        );
+    }
+
+    #[test]
+    fn history_file_roundtrips() {
+        let history = HistoryFile {
+            current: vec![ApiMessage::user("hello")],
+            conversations: vec![ConversationRecord {
+                id: "c1".into(),
+                title: conversation_title(&[ApiMessage::user("first line\nsecond")]),
+                updated: "2026-01-01T00:00:00Z".into(),
+                messages: vec![ApiMessage::assistant(Some("hi".into()), Vec::new())],
+            }],
+        };
+        let text = serde_json::to_string(&history).unwrap();
+        let loaded: HistoryFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(loaded.current.len(), 1);
+        assert_eq!(loaded.conversations[0].title, "first line");
+        assert_eq!(loaded.conversations[0].messages.len(), 1);
     }
 
     #[test]

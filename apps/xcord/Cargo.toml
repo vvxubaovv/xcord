@@ -17,6 +17,7 @@ log.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml = "0.9"
+encoding_rs = "0.8"
 sha2 = "0.10"
 tokio.workspace = true
 unicode-segmentation = "1"

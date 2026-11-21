@@ -135,8 +135,39 @@ fn collect_xsh_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String
     Ok(())
 }
 
+/// Xshell writes .xsh files as ANSI/GBK on Chinese Windows, sometimes as
+/// UTF-16. Decode BOM/UTF-8 first, then fall back to GB18030.
+pub fn read_text_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    if let Some((encoding, bom_len)) = encoding_rs::Encoding::for_bom(&bytes) {
+        let (text, _) = encoding.decode_without_bom_handling(&bytes[bom_len..]);
+        return Ok(text.into_owned());
+    }
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        return Ok(text.to_string());
+    }
+    if bytes.len() % 2 == 0 {
+        let pairs = bytes.len() / 2;
+        let le_nuls = bytes.chunks_exact(2).filter(|pair| pair[1] == 0).count();
+        let be_nuls = bytes.chunks_exact(2).filter(|pair| pair[0] == 0).count();
+        if le_nuls * 4 > pairs * 3 {
+            let (text, _) = encoding_rs::UTF_16LE.decode_without_bom_handling(&bytes);
+            return Ok(text.into_owned());
+        }
+        if be_nuls * 4 > pairs * 3 {
+            let (text, _) = encoding_rs::UTF_16BE.decode_without_bom_handling(&bytes);
+            return Ok(text.into_owned());
+        }
+    }
+    let (text, _, _) = encoding_rs::GB18030.decode(&bytes);
+    Ok(text.into_owned())
+}
+
 fn parse_xsh_file(path: &Path, root: &Path, sid: Option<&str>) -> Result<PortableProfile, String> {
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let text = read_text_file(path)?;
     let ini = parse_ini(&text);
     let find = |keys: &[&str]| -> Option<String> {
         for section in ["connection", "connection:authentication", "connection:ssh"] {
@@ -444,6 +475,37 @@ mod tests {
         let encrypted = encrypt_xshell_password("p@ssw0rd", sid).unwrap();
         let decrypted = decrypt_xshell_password(&encrypted, Some(sid)).unwrap();
         assert_eq!(decrypted, "p@ssw0rd");
+    }
+
+    #[test]
+    fn decodes_gbk_and_utf16_xsh_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "xcord-encoding-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gbk_path = dir.join("gbk.xsh");
+        let (gbk, _, _) = encoding_rs::GBK.encode("[CONNECTION]\nHost=中文");
+        std::fs::write(&gbk_path, gbk.as_ref()).unwrap();
+        assert_eq!(
+            read_text_file(&gbk_path).unwrap(),
+            "[CONNECTION]\nHost=中文"
+        );
+
+        let utf16_path = dir.join("utf16.xsh");
+        let mut utf16 = vec![0xff, 0xfe];
+        for unit in "[CONNECTION]\nHost=中文".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&utf16_path, utf16).unwrap();
+        assert_eq!(
+            read_text_file(&utf16_path).unwrap(),
+            "[CONNECTION]\nHost=中文"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
