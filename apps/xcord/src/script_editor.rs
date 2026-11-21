@@ -469,8 +469,7 @@ impl ScriptEditor {
         let word = keystroke.modifiers.control || keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
 
-        if self.marked_range.is_some() && !word {
-            cx.stop_propagation();
+        if crate::ime::is_composing() || self.marked_range.is_some() {
             return;
         }
 

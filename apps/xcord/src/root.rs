@@ -528,6 +528,7 @@ impl XcordApp {
             false,
             cx,
         );
+        crate::ime::ensure_imm_context(window);
         let automation_help_owner = Rc::new(Cell::new(None));
         let automation_help = cx.new(|cx| {
             let mut help = SelectableText::new(
@@ -2837,7 +2838,8 @@ impl XcordApp {
                     .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         let control =
                             event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
-                        if control && event.keystroke.key == "enter" {
+                        if control && event.keystroke.key == "enter" && !crate::ime::is_composing()
+                        {
                             this.send_ai(cx);
                             cx.stop_propagation();
                         }

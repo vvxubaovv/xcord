@@ -192,7 +192,8 @@ impl TerminalView {
         let key = keystroke.key.as_str();
 
         if !control && !keystroke.modifiers.alt && !self.ime_text.is_empty() {
-            cx.stop_propagation();
+            // Never consume keys while the IME owns composition; returning
+            // lets GPUI translate them back to the IME.
             return;
         }
 

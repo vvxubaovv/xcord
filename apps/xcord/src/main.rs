@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod detached_terminal;
+mod ime;
 pub(crate) mod root;
 mod script_editor;
 mod selectable_text;

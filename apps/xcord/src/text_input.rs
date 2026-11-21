@@ -256,8 +256,10 @@ impl TextInput {
         let word = modifiers.control || modifiers.platform;
         let shift = modifiers.shift;
 
-        if self.marked_range.is_some() && !word {
-            cx.stop_propagation();
+        if crate::ime::is_composing() || self.marked_range.is_some() {
+            // Never consume keys while the IME owns composition. Returning
+            // without stopping propagation lets GPUI translate the key for
+            // the IME (Enter to commit, Backspace to edit candidates, ...).
             return;
         }
 
