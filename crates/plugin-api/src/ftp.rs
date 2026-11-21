@@ -35,8 +35,17 @@ pub struct FtpSnapshot {
 
 #[derive(Clone, Debug)]
 pub enum FtpEvent {
-    Changed { profile_id: String },
-    Notice { level: NoticeLevel, message: String },
+    Changed {
+        profile_id: String,
+    },
+    Downloaded {
+        profile_id: String,
+        paths: Vec<String>,
+    },
+    Notice {
+        level: NoticeLevel,
+        message: String,
+    },
 }
 
 pub trait FtpService {

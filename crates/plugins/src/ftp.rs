@@ -444,6 +444,7 @@ impl FtpShared {
         let state = self.data.clone();
         let id = profile_id.to_string();
         self.runtime.spawn(async move {
+            let mut downloaded = Vec::new();
             {
                 let client = client.lock().await;
                 for remote in remote_paths {
@@ -455,6 +456,7 @@ impl FtpShared {
                         }
                         break;
                     }
+                    downloaded.push(local.to_string_lossy().into_owned());
                 }
                 if let Ok(entries) = read_local(&local_dir) {
                     state.local.lock().unwrap().entries = entries;
@@ -462,6 +464,12 @@ impl FtpShared {
                 if let Some(snapshot) = state.snapshots.lock().unwrap().get_mut(&id) {
                     snapshot.busy = None;
                 }
+            }
+            if !downloaded.is_empty() {
+                let _ = state.events.send(FtpEvent::Downloaded {
+                    profile_id: id.clone(),
+                    paths: downloaded,
+                });
             }
             state.emit(&id);
         });

@@ -245,6 +245,7 @@ struct SettingsForm {
     strict_host_keys: bool,
     download_dir: Entity<TextInput>,
     download_ask: bool,
+    download_reveal: bool,
     error: Option<String>,
 }
 
@@ -1210,6 +1211,8 @@ impl XcordApp {
             WorkspaceEvent::FileSaved { path, .. } => {
                 if self.settings.download_ask {
                     self.prompt_move_saved_file(PathBuf::from(path), cx);
+                } else if self.settings.download_reveal {
+                    reveal_in_file_manager(&path);
                 }
             }
             WorkspaceEvent::StatusChanged(id) | WorkspaceEvent::Bell(id) => {
@@ -1591,6 +1594,19 @@ impl XcordApp {
     fn on_ftp_event(&mut self, event: FtpEvent, cx: &mut Context<Self>) {
         match event {
             FtpEvent::Changed { profile_id } => {
+                if self.ftp_open
+                    && (profile_id == "*"
+                        || self.ftp_profile.as_deref() == Some(profile_id.as_str()))
+                {
+                    self.refresh_ftp_snapshot(cx);
+                }
+            }
+            FtpEvent::Downloaded { profile_id, paths } => {
+                if self.settings.download_reveal {
+                    if let Some(path) = paths.first() {
+                        reveal_in_file_manager(path);
+                    }
+                }
                 if self.ftp_open
                     && (profile_id == "*"
                         || self.ftp_profile.as_deref() == Some(profile_id.as_str()))
@@ -2359,6 +2375,7 @@ impl XcordApp {
             strict_host_keys: self.settings.host_key_policy == HostKeyPolicy::Strict,
             download_dir,
             download_ask: self.settings.download_ask,
+            download_reveal: self.settings.download_reveal,
             error: None,
         });
         cx.notify();
@@ -2434,6 +2451,7 @@ impl XcordApp {
         settings.highlight = form.highlight;
         settings.download_dir = form.download_dir.read(cx).value().trim().to_string();
         settings.download_ask = form.download_ask;
+        settings.download_reveal = form.download_reveal;
         settings.host_key_policy = if form.strict_host_keys {
             HostKeyPolicy::Strict
         } else {
@@ -7947,6 +7965,9 @@ impl XcordApp {
                         if self.settings.download_ask {
                             self.prompt_move_saved_file(path, cx);
                         } else {
+                            if self.settings.download_reveal {
+                                reveal_in_file_manager(&path.to_string_lossy());
+                            }
                             self.set_notice(
                                 NoticeLevel::Success,
                                 self.tr_args(
@@ -11287,6 +11308,28 @@ impl XcordApp {
             )
             .child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        checkbox(
+                            "\u{4e0b}\u{8f7d}\u{5b8c}\u{6210}\u{540e}\u{5728}\u{6587}\u{4ef6}\u{6d4f}\u{89c8}\u{5668}\u{4e2d}\u{663e}\u{793a}",
+                            form.download_reveal,
+                            theme,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(form) = &mut this.settings_form {
+                                    form.download_reveal = !form.download_reveal;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
                     .text_size(px(10.))
                     .text_color(if error.is_some() {
                         rgbc(theme.danger)
@@ -11934,6 +11977,38 @@ fn save_base64_file(name: &str, bytes: &[u8], dir: &Path) -> Result<PathBuf, Str
     let path = unique_file_path(dir, &name);
     std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
     Ok(path)
+}
+
+fn reveal_in_file_manager(path: &str) {
+    let path = Path::new(path);
+    let target = if path.exists() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", target.display()))
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(target)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(if target.is_dir() {
+                target
+            } else {
+                target.parent().unwrap_or(target)
+            })
+            .spawn();
+    }
 }
 
 fn configured_download_dir(settings: &Settings) -> PathBuf {

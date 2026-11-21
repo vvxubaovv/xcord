@@ -250,6 +250,9 @@ pub struct Settings {
     /// Ask for another folder after a file has been received.
     #[serde(default)]
     pub download_ask: bool,
+    /// Reveal completed downloads in the platform file manager.
+    #[serde(default = "default_true")]
+    pub download_reveal: bool,
     /// External editor used by the automation script page.
     #[serde(default = "default_editor_command")]
     pub editor_command: String,
@@ -300,6 +303,7 @@ impl Default for Settings {
             log_dir: String::new(),
             download_dir: String::new(),
             download_ask: false,
+            download_reveal: true,
             editor_command: default_editor_command(),
             sidebar_width: 260.0,
             automation_width: 510.0,
