@@ -10045,6 +10045,31 @@ impl XcordApp {
             )
     }
 
+    fn pick_ftp_local_folder(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(self.tr("Choose local folder").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path = path.to_string_lossy().to_string();
+            let _ = this.update(cx, |this, cx| {
+                this.ftp.navigate_local(&path);
+                this.ftp_local_input
+                    .update(cx, |input, cx| input.set_value(path, cx));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_ftp_pane(
         &self,
         title: String,
@@ -10206,6 +10231,24 @@ impl XcordApp {
                         )
                         .child(self.tr("New folder")),
                 );
+        }
+        if !remote {
+            toolbar = toolbar.child(
+                div()
+                    .id("ftp-pick-local")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .text_size(px(10.))
+                    .text_color(rgbc(theme.muted))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgbc(theme.accent)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.pick_ftp_local_folder(cx)),
+                    )
+                    .child("\u{9009}\u{62e9}"),
+            );
         }
         let mut rows = div()
             .id(if remote {
