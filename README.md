@@ -164,7 +164,7 @@ guide, the threading model, and the session-open sequence.
 - **Localization**: Simplified Chinese by default, English available in Settings;
   every plugin can register its own locale catalogs and unregister them on
   unload. Command titles and plugin metadata are localized automatically.
-- **MCP server**: 12 tools and 3 resources (plus a terminal template) over
+- **MCP server**: 42 tools and 3 resources (plus a terminal template) over
   localhost JSON-RPC, with a stdio bridge for Claude Desktop, Cursor, and other
   MCP clients.
 - **AI copilot**: streaming chat, selectable terminal context, auto-scroll, and
@@ -411,6 +411,20 @@ The stdio bridge (`apps/xcord-mcp`) forwards newline-delimited JSON-RPC to
 | `list_commands` | yes | Command-palette entries |
 | `run_command` | no | Execute a command by id |
 | `get_settings` | yes | Sanitized settings (token removed) |
+| `list_groups` | yes | Session group paths |
+| `create_group` / `rename_group` / `delete_group` | no | Manage nested session groups |
+| `create_session` / `update_session` / `delete_session` / `move_session` | no | Manage saved connections |
+| `list_snippets` / `create_snippet` / `delete_snippet` | mixed | Quick-command snippets |
+| `list_highlights` / `save_highlight` / `delete_highlight` | mixed | Terminal highlight rules |
+| `automation_run_script` | no | Run an automation script on a tab |
+| `automation_stop_script` | no | Stop a running automation run |
+| `automation_run_status` | yes | Active or specific automation run |
+| `next_tab` / `previous_tab` | yes | Navigate open tabs |
+| `move_tab` | no | Reorder tabs |
+| `reconnect_tab` | no | Reconnect a terminal tab |
+| `resize_terminal` | no | Resize the PTY |
+| `scroll_terminal` | yes | Scroll a terminal viewport |
+| `export_sessions` / `import_sessions` | no | TOML connection backup/restore |
 
 Resources: `xcord://sessions`, `xcord://tabs`, `xcord://plugins`, plus the
 `xcord://terminal/{id}` template. The copilot calls this exact registry, so
@@ -421,11 +435,11 @@ Ollama) or enter any OpenAI-compatible base URL, and store an API key in the
 platform vault. The key can also come from `XCORD_AI_API_KEY`,
 `DEEPSEEK_API_KEY`, or `OPENAI_API_KEY`.
 
-- **Terminal context** sends the selected tab's recent output to the model. Use
-  the chips above the chat to pin a tab or follow the active one. Disable it for
-  sensitive hosts.
+- **Terminal context** sends the active tab's recent output to the model and
+  follows tab switches automatically. Disable it for sensitive hosts.
 - **Writes blocked** is the default. Enable it only when you want the model to
-  call `terminal_send`, `open_session`, `close_tab`, or `run_command`.
+  call `terminal_send`, `open_session`, `close_tab`, `run_command`, or any
+  session/group/automation mutation tool.
 - Streaming, tool calls, tool results, and errors appear inline. `Ctrl+Shift+I`
   toggles the panel.
 

@@ -22,6 +22,7 @@ use xcord_plugin_api::{
     McpToolRegistry, McpTools, PostOffice, ResourceContent, ResourceSpec, Runtime, Sessions,
     ToolSpec, Workspace,
 };
+use xcord_store::{AuthKind, HighlightRule, SessionProfile, Snippet};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const INTERNAL_PROTOCOL: &str = "mcp/protocol";
@@ -878,7 +879,7 @@ fn register_tools(
             name: "get_settings".into(),
             title: "Get settings".into(),
             description: "Read sanitized Xcord settings (secrets are removed).".into(),
-            input_schema: no_args,
+            input_schema: no_args.clone(),
             read_only: true,
         },
         {
@@ -893,6 +894,814 @@ fn register_tools(
             }
         },
     );
+
+    tools.register(
+        ToolSpec {
+            name: "list_groups".into(),
+            title: "List session groups".into(),
+            description: "List all session group paths.".into(),
+            input_schema: no_args.clone(),
+            read_only: true,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, _args| {
+                Ok(Value::Array(
+                    sessions.groups().into_iter().map(Value::String).collect(),
+                ))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "create_group".into(),
+            title: "Create session group".into(),
+            description: "Create a nested session group. Parent groups are created automatically.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "Group path, e.g. Servers/Prod"}},
+                "required": ["name"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                let name = required_str(&args, "name")?;
+                sessions.create_group(&name)?;
+                Ok(json!({"created": name}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "rename_group".into(),
+            title: "Rename session group".into(),
+            description: "Rename a group and all descendant groups.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "old": {"type": "string"},
+                    "new": {"type": "string"}
+                },
+                "required": ["old", "new"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                sessions
+                    .rename_group(&required_str(&args, "old")?, &required_str(&args, "new")?)?;
+                Ok(json!({"renamed": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "delete_group".into(),
+            title: "Delete session group".into(),
+            description: "Delete a group and its child groups; contained sessions move to the parent.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                sessions.delete_group(&required_str(&args, "name")?)?;
+                Ok(json!({"deleted": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "create_session".into(),
+            title: "Create session".into(),
+            description:
+                "Create a saved SSH connection profile. Passwords are stored in the OS vault."
+                    .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "group": {"type": "string", "default": "Sessions"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer", "default": 22},
+                    "user": {"type": "string"},
+                    "auth": {"type": "string", "enum": ["password", "public_key", "agent", "none"]},
+                    "key_path": {"type": "string"},
+                    "password": {"type": "string"},
+                    "passphrase": {"type": "string"},
+                    "term": {"type": "string"},
+                    "login_script": {"type": "string"},
+                    "startup_command": {"type": "string"},
+                    "logging": {"type": "boolean"},
+                    "tags": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["name", "host"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                let name = required_str(&args, "name")?;
+                let host = required_str(&args, "host")?;
+                let mut profile = SessionProfile::new(name);
+                profile.host = host;
+                profile.port = args
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(22)
+                    .clamp(1, 65535) as u16;
+                profile.user = args
+                    .get("user")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                profile.group = args
+                    .get("group")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Sessions")
+                    .to_string();
+                apply_profile_fields(&mut profile, &args);
+                sessions.create_group(&profile.group)?;
+                sessions.save(profile.clone())?;
+                apply_profile_secrets(&sessions, &profile, &args)?;
+                Ok(profile_json(&sessions, &profile))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "update_session".into(),
+            title: "Update session".into(),
+            description: "Update fields on an existing session profile. Omitted fields are preserved.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "group": {"type": "string"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "user": {"type": "string"},
+                    "auth": {"type": "string", "enum": ["password", "public_key", "agent", "none"]},
+                    "key_path": {"type": "string"},
+                    "password": {"type": "string", "description": "Empty string clears the saved password"},
+                    "passphrase": {"type": "string"},
+                    "term": {"type": "string"},
+                    "login_script": {"type": "string"},
+                    "startup_command": {"type": "string"},
+                    "logging": {"type": "boolean"},
+                    "tags": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["id"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                let id = required_str(&args, "id")?;
+                let mut profile = sessions.get(&id).ok_or_else(|| format!("session {id} not found"))?;
+                if let Some(value) = args.get("name").and_then(Value::as_str) {
+                    profile.name = value.to_string();
+                }
+                if let Some(value) = args.get("host").and_then(Value::as_str) {
+                    profile.host = value.to_string();
+                }
+                if let Some(value) = args.get("port").and_then(Value::as_u64) {
+                    profile.port = value.clamp(1, 65535) as u16;
+                }
+                if let Some(value) = args.get("user").and_then(Value::as_str) {
+                    profile.user = value.to_string();
+                }
+                if let Some(value) = args.get("group").and_then(Value::as_str) {
+                    profile.group = value.to_string();
+                }
+                apply_profile_fields(&mut profile, &args);
+                sessions.create_group(&profile.group)?;
+                sessions.save(profile.clone())?;
+                apply_profile_secrets(&sessions, &profile, &args)?;
+                Ok(profile_json(&sessions, &profile))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "delete_session".into(),
+            title: "Delete session".into(),
+            description: "Delete a saved session profile.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                sessions.delete(&required_str(&args, "id")?)?;
+                Ok(json!({"deleted": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "move_session".into(),
+            title: "Move session".into(),
+            description: "Move a session profile into another group.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "group": {"type": "string"}
+                },
+                "required": ["id", "group"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                sessions.move_session(
+                    &required_str(&args, "id")?,
+                    &required_str(&args, "group")?,
+                    None,
+                    true,
+                )?;
+                Ok(json!({"moved": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "list_snippets".into(),
+            title: "List snippets".into(),
+            description: "List saved quick command snippets.".into(),
+            input_schema: no_args.clone(),
+            read_only: true,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, _args| {
+                Ok(Value::Array(
+                    sessions.snippets().into_iter().map(snippet_json).collect(),
+                ))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "create_snippet".into(),
+            title: "Create snippet".into(),
+            description: "Create a quick command snippet.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "command": {"type": "string"},
+                    "send_enter": {"type": "boolean", "default": true}
+                },
+                "required": ["name", "command"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                let mut snippet = Snippet::new(
+                    required_str(&args, "name")?,
+                    required_str(&args, "command")?,
+                );
+                snippet.send_enter = args
+                    .get("send_enter")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                sessions.save_snippet(snippet.clone())?;
+                Ok(snippet_json(snippet))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "delete_snippet".into(),
+            title: "Delete snippet".into(),
+            description: "Delete a quick command snippet.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                sessions.delete_snippet(&required_str(&args, "id")?)?;
+                Ok(json!({"deleted": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "list_highlights".into(),
+            title: "List highlight rules".into(),
+            description: "List terminal highlight rules.".into(),
+            input_schema: no_args.clone(),
+            read_only: true,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, _args| {
+                Ok(Value::Array(
+                    sessions
+                        .highlights()
+                        .into_iter()
+                        .map(highlight_json)
+                        .collect(),
+                ))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "save_highlight".into(),
+            title: "Save highlight rule".into(),
+            description: "Create a terminal highlight rule.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "pattern": {"type": "string"},
+                    "foreground": {"type": "string"},
+                    "background": {"type": "string"},
+                    "enabled": {"type": "boolean", "default": true}
+                },
+                "required": ["name", "pattern"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                let mut rule = HighlightRule::new(
+                    required_str(&args, "name")?,
+                    required_str(&args, "pattern")?,
+                );
+                if let Some(value) = args.get("foreground").and_then(Value::as_str) {
+                    rule.foreground = Some(value.to_string());
+                }
+                if let Some(value) = args.get("background").and_then(Value::as_str) {
+                    rule.background = Some(value.to_string());
+                }
+                rule.enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                sessions.save_highlight(rule.clone())?;
+                Ok(highlight_json(rule))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "delete_highlight".into(),
+            title: "Delete highlight rule".into(),
+            description: "Delete a terminal highlight rule.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                sessions.delete_highlight(&required_str(&args, "id")?)?;
+                Ok(json!({"deleted": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "automation_run_script".into(),
+            title: "Run automation script".into(),
+            description: "Run an automation script against a terminal tab.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "script_id": {"type": "string"},
+                    "tab_id": {"type": "integer"}
+                },
+                "required": ["script_id", "tab_id"]
+            }),
+            read_only: false,
+        },
+        {
+            let automation = automation.clone();
+            move |_ctx, args| {
+                let script_id = required_str(&args, "script_id")?;
+                let tab = tab_id(&args)?;
+                let run = automation.run(&script_id, tab)?;
+                Ok(script_run_json(&run))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "automation_stop_script".into(),
+            title: "Stop automation script".into(),
+            description: "Stop a running automation script by run id.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"run_id": {"type": "integer"}},
+                "required": ["run_id"]
+            }),
+            read_only: false,
+        },
+        {
+            let automation = automation.clone();
+            move |_ctx, args| {
+                let run_id = args
+                    .get("run_id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "run_id is required".to_string())?;
+                automation.stop(run_id);
+                Ok(json!({"stopping": run_id}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "automation_run_status".into(),
+            title: "Automation run status".into(),
+            description: "Read the active automation run, or a specific run by id.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"run_id": {"type": "integer"}}
+            }),
+            read_only: true,
+        },
+        {
+            let automation = automation.clone();
+            move |_ctx, args| {
+                let run = match args.get("run_id").and_then(Value::as_u64) {
+                    Some(run_id) => automation.run_snapshot(run_id),
+                    None => automation.active_run(),
+                };
+                Ok(run.map(|run| script_run_json(&run)).unwrap_or(Value::Null))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "next_tab".into(),
+            title: "Select next tab".into(),
+            description: "Select the next open terminal tab.".into(),
+            input_schema: no_args.clone(),
+            read_only: true,
+        },
+        {
+            let workspace = workspace.clone();
+            move |_ctx, _args| {
+                workspace.select_next();
+                Ok(json!({"active": workspace.active().map(|id| id.raw())}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "previous_tab".into(),
+            title: "Select previous tab".into(),
+            description: "Select the previous open terminal tab.".into(),
+            input_schema: no_args.clone(),
+            read_only: true,
+        },
+        {
+            let workspace = workspace.clone();
+            move |_ctx, _args| {
+                workspace.select_previous();
+                Ok(json!({"active": workspace.active().map(|id| id.raw())}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "move_tab".into(),
+            title: "Move tab".into(),
+            description: "Reorder a tab relative to another tab.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "target_id": {"type": "integer"},
+                    "after": {"type": "boolean", "default": true}
+                },
+                "required": ["tab_id", "target_id"]
+            }),
+            read_only: false,
+        },
+        {
+            let workspace = workspace.clone();
+            move |_ctx, args| {
+                let id = tab_id(&args)?;
+                let target = args
+                    .get("target_id")
+                    .and_then(Value::as_u64)
+                    .map(xcord_plugin_api::TerminalId::new)
+                    .ok_or_else(|| "target_id is required".to_string())?;
+                let after = args.get("after").and_then(Value::as_bool).unwrap_or(true);
+                workspace.move_tab(id, target, after);
+                Ok(json!({"moved": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "reconnect_tab".into(),
+            title: "Reconnect tab".into(),
+            description: "Reconnect a terminal tab and return the new tab id.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"tab_id": {"type": "integer"}},
+                "required": ["tab_id"]
+            }),
+            read_only: false,
+        },
+        {
+            let workspace = workspace.clone();
+            move |_ctx, args| {
+                let id = workspace.reconnect(tab_id(&args)?)?;
+                Ok(json!({"tab_id": id.raw()}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "resize_terminal".into(),
+            title: "Resize terminal".into(),
+            description: "Resize a terminal tab PTY.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "cols": {"type": "integer", "minimum": 20},
+                    "rows": {"type": "integer", "minimum": 5}
+                },
+                "required": ["tab_id", "cols", "rows"]
+            }),
+            read_only: false,
+        },
+        {
+            let workspace = workspace.clone();
+            move |_ctx, args| {
+                let id = tab_id(&args)?;
+                let cols =
+                    args.get("cols")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "cols is required".to_string())? as u16;
+                let rows =
+                    args.get("rows")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| "rows is required".to_string())? as u16;
+                workspace.resize(id, cols, rows);
+                Ok(json!({"cols": cols, "rows": rows}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "scroll_terminal".into(),
+            title: "Scroll terminal".into(),
+            description:
+                "Scroll a terminal by delta lines, jump to an offset, or scroll to bottom.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "delta": {"type": "integer"},
+                    "offset": {"type": "integer"},
+                    "bottom": {"type": "boolean"}
+                },
+                "required": ["tab_id"]
+            }),
+            read_only: true,
+        },
+        {
+            let workspace = workspace.clone();
+            move |_ctx, args| {
+                let id = tab_id(&args)?;
+                if args.get("bottom").and_then(Value::as_bool).unwrap_or(false) {
+                    workspace.scroll_to_bottom(id);
+                } else if let Some(offset) = args.get("offset").and_then(Value::as_u64) {
+                    workspace.scroll_to(id, offset as usize);
+                } else {
+                    let delta = args.get("delta").and_then(Value::as_i64).unwrap_or(0) as i32;
+                    workspace.scroll_by(id, delta);
+                }
+                Ok(json!({"scrolled": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "export_sessions".into(),
+            title: "Export sessions".into(),
+            description: "Export all saved sessions to a TOML file.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                sessions.export(&required_str(&args, "path")?)?;
+                Ok(json!({"exported": true}))
+            }
+        },
+    );
+
+    tools.register(
+        ToolSpec {
+            name: "import_sessions".into(),
+            title: "Import sessions".into(),
+            description: "Import sessions from a TOML export file.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            read_only: false,
+        },
+        {
+            let sessions = sessions.clone();
+            move |_ctx, args| {
+                sessions.import(&required_str(&args, "path")?)?;
+                Ok(json!({"imported": true}))
+            }
+        },
+    );
+}
+
+fn required_str(args: &Value, key: &str) -> std::result::Result<String, String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("{key} is required"))
+}
+
+fn apply_profile_fields(profile: &mut SessionProfile, args: &Value) {
+    if let Some(value) = args.get("term").and_then(Value::as_str) {
+        profile.term = value.to_string();
+    }
+    if let Some(value) = args.get("login_script").and_then(Value::as_str) {
+        profile.login_script = value.to_string();
+    }
+    if let Some(value) = args.get("startup_command").and_then(Value::as_str) {
+        profile.startup_command = Some(value.to_string());
+    }
+    if let Some(value) = args.get("logging").and_then(Value::as_bool) {
+        profile.logging = value;
+    }
+    if let Some(values) = args.get("tags").and_then(Value::as_array) {
+        profile.tags = values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+    }
+    if let Some(auth) = args.get("auth").and_then(Value::as_str) {
+        let key_path = args
+            .get("key_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        profile.auth = match auth {
+            "public_key" => AuthKind::PublicKey {
+                path: key_path,
+                save_passphrase: false,
+                secret_id: None,
+            },
+            "agent" => AuthKind::Agent,
+            "none" => AuthKind::None,
+            _ => AuthKind::Password {
+                save: false,
+                secret_id: None,
+            },
+        };
+    } else if let Some(key_path) = args.get("key_path").and_then(Value::as_str) {
+        if let AuthKind::PublicKey { path, .. } = &mut profile.auth {
+            *path = key_path.to_string();
+        }
+    }
+}
+
+fn apply_profile_secrets(
+    sessions: &Sessions,
+    profile: &SessionProfile,
+    args: &Value,
+) -> std::result::Result<(), String> {
+    if let Some(password) = args.get("password").and_then(Value::as_str) {
+        if password.is_empty() {
+            sessions.clear_password(profile)?;
+        } else {
+            sessions.store_password(profile, password)?;
+        }
+    }
+    if let Some(passphrase) = args.get("passphrase").and_then(Value::as_str) {
+        if passphrase.is_empty() {
+            sessions.clear_passphrase(profile)?;
+        } else {
+            sessions.store_passphrase(profile, passphrase)?;
+        }
+    }
+    Ok(())
+}
+
+fn profile_json(sessions: &Sessions, profile: &SessionProfile) -> Value {
+    json!({
+        "id": profile.id,
+        "name": profile.name,
+        "group": profile.group,
+        "host": profile.host,
+        "port": profile.port,
+        "user": profile.user,
+        "auth": profile.auth.label(),
+        "has_saved_password": sessions.password(profile).is_some(),
+        "has_saved_passphrase": sessions.passphrase(profile).is_some(),
+        "logging": profile.logging,
+        "tags": profile.tags,
+    })
+}
+
+fn snippet_json(snippet: Snippet) -> Value {
+    json!({
+        "id": snippet.id,
+        "name": snippet.name,
+        "command": snippet.command,
+        "send_enter": snippet.send_enter,
+        "action": format!("{:?}", snippet.action).to_lowercase(),
+        "script_id": snippet.script_id,
+        "script_file": snippet.script_file,
+    })
+}
+
+fn highlight_json(rule: HighlightRule) -> Value {
+    json!({
+        "id": rule.id,
+        "name": rule.name,
+        "pattern": rule.pattern,
+        "foreground": rule.foreground,
+        "background": rule.background,
+        "enabled": rule.enabled,
+    })
+}
+
+fn script_run_json(run: &xcord_plugin_api::ScriptRunSnapshot) -> Value {
+    json!({
+        "run_id": run.run_id,
+        "script_id": run.script_id,
+        "script_name": run.script_name,
+        "tab_id": run.terminal.raw(),
+        "status": format!("{:?}", run.status).to_lowercase(),
+        "current_line": run.current_line,
+        "error": run.error,
+        "logs": run.logs.iter().map(|log| json!({
+            "level": format!("{:?}", log.level).to_lowercase(),
+            "message": log.message,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn tab_id(args: &Value) -> std::result::Result<xcord_plugin_api::TerminalId, String> {
