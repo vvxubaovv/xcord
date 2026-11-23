@@ -82,6 +82,7 @@ pub struct TerminalView {
     metrics: Rc<Cell<GridMetrics>>,
     selection: Option<Selection>,
     selecting: bool,
+    scrollbar_drag: Option<f32>,
     scroll_accumulator: f32,
     ime_text: String,
     suppress_ctrl_c_until: Option<Instant>,
@@ -107,6 +108,7 @@ impl TerminalView {
             metrics: Rc::new(Cell::new(GridMetrics::default())),
             selection: None,
             selecting: false,
+            scrollbar_drag: None,
             scroll_accumulator: 0.0,
             ime_text: String::new(),
             suppress_ctrl_c_until: None,
@@ -190,6 +192,10 @@ impl TerminalView {
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
         let key = keystroke.key.as_str();
+
+        if let Some(id) = self.active {
+            self.workspace.scroll_to_bottom(id);
+        }
 
         if !control && !keystroke.modifiers.alt && !self.ime_text.is_empty() {
             // Never consume keys while the IME owns composition; returning
@@ -377,6 +383,11 @@ impl TerminalView {
         if event.button != MouseButton::Left {
             return;
         }
+        if self.begin_scrollbar_drag(event.position, cx) {
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if event.click_count >= 2 {
             self.selecting = false;
             self.select_word_at(event.position, cx);
@@ -399,6 +410,11 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.scrollbar_drag.is_some() {
+            self.update_scrollbar_drag(event.position, cx);
+            cx.notify();
+            return;
+        }
         if !self.selecting {
             return;
         }
@@ -410,6 +426,10 @@ impl TerminalView {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.scrollbar_drag.take().is_some() {
+            cx.notify();
+            return;
+        }
         if event.click_count >= 2 {
             self.selecting = false;
             if self.settings.copy_on_select {
@@ -426,6 +446,58 @@ impl TerminalView {
             self.copy_selection(cx);
         }
         cx.notify();
+    }
+
+    fn scrollbar_snapshot(&self) -> Option<(TerminalId, Bounds<Pixels>, usize, usize)> {
+        let id = self.active?;
+        let metrics = self.metrics.get();
+        let rows = metrics.rows as usize;
+        if rows == 0 || metrics.cell_height <= 0.0 {
+            return None;
+        }
+        let snapshot = self.workspace.snapshot(id)?;
+        if snapshot.scrollback_len == 0 {
+            return None;
+        }
+        Some((id, metrics.bounds, rows, snapshot.scrollback_len))
+    }
+
+    fn scrollbar_ratio(&self, y: Pixels, bounds: Bounds<Pixels>, rows: usize) -> f32 {
+        let track = rows as f32 * self.metrics.get().cell_height.max(1.0);
+        if track <= 0.0 {
+            return 0.0;
+        }
+        (f32::from(y - bounds.top()) / track).clamp(0.0, 1.0)
+    }
+
+    fn begin_scrollbar_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some((id, bounds, rows, scrollback)) = self.scrollbar_snapshot() else {
+            return false;
+        };
+        let metrics = self.metrics.get();
+        let local_x = f32::from(position.x - bounds.left());
+        if local_x < (metrics.cols as f32 * metrics.cell_width - 12.0).max(0.0) {
+            return false;
+        }
+        let ratio = self.scrollbar_ratio(position.y, bounds, rows);
+        let max_top = scrollback;
+        let top_lines = (ratio * max_top as f32).round() as usize;
+        let scroll = scrollback.saturating_sub(top_lines);
+        self.workspace.scroll_to(id, scroll);
+        self.scrollbar_drag = Some(ratio);
+        cx.notify();
+        true
+    }
+
+    fn update_scrollbar_drag(&mut self, position: Point<Pixels>, _cx: &mut Context<Self>) {
+        let Some((id, bounds, rows, scrollback)) = self.scrollbar_snapshot() else {
+            return;
+        };
+        let ratio = self.scrollbar_ratio(position.y, bounds, rows);
+        let max_top = scrollback;
+        let top_lines = (ratio * max_top as f32).round() as usize;
+        let scroll = scrollback.saturating_sub(top_lines);
+        self.workspace.scroll_to(id, scroll);
     }
 
     fn on_scroll(
@@ -574,6 +646,7 @@ impl EntityInputHandler for TerminalView {
         if !text.is_empty() {
             if let Some(id) = self.active {
                 self.workspace.write(id, text.as_bytes());
+                self.workspace.scroll_to_bottom(id);
             }
         }
         cx.notify();

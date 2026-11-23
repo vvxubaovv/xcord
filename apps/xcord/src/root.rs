@@ -314,6 +314,9 @@ pub struct XcordApp {
     search: Entity<TextInput>,
     compose: Entity<TextInput>,
     ai_input: Entity<ScriptEditor>,
+    ai_input_history: RefCell<Vec<String>>,
+    ai_input_history_index: Cell<Option<usize>>,
+    ai_input_draft: RefCell<String>,
     ai_scroll: ScrollHandle,
     ai_follow: Cell<bool>,
     ai_jump_target: Cell<Option<usize>>,
@@ -393,6 +396,8 @@ pub struct XcordApp {
 
     session_form: Option<SessionForm>,
     session_menu: Option<String>,
+    session_group_picker: Option<String>,
+    session_group_ready: bool,
     group_menu: Option<String>,
     sidebar_menu: bool,
     group_form: Option<GroupForm>,
@@ -575,6 +580,9 @@ impl XcordApp {
             search,
             compose,
             ai_input,
+            ai_input_history: RefCell::new(Vec::new()),
+            ai_input_history_index: Cell::new(None),
+            ai_input_draft: RefCell::new(String::new()),
             ai_scroll: ScrollHandle::new(),
             ai_follow: Cell::new(true),
             ai_jump_target: Cell::new(None),
@@ -649,6 +657,8 @@ impl XcordApp {
             ftp_new_dir,
             session_form: None,
             session_menu: None,
+            session_group_picker: None,
+            session_group_ready: false,
             group_menu: None,
             sidebar_menu: false,
             group_form: None,
@@ -691,6 +701,7 @@ impl XcordApp {
             true
         });
         app.sync(cx);
+        app.seed_ai_input_history(cx);
         app.start_pumps(cx);
         window.set_window_title(&window_title);
         if let Ok(session_id) = std::env::var("XCORD_AUTOCONNECT") {
@@ -940,6 +951,10 @@ impl XcordApp {
         if self.active.is_none() {
             self.active = self.tabs.first().map(|tab| tab.id);
         }
+        // Keep the copilot context pinned to the tab the UI currently shows.
+        // Some tab-open paths update the shell's active tab before the
+        // workspace event is observed; syncing here avoids a stale context.
+        self.ai.set_context_terminal(self.active);
         if self.ai_active_seen.replace(self.active) != self.active {
             if let Some(pinned) = self.ai.context_terminal() {
                 if Some(pinned) != self.active {
@@ -2584,6 +2599,77 @@ impl XcordApp {
         cx.notify();
     }
 
+    fn seed_ai_input_history(&mut self, cx: &mut Context<Self>) {
+        let prompts = self
+            .ai
+            .snapshot()
+            .messages
+            .into_iter()
+            .filter(|message| message.role == "You")
+            .map(|message| message.text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>();
+        let mut history = self.ai_input_history.borrow_mut();
+        for prompt in prompts {
+            if history.last().map(String::as_str) != Some(prompt.as_str()) {
+                history.push(prompt);
+            }
+        }
+        history.truncate(200);
+        self.ai_input_history_index.set(None);
+        self.ai_input_draft.borrow_mut().clear();
+        cx.notify();
+    }
+
+    fn remember_ai_input(&self, prompt: &str) {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return;
+        }
+        let mut history = self.ai_input_history.borrow_mut();
+        if history.last().map(String::as_str) != Some(prompt) {
+            history.push(prompt.to_string());
+            if history.len() > 200 {
+                history.remove(0);
+            }
+        }
+        self.ai_input_history_index.set(None);
+        self.ai_input_draft.borrow_mut().clear();
+    }
+
+    fn browse_ai_history(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let history = self.ai_input_history.borrow();
+        if history.is_empty() {
+            return;
+        }
+        let current = self.ai_input_history_index.get();
+        let next = if direction < 0 {
+            match current {
+                Some(index) => Some(index.saturating_sub(1)),
+                None => {
+                    let draft = self.ai_input.read(cx).value().to_string();
+                    self.ai_input_draft.replace(draft);
+                    Some(history.len() - 1)
+                }
+            }
+        } else {
+            current.and_then(|index| (index + 1 < history.len()).then_some(index + 1))
+        };
+        let value = match next {
+            Some(index) => history[index].clone(),
+            None => {
+                let draft = self.ai_input_draft.borrow().clone();
+                draft
+            }
+        };
+        drop(history);
+        self.ai_input_history_index.set(next);
+        self.ai_input
+            .update(cx, |input, cx| input.set_value(value, cx));
+        self.pending_focus = Some(PendingFocus::AiInput);
+        cx.notify();
+    }
+
     fn send_ai(&mut self, cx: &mut Context<Self>) {
         let prompt = self.ai_input.read(cx).value().trim().to_string();
         if prompt.is_empty() {
@@ -2594,6 +2680,7 @@ impl XcordApp {
         self.ai_scroll.scroll_to_bottom();
         match self.ai.send(&prompt) {
             Ok(()) => {
+                self.remember_ai_input(&prompt);
                 self.ai_input
                     .update(cx, |input, cx| input.set_value("", cx));
                 self.pending_focus = Some(PendingFocus::AiInput);
@@ -2885,13 +2972,31 @@ impl XcordApp {
                     .flex()
                     .items_end()
                     .gap_2()
-                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                         let control =
                             event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+                        let alt = event.keystroke.modifiers.alt;
+                        let shift = event.keystroke.modifiers.shift;
                         if control && event.keystroke.key == "enter" && !crate::ime::is_composing()
                         {
                             this.send_ai(cx);
                             cx.stop_propagation();
+                            return;
+                        }
+                        if !control && !alt && !shift && !crate::ime::is_composing() {
+                            let focused =
+                                this.ai_input.read(cx).focus_handle(cx).is_focused(window);
+                            let has_history = !this.ai_input_history.borrow().is_empty();
+                            if focused && event.keystroke.key == "up" && has_history {
+                                this.browse_ai_history(-1, cx);
+                                cx.stop_propagation();
+                            } else if focused
+                                && event.keystroke.key == "down"
+                                && this.ai_input_history_index.get().is_some()
+                            {
+                                this.browse_ai_history(1, cx);
+                                cx.stop_propagation();
+                            }
                         }
                     }))
                     .child(
@@ -3260,9 +3365,10 @@ impl XcordApp {
             .border_color(rgbc(theme.border));
 
         if let Some(last) = last_sent {
+            let users = user_indices.clone();
             rail = rail.child(
                 div()
-                    .id("ai-jump-last-sent")
+                    .id("ai-jump-previous")
                     .w(px(18.))
                     .h(px(18.))
                     .flex()
@@ -3276,9 +3382,21 @@ impl XcordApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.ai_follow.set(false);
-                            this.ai_jump_target.set(Some(last));
-                            this.ai_scroll.scroll_to_top_of_item(last);
+                            let current = this.ai_jump_target.get();
+                            let target = match current {
+                                None => Some(last),
+                                Some(index) => users
+                                    .iter()
+                                    .position(|candidate| *candidate == index)
+                                    .and_then(|position| position.checked_sub(1))
+                                    .map(|position| users[position])
+                                    .or(Some(index)),
+                            };
+                            if let Some(target) = target {
+                                this.ai_follow.set(false);
+                                this.ai_jump_target.set(Some(target));
+                                this.ai_scroll.scroll_to_top_of_item(target);
+                            }
                             cx.notify();
                         }),
                     )
@@ -3286,7 +3404,7 @@ impl XcordApp {
             );
         }
 
-        for index in user_indices {
+        for &index in &user_indices {
             let is_selected = selected == Some(index);
             let is_last = Some(index) == last_sent;
             let size = if is_last { 9.0 } else { 7.0 };
@@ -3315,9 +3433,10 @@ impl XcordApp {
             );
         }
 
+        let users = user_indices.clone();
         rail.child(
             div()
-                .id("ai-jump-latest")
+                .id("ai-jump-next")
                 .mt_auto()
                 .w(px(18.))
                 .h(px(18.))
@@ -3335,10 +3454,26 @@ impl XcordApp {
                 .hover(|style| style.bg(rgba(theme.accent, 0.18)))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.ai_follow.set(true);
-                        this.ai_jump_target.set(None);
-                        this.ai_scroll.scroll_to_bottom();
+                    cx.listener(move |this, _, _, cx| {
+                        let current = this.ai_jump_target.get();
+                        let next = current.and_then(|index| {
+                            users
+                                .iter()
+                                .position(|candidate| *candidate == index)
+                                .and_then(|position| users.get(position + 1).copied())
+                        });
+                        match next {
+                            Some(target) => {
+                                this.ai_follow.set(false);
+                                this.ai_jump_target.set(Some(target));
+                                this.ai_scroll.scroll_to_top_of_item(target);
+                            }
+                            None => {
+                                this.ai_follow.set(true);
+                                this.ai_jump_target.set(None);
+                                this.ai_scroll.scroll_to_bottom();
+                            }
+                        }
                         cx.notify();
                     }),
                 )
@@ -3960,6 +4095,13 @@ impl XcordApp {
             }
         }
         if keystroke.key == "escape" {
+            if self.session_group_picker.is_some() {
+                self.session_group_picker = None;
+                self.session_group_ready = false;
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
             if self.ai_open && self.ai.snapshot().streaming {
                 self.ai.cancel();
                 self.set_notice(NoticeLevel::Info, self.tr("Stopping AI…"));
@@ -4539,6 +4681,8 @@ impl XcordApp {
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| {
                     this.session_menu = Some(menu_id.clone());
+                    this.session_group_picker = None;
+                    this.session_group_ready = false;
                     this.group_menu = None;
                     this.sidebar_menu = false;
                     cx.stop_propagation();
@@ -4664,7 +4808,20 @@ impl XcordApp {
         } else {
             profile.group.clone()
         };
-        self.collapsed_groups.borrow_mut().remove(&group);
+        {
+            // Expand every ancestor of the target group as well as the group
+            // itself, otherwise a collapsed parent keeps the session hidden.
+            let mut collapsed = self.collapsed_groups.borrow_mut();
+            let mut prefix = String::new();
+            for part in group.split('/').filter(|part| !part.is_empty()) {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                collapsed.remove(&prefix);
+            }
+            collapsed.remove(&group);
+        }
         self.search.update(cx, |input, cx| input.clear(cx));
         self.session_menu = None;
         self.group_menu = None;
@@ -5035,6 +5192,136 @@ impl XcordApp {
         cx.notify();
     }
 
+    fn render_session_group_picker(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(profile_id) = self.session_group_picker.clone() else {
+            return div();
+        };
+        let groups = self.sessions.groups();
+        let current_group = self
+            .sessions
+            .get(&profile_id)
+            .map(|profile| {
+                if profile.group.trim().is_empty() {
+                    "Sessions".to_string()
+                } else {
+                    profile.group
+                }
+            })
+            .unwrap_or_else(|| "Sessions".to_string());
+        let mut list = div()
+            .id("session-group-picker-list")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .max_h(px(300.))
+            .overflow_y_scroll()
+            .p_1()
+            .rounded_md()
+            .bg(rgbc(theme.background))
+            .border_1()
+            .border_color(rgbc(theme.border));
+        for group in groups {
+            let selected = group == current_group;
+            let target = group.clone();
+            let session = profile_id.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "session-group-picker-{profile_id}-{group}"
+                    )))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(if selected {
+                        rgba(theme.accent, 0.16)
+                    } else {
+                        rgba(theme.background, 0.0)
+                    })
+                    .text_size(px(10.))
+                    .text_color(if selected {
+                        rgbc(theme.accent)
+                    } else {
+                        rgbc(theme.foreground)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.move_session_to_group(&session, &target, cx);
+                        }),
+                    )
+                    .child(self.tr(&group)),
+            );
+        }
+        list = list.child(
+            div()
+                .id("session-group-picker-new")
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .text_size(px(10.))
+                .text_color(rgbc(theme.accent))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.session_group_picker = None;
+                        this.session_group_ready = false;
+                        this.open_group_dialog(cx);
+                    }),
+                )
+                .child(self.tr("New group")),
+        );
+        div()
+            .w(px(420.))
+            .p(px(18.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .bg(rgbc(theme.panel))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(13.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgbc(theme.foreground))
+                            .child(self.tr("Move to group")),
+                    )
+                    .child(
+                        div()
+                            .id("session-group-picker-close")
+                            .px_2()
+                            .text_size(px(16.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgbc(theme.danger)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.session_group_picker = None;
+                                    this.session_group_ready = false;
+                                    cx.notify();
+                                }),
+                            )
+                            .child("×"),
+                    ),
+            )
+            .child(list)
+    }
+
     fn render_session_menu(&self, profile_id: &str, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let edit_id = profile_id.to_string();
@@ -5046,7 +5333,8 @@ impl XcordApp {
                 .id(SharedString::from(format!(
                     "session-menu-{suffix}-{profile_id}"
                 )))
-                .min_w(px(84.))
+                .flex_1()
+                .min_w(px(0.))
                 .h(px(26.))
                 .flex()
                 .items_center()
@@ -5070,7 +5358,6 @@ impl XcordApp {
         } else {
             self.tr("Pin to Quick access")
         };
-        let groups = self.sessions.groups();
         let current_group = self
             .sessions
             .get(profile_id)
@@ -5082,74 +5369,72 @@ impl XcordApp {
                 }
             })
             .unwrap_or_else(|| "Sessions".to_string());
-        let mut group_row = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_1()
-            .px_1()
-            .child(
-                div()
-                    .text_size(px(9.5))
-                    .text_color(rgbc(theme.muted))
-                    .child(self.tr("Move to group")),
-            );
-        for group in groups {
-            let target = group.clone();
-            let session = profile_id.to_string();
-            let selected = group == current_group;
-            group_row = group_row.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "session-menu-group-{profile_id}-{group}"
-                    )))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if selected {
-                        rgbc(theme.accent)
-                    } else {
-                        rgbc(theme.border)
-                    })
-                    .bg(if selected {
-                        rgba(theme.accent, 0.16)
-                    } else {
-                        rgbc(theme.background)
-                    })
-                    .text_size(px(9.5))
-                    .text_color(rgbc(theme.foreground))
-                    .cursor_pointer()
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.move_session_to_group(&session, &target, cx);
-                        }),
-                    )
-                    .child(self.tr(&group)),
-            );
-        }
-        group_row = group_row.child(
+        let picker_open =
+            self.session_group_ready && self.session_group_picker.as_deref() == Some(profile_id);
+        let picker_id = profile_id.to_string();
+        let group_section = div().flex().flex_col().gap_1().px_1().child(
             div()
                 .id(SharedString::from(format!(
-                    "session-menu-new-group-{profile_id}"
+                    "session-group-toggle-{profile_id}"
                 )))
+                .h(px(28.))
                 .px_2()
-                .py_1()
+                .flex()
+                .items_center()
+                .gap_2()
                 .rounded_sm()
                 .border_1()
                 .border_color(rgbc(theme.border))
                 .bg(rgbc(theme.background))
-                .text_size(px(9.5))
-                .text_color(rgbc(theme.accent))
                 .cursor_pointer()
+                .hover(|style| style.bg(rgbc(theme.panel)))
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
-                        this.open_group_dialog(cx);
+                        if this.session_group_picker.as_deref() == Some(&picker_id) {
+                            this.session_group_picker = None;
+                            this.session_group_ready = false;
+                        } else {
+                            this.session_group_picker = Some(picker_id.clone());
+                            this.session_group_ready = false;
+                            // Render the list on the next frame so the click
+                            // that opens it cannot also hit a group row.
+                            let picker = picker_id.clone();
+                            cx.spawn(async move |this, cx| {
+                                Timer::after(Duration::from_millis(80)).await;
+                                let _ = this.update(cx, |this, cx| {
+                                    if this.session_group_picker.as_deref() == Some(&picker) {
+                                        this.session_group_ready = true;
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
                     }),
                 )
-                .child(self.tr("New group")),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_size(px(9.5))
+                        .text_color(rgbc(theme.foreground))
+                        .child(format!(
+                            "{}: {}",
+                            self.tr("Move to group"),
+                            self.tr(&current_group)
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.))
+                        .text_color(rgbc(theme.muted))
+                        .child(if picker_open { "▴" } else { "▾" }),
+                ),
         );
         div()
             .mx_2()
@@ -5186,14 +5471,21 @@ impl XcordApp {
                             this.connect_profile(connect_id.clone(), window, cx, true);
                         }),
                     ))
-                    .child(button("delete", "删除连接".to_string(), theme).on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.delete_session(&delete_id, cx);
-                        }),
-                    )),
+                    .child(
+                        button(
+                            "delete",
+                            "\u{5220}\u{9664}\u{8fde}\u{63a5}".to_string(),
+                            theme,
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.delete_session(&delete_id, cx);
+                            }),
+                        ),
+                    ),
             )
-            .child(group_row)
+            .child(group_section)
             .child(div().flex().gap_1().child(
                 button("pin-quick-access", pin_label, theme).on_mouse_up(
                     MouseButton::Left,
@@ -5236,6 +5528,7 @@ impl XcordApp {
             self.set_notice(NoticeLevel::Error, error);
         } else {
             self.session_menu = None;
+            self.session_group_picker = None;
             self.sync(cx);
             self.set_notice(
                 NoticeLevel::Info,
@@ -5271,6 +5564,8 @@ impl XcordApp {
             return;
         }
         self.session_menu = None;
+        self.session_group_picker = None;
+        self.session_group_ready = false;
         self.drag_hover.replace(None);
         self.sync(cx);
         cx.notify();
@@ -11617,6 +11912,8 @@ impl Render for XcordApp {
             modal_shell(self.render_session_dialog(cx))
         } else if self.transfer_open {
             modal_shell(self.render_transfer_panel(cx))
+        } else if self.session_group_picker.is_some() && self.session_group_ready {
+            modal_shell(self.render_session_group_picker(cx))
         } else if self.settings_form.is_some() {
             modal_shell(self.render_settings_panel(cx))
         } else if self.ai_config.is_some() {

@@ -21,12 +21,14 @@ use xcord_plugin_api::{
 };
 
 const INTERNAL_AI: &str = "ai/internal";
-const MAX_TOOL_ROUNDS: usize = 32;
+const MAX_TOOL_ROUNDS: usize = 64;
 const MAX_TOOL_RESULT: usize = 14_000;
 /// Keep long conversations inside the provider context window. Older user
 /// turns are dropped only when the history exceeds this rough character budget.
 const MAX_CONTEXT_CHARS: usize = 400_000;
 const COMPACT_TOOL_RESULT: usize = 4_000;
+/// Never discard the most recent 50 user turns, even when compacting tools.
+const MIN_HISTORY_TURNS: usize = 50;
 
 const AI_ZH: &[(&str, &str)] = &[
     ("Thinking…", "思考中…"),
@@ -392,11 +394,11 @@ impl AiService {
             return None;
         }
         let tabs = self.workspace.tabs();
-        // Always use the currently active tab. Pinning a terminal became stale
-        // as soon as the user switched tabs, so the copilot follows selection.
         let id = self
-            .workspace
-            .active()
+            .context_terminal
+            .get()
+            .filter(|id| tabs.iter().any(|tab| tab.id == *id))
+            .or_else(|| self.workspace.active())
             .filter(|id| tabs.iter().any(|tab| tab.id == *id))?;
         let tab = tabs.into_iter().find(|tab| tab.id == id)?;
         let text = self.workspace.terminal_text(id, 220)?;
@@ -582,9 +584,14 @@ impl AiAssistant for AiService {
             self.context_terminal.set(None);
         }
         let context = self
-            .workspace
-            .active()
-            .filter(|id| tabs.iter().any(|tab| tab.id == *id));
+            .context_terminal
+            .get()
+            .filter(|id| tabs.iter().any(|tab| tab.id == *id))
+            .or_else(|| {
+                self.workspace
+                    .active()
+                    .filter(|id| tabs.iter().any(|tab| tab.id == *id))
+            });
         let context_title = context
             .and_then(|id| tabs.into_iter().find(|tab| tab.id == id))
             .map(|tab| tab.title);
@@ -863,40 +870,31 @@ fn api_message_chars(message: &ApiMessage) -> usize {
 /// budget. A user turn is a `user` message plus the assistant/tool messages
 /// that follow it, so the provider never sees orphaned tool results.
 fn compact_history(mut messages: Vec<ApiMessage>) -> Vec<ApiMessage> {
-    let total = || messages.iter().map(api_message_chars).sum::<usize>();
-    if total() <= MAX_CONTEXT_CHARS {
-        return messages;
-    }
-
     let user_starts = messages
         .iter()
         .enumerate()
         .filter(|(_, message)| message.role == "user")
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let mut drop_count = 0usize;
-    while total() > MAX_CONTEXT_CHARS && user_starts.len() > 1 {
-        drop_count += 1;
-        let cut = user_starts[drop_count];
+
+    // Drop only turns older than the retention window. Keeping 50 user turns
+    // is a hard product requirement; the remaining content is compacted below.
+    let excess = user_starts.len().saturating_sub(MIN_HISTORY_TURNS);
+    if excess > 0 && messages.iter().map(api_message_chars).sum::<usize>() > MAX_CONTEXT_CHARS {
+        let cut = user_starts.get(excess).copied().unwrap_or(messages.len());
         messages.drain(0..cut);
-        return compact_history(messages);
     }
 
-    // A single turn can still be huge (many large tool results). Trim old
-    // tool output and assistant text before giving up on the request.
-    for message in &mut messages {
-        match message.role.as_str() {
-            "tool" => {
-                if let Some(content) = &mut message.content {
-                    *content = truncate(content, COMPACT_TOOL_RESULT);
+    if messages.iter().map(api_message_chars).sum::<usize>() > MAX_CONTEXT_CHARS {
+        for message in &mut messages {
+            match message.role.as_str() {
+                "tool" | "assistant" | "user" => {
+                    if let Some(content) = &mut message.content {
+                        *content = truncate(content, COMPACT_TOOL_RESULT);
+                    }
                 }
+                _ => {}
             }
-            "assistant" => {
-                if let Some(content) = &mut message.content {
-                    *content = truncate(content, COMPACT_TOOL_RESULT);
-                }
-            }
-            _ => {}
         }
     }
     messages
@@ -1421,21 +1419,32 @@ mod tests {
     }
 
     #[test]
-    fn compact_history_drops_old_turns_but_keeps_user_boundary() {
+    fn compact_history_keeps_at_least_fifty_turns() {
         let mut first = ApiMessage::user("old");
         first.content = Some("x".repeat(MAX_CONTEXT_CHARS + 10));
-        let messages = vec![
+        let compacted = compact_history(vec![
             first,
             ApiMessage::assistant(Some("old answer".into()), Vec::new()),
             ApiMessage::user("latest"),
-            ApiMessage::assistant(Some("latest answer".into()), Vec::new()),
-        ];
-        let compacted = compact_history(messages);
+        ]);
         assert_eq!(compacted.first().map(|m| m.role.as_str()), Some("user"));
-        assert_eq!(
-            compacted.first().and_then(|m| m.content.as_deref()),
-            Some("latest")
-        );
+        assert!(compacted
+            .first()
+            .and_then(|m| m.content.as_ref())
+            .is_some_and(|content| content.len() <= COMPACT_TOOL_RESULT + 32));
+
+        let mut messages = Vec::new();
+        for index in 0..51 {
+            messages.push(ApiMessage::user(format!("user-{index}")));
+            messages.push(ApiMessage::assistant(Some("y".repeat(10_000)), Vec::new()));
+        }
+        let compacted = compact_history(messages);
+        let users = compacted
+            .iter()
+            .filter(|message| message.role == "user")
+            .collect::<Vec<_>>();
+        assert_eq!(users.len(), MIN_HISTORY_TURNS);
+        assert_eq!(users[0].content.as_deref(), Some("user-1"));
     }
 
     #[test]
