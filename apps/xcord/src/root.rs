@@ -182,6 +182,12 @@ struct TabGroupForm {
     error: Option<String>,
 }
 
+struct TabRenameForm {
+    tab_id: TerminalId,
+    name: Entity<TextInput>,
+    error: Option<String>,
+}
+
 struct TabDragPreview {
     name: String,
     theme: Theme,
@@ -270,6 +276,7 @@ enum PendingFocus {
     DialogSecret,
     GroupName,
     TabGroupName,
+    TabRename,
     Compose,
     Palette,
     AiInput,
@@ -408,6 +415,8 @@ pub struct XcordApp {
     tab_group_menu: Option<String>,
     tab_group_pending: Option<TerminalId>,
     tab_group_form: Option<TabGroupForm>,
+    tab_rename: Option<TabRenameForm>,
+    tab_titles: RefCell<HashMap<TerminalId, String>>,
     next_tab_group: Cell<u64>,
     collapsed_groups: RefCell<HashSet<String>>,
     drag_hover: RefCell<Option<DragHover>>,
@@ -669,6 +678,8 @@ impl XcordApp {
             tab_group_menu: None,
             tab_group_pending: None,
             tab_group_form: None,
+            tab_rename: None,
+            tab_titles: RefCell::new(HashMap::new()),
             next_tab_group: Cell::new(1),
             collapsed_groups: RefCell::new(HashSet::new()),
             drag_hover: RefCell::new(None),
@@ -944,6 +955,18 @@ impl XcordApp {
                 format!("{base} ({count})")
             };
         }
+        {
+            let titles = self.tab_titles.borrow().clone();
+            for tab in &mut self.tabs {
+                if let Some(title) = titles.get(&tab.id) {
+                    tab.title = title.clone();
+                }
+            }
+            let live = self.tabs.iter().map(|tab| tab.id).collect::<HashSet<_>>();
+            self.tab_titles
+                .borrow_mut()
+                .retain(|id, _| live.contains(id));
+        }
         self.active = self
             .workspace
             .active()
@@ -951,10 +974,12 @@ impl XcordApp {
         if self.active.is_none() {
             self.active = self.tabs.first().map(|tab| tab.id);
         }
-        // Keep the copilot context pinned to the tab the UI currently shows.
-        // Some tab-open paths update the shell's active tab before the
-        // workspace event is observed; syncing here avoids a stale context.
-        self.ai.set_context_terminal(self.active);
+        // Keep the copilot context pinned to the tab the UI currently shows,
+        // except while a response is streaming: opening another connection
+        // must not silently move an in-flight conversation.
+        if !self.ai.snapshot().streaming {
+            self.ai.set_context_terminal(self.active);
+        }
         if self.ai_active_seen.replace(self.active) != self.active {
             if let Some(pinned) = self.ai.context_terminal() {
                 if Some(pinned) != self.active {
@@ -1762,6 +1787,116 @@ impl XcordApp {
             self.tr_args("Group created: {name}", &[("name", name)]),
         );
         cx.notify();
+    }
+
+    fn open_tab_rename_dialog(&mut self, tab_id: TerminalId, cx: &mut Context<Self>) {
+        let title = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default();
+        if title.is_empty() {
+            return;
+        }
+        let theme = self.theme.clone();
+        let name = Self::make_input(&theme, &title, false, cx);
+        name.update(cx, |input, cx| input.set_value(title, cx));
+        self.tab_rename = Some(TabRenameForm {
+            tab_id,
+            name,
+            error: None,
+        });
+        self.pending_focus = Some(PendingFocus::TabRename);
+        self.tab_menu = None;
+        cx.notify();
+    }
+
+    fn save_tab_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.tab_rename.as_ref() else {
+            return;
+        };
+        let value = form.name.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            let error = self.tr("Tab name cannot be empty.");
+            if let Some(form) = &mut self.tab_rename {
+                form.error = Some(error);
+            }
+            cx.notify();
+            return;
+        }
+        let tab_id = form.tab_id;
+        self.tab_titles.borrow_mut().insert(tab_id, value);
+        self.tab_rename = None;
+        self.sync(cx);
+        cx.notify();
+    }
+
+    fn render_tab_rename_dialog(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(form) = self.tab_rename.as_ref() else {
+            return div();
+        };
+        div()
+            .w(px(360.))
+            .p_4()
+            .rounded_lg()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .bg(rgbc(theme.panel))
+            .border_1()
+            .border_color(rgbc(theme.border))
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgbc(theme.foreground))
+                    .child(self.tr("Rename tab")),
+            )
+            .child(
+                div()
+                    .h(px(34.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .bg(rgbc(theme.panel_alt))
+                    .border_1()
+                    .border_color(rgbc(theme.border))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                        if event.keystroke.key == "enter" {
+                            this.save_tab_rename(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .child(form.name.clone()),
+            )
+            .when_some(form.error.clone(), |panel, error| {
+                panel.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgbc(theme.danger))
+                        .child(error),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(secondary_button(self.tr("Cancel"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.tab_rename = None;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(primary_button(self.tr("Save"), theme).on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.save_tab_rename(cx)),
+                    )),
+            )
     }
 
     fn render_group_dialog(&self, cx: &mut Context<Self>) -> Div {
@@ -2987,12 +3122,20 @@ impl XcordApp {
                             let focused =
                                 this.ai_input.read(cx).focus_handle(cx).is_focused(window);
                             let has_history = !this.ai_input_history.borrow().is_empty();
-                            if focused && event.keystroke.key == "up" && has_history {
+                            let (at_top, at_bottom) = {
+                                let input = this.ai_input.read(cx);
+                                (
+                                    input.cursor_line() == 0,
+                                    input.cursor_line() + 1 >= input.line_count(),
+                                )
+                            };
+                            if focused && event.keystroke.key == "up" && has_history && at_top {
                                 this.browse_ai_history(-1, cx);
                                 cx.stop_propagation();
                             } else if focused
                                 && event.keystroke.key == "down"
                                 && this.ai_input_history_index.get().is_some()
+                                && at_bottom
                             {
                                 this.browse_ai_history(1, cx);
                                 cx.stop_propagation();
@@ -3567,9 +3710,10 @@ impl XcordApp {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            // Selecting a tab keeps the copilot following the
-                            // active terminal instead of pinning a stale one.
-                            this.ai.set_context_terminal(None);
+                            // Manual selection switches the conversation; while
+                            // streaming the service cancels first and applies the
+                            // switch once the response is stopped.
+                            this.ai.set_context_terminal(Some(id));
                             this.workspace.select(id);
                             this.sync(cx);
                             this.pending_focus = Some(PendingFocus::AiInput);
@@ -4001,6 +4145,10 @@ impl XcordApp {
                 .tab_group_form
                 .as_ref()
                 .map(|form| form.name.read(cx).focus_handle_only()),
+            PendingFocus::TabRename => self
+                .tab_rename
+                .as_ref()
+                .map(|form| form.name.read(cx).focus_handle_only()),
             PendingFocus::AiInput => Some(self.ai_input.read(cx).focus_handle(cx)),
             PendingFocus::AiBase => self
                 .ai_config
@@ -4143,6 +4291,10 @@ impl XcordApp {
             } else if self.ftp_open {
                 self.ftp_open = false;
                 self.ftp_snapshot = None;
+                cx.notify();
+                cx.stop_propagation();
+            } else if self.tab_rename.is_some() {
+                self.tab_rename = None;
                 cx.notify();
                 cx.stop_propagation();
             } else if self.tab_group_form.is_some() {
@@ -6012,6 +6164,7 @@ impl XcordApp {
         let position = self.tabs.iter().position(|entry| entry.id == tab_id);
         let has_left = position.is_some_and(|index| index > 0);
         let has_right = position.is_some_and(|index| index + 1 < self.tabs.len());
+        let rename_tab = tab_id;
         let detach_window = tab_id;
         let close_current = tab_id;
         let close_all = tab_id;
@@ -6147,6 +6300,16 @@ impl XcordApp {
                             .flex()
                             .flex_col()
                             .gap_1()
+                            .child(
+                                button("rename-tab", self.tr("Rename"), true, theme)
+                                    .w_full()
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.open_tab_rename_dialog(rename_tab, cx);
+                                        }),
+                                    ),
+                            )
                             .child(
                                 button("detach-window", self.tr("Open in new window"), true, theme)
                                     .w_full()
@@ -11901,6 +12064,8 @@ impl Render for XcordApp {
             modal_shell(self.render_quick_commands(cx))
         } else if self.ftp_open {
             modal_shell(self.render_ftp_panel(cx))
+        } else if self.tab_rename.is_some() {
+            modal_shell(self.render_tab_rename_dialog(cx))
         } else if self.tab_group_form.is_some() {
             modal_shell(self.render_tab_group_dialog(cx))
         } else if self.group_form.is_some() {
