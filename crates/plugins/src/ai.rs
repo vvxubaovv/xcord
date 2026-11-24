@@ -5,6 +5,7 @@
 //! through the same MCP registry exposed to external clients.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -100,6 +101,13 @@ impl Plugin for AiPlugin {
             cancel: RefCell::new(None),
             history_path,
             archives: RefCell::new(history.conversations),
+            context_key: RefCell::new(if history.current_key.is_empty() {
+                "default".to_string()
+            } else {
+                history.current_key
+            }),
+            currents: RefCell::new(history.currents),
+            pending_context: Cell::new(None),
         });
         service.refresh_key();
 
@@ -202,6 +210,8 @@ struct ConversationRecord {
     id: String,
     title: String,
     updated: String,
+    #[serde(default)]
+    key: String,
     messages: Vec<ApiMessage>,
 }
 
@@ -209,6 +219,10 @@ struct ConversationRecord {
 struct HistoryFile {
     #[serde(default)]
     current: Vec<ApiMessage>,
+    #[serde(default)]
+    current_key: String,
+    #[serde(default)]
+    currents: HashMap<String, Vec<ApiMessage>>,
     #[serde(default)]
     conversations: Vec<ConversationRecord>,
 }
@@ -285,6 +299,9 @@ pub struct AiService {
     cancel: RefCell<Option<CancelHandle>>,
     history_path: PathBuf,
     archives: RefCell<Vec<ConversationRecord>>,
+    context_key: RefCell<String>,
+    currents: RefCell<HashMap<String, Vec<ApiMessage>>>,
+    pending_context: Cell<Option<TerminalId>>,
 }
 
 impl AiService {
@@ -327,6 +344,7 @@ impl AiService {
                 *self.error.borrow_mut() = None;
                 self.cancel.borrow_mut().take();
                 self.persist_history();
+                self.apply_pending_context();
             }
             AiEvent::Cancelled(messages) => {
                 *self.messages.borrow_mut() = messages;
@@ -341,6 +359,7 @@ impl AiService {
                 *self.error.borrow_mut() = None;
                 self.cancel.borrow_mut().take();
                 self.persist_history();
+                self.apply_pending_context();
             }
             AiEvent::Error(error) => {
                 let partial = std::mem::take(&mut *self.stream_text.borrow_mut());
@@ -353,13 +372,72 @@ impl AiService {
                 self.streaming.set(false);
                 self.status.borrow_mut().clear();
                 self.persist_history();
+                self.apply_pending_context();
             }
+        }
+    }
+
+    fn context_key_for(&self, id: Option<TerminalId>) -> String {
+        let Some(id) = id else {
+            return "default".to_string();
+        };
+        self.workspace
+            .tabs()
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| {
+                if tab.profile_id.trim().is_empty() {
+                    format!("tab:{}", id.raw())
+                } else {
+                    format!("profile:{}", tab.profile_id)
+                }
+            })
+            .unwrap_or_else(|| format!("tab:{}", id.raw()))
+    }
+
+    fn switch_context(&self, id: Option<TerminalId>) {
+        let next_key = self.context_key_for(id);
+        let current_key = self.context_key.borrow().clone();
+        if next_key == current_key {
+            self.context_terminal.set(id);
+            return;
+        }
+        let mut currents = self.currents.borrow_mut();
+        let current_messages = self.messages.borrow().clone();
+        // Migrate the pre-per-connection history to the first connection the
+        // user opens instead of leaving it stranded under "default".
+        let migrate_default = current_key == "default"
+            && !currents.contains_key(&next_key)
+            && !current_messages.is_empty();
+        if !current_key.is_empty() && !migrate_default {
+            currents.insert(current_key, current_messages);
+        }
+        let next_messages = if migrate_default {
+            self.messages.borrow().clone()
+        } else {
+            currents.remove(&next_key).unwrap_or_default()
+        };
+        drop(currents);
+        *self.messages.borrow_mut() = next_messages;
+        *self.context_key.borrow_mut() = next_key;
+        self.context_terminal.set(id);
+        self.stream_text.borrow_mut().clear();
+        *self.error.borrow_mut() = None;
+        self.status.borrow_mut().clear();
+        self.persist_history();
+    }
+
+    fn apply_pending_context(&self) {
+        if let Some(id) = self.pending_context.take() {
+            self.switch_context(Some(id));
         }
     }
 
     fn persist_history(&self) {
         let history = HistoryFile {
             current: self.messages.borrow().clone(),
+            current_key: self.context_key.borrow().clone(),
+            currents: self.currents.borrow().clone(),
             conversations: self.archives.borrow().clone(),
         };
         let Ok(text) = serde_json::to_string_pretty(&history) else {
@@ -380,6 +458,7 @@ impl AiService {
             id: uuid::Uuid::new_v4().to_string(),
             title: conversation_title(&messages),
             updated: chrono::Utc::now().to_rfc3339(),
+            key: self.context_key.borrow().clone(),
             messages,
         };
         let mut archives = self.archives.borrow_mut();
@@ -612,6 +691,9 @@ impl AiAssistant for AiService {
                 .archives
                 .borrow()
                 .iter()
+                .filter(|conversation| {
+                    conversation.key.is_empty() || conversation.key == *self.context_key.borrow()
+                })
                 .map(|conversation| xcord_plugin_api::AiConversationView {
                     id: conversation.id.clone(),
                     title: conversation.title.clone(),
@@ -623,7 +705,14 @@ impl AiAssistant for AiService {
     }
 
     fn set_context_terminal(&self, id: Option<TerminalId>) {
-        self.context_terminal.set(id);
+        if self.streaming.get() {
+            if self.context_terminal.get() != id {
+                self.pending_context.set(id);
+                self.cancel();
+            }
+            return;
+        }
+        self.switch_context(id);
     }
 
     fn context_terminal(&self) -> Option<TerminalId> {
@@ -661,12 +750,10 @@ impl AiAssistant for AiService {
         if self.streaming.get() {
             return Err(self.i18n.t("ai", "Stop the current response first."));
         }
-        if !self
-            .archives
-            .borrow()
-            .iter()
-            .any(|conversation| conversation.id == id)
-        {
+        let key = self.context_key.borrow().clone();
+        if !self.archives.borrow().iter().any(|conversation| {
+            conversation.id == id && (conversation.key.is_empty() || conversation.key == key)
+        }) {
             return Err(self.i18n.t("ai", "Conversation not found."));
         }
         self.archive_current();
@@ -1451,10 +1538,13 @@ mod tests {
     fn history_file_roundtrips() {
         let history = HistoryFile {
             current: vec![ApiMessage::user("hello")],
+            current_key: "profile:p1".into(),
+            currents: HashMap::new(),
             conversations: vec![ConversationRecord {
                 id: "c1".into(),
                 title: conversation_title(&[ApiMessage::user("first line\nsecond")]),
                 updated: "2026-01-01T00:00:00Z".into(),
+                key: "profile:p1".into(),
                 messages: vec![ApiMessage::assistant(Some("hi".into()), Vec::new())],
             }],
         };

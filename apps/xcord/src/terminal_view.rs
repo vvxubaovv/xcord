@@ -185,6 +185,7 @@ impl TerminalView {
         } else {
             self.workspace.write(id, normalized.as_bytes());
         }
+        self.workspace.scroll_to_bottom(id);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -192,10 +193,6 @@ impl TerminalView {
         let control = keystroke.modifiers.control || keystroke.modifiers.platform;
         let shift = keystroke.modifiers.shift;
         let key = keystroke.key.as_str();
-
-        if let Some(id) = self.active {
-            self.workspace.scroll_to_bottom(id);
-        }
 
         if !control && !keystroke.modifiers.alt && !self.ime_text.is_empty() {
             // Never consume keys while the IME owns composition; returning
@@ -314,6 +311,7 @@ impl TerminalView {
         };
         if let Some(bytes) = encode_key(keystroke, snapshot.modes.application_cursor) {
             self.workspace.write(id, &bytes);
+            self.workspace.scroll_to_bottom(id);
         }
         cx.stop_propagation();
     }

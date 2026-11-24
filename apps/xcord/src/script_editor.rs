@@ -10,13 +10,35 @@ use gpui::{
     canvas, div, px, Bounds, ClipboardItem, Context, CursorStyle, ElementInputHandler,
     EntityInputHandler, FocusHandle, Focusable, Font, FontWeight, Hsla, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, ShapedLine,
-    SharedString, TextRun, UTF16Selection, Window,
+    SharedString, StyledText, TextRun, UTF16Selection, Window,
 };
 
 const FONT_SIZE: f32 = 11.5;
 const LINE_HEIGHT: f32 = 18.0;
 const GUTTER: f32 = 46.0;
 const PADDING: f32 = 8.0;
+
+fn push_text_run(
+    text: &mut String,
+    runs: &mut Vec<TextRun>,
+    font: &Font,
+    value: &str,
+    color: Hsla,
+    background: Option<Hsla>,
+) {
+    if value.is_empty() {
+        return;
+    }
+    text.push_str(value);
+    runs.push(TextRun {
+        len: value.len(),
+        font: font.clone(),
+        color,
+        background_color: background,
+        underline: None,
+        strikethrough: None,
+    });
+}
 
 pub struct ScriptEditor {
     focus_handle: FocusHandle,
@@ -92,6 +114,14 @@ impl ScriptEditor {
 
     pub fn value(&self) -> &str {
         &self.content
+    }
+
+    pub fn cursor_line(&self) -> usize {
+        self.cursor_line_column().0
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.content.split('\n').count().max(1)
     }
 
     pub fn set_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
@@ -313,12 +343,20 @@ impl ScriptEditor {
     fn move_vertical(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
         let (line, _) = self.cursor_line_column();
         let line_start = self.line_start(line);
-        let column = self.head.saturating_sub(line_start);
+        let head = self.head.min(self.content.len());
+        let column = self.content[line_start..head].chars().count();
         let target = (line as isize + delta).clamp(0, self.content.split('\n').count() as isize - 1)
             as usize;
         let start = self.line_start(target);
         let end = self.line_end(target);
-        let offset = start + column.min(end - start);
+        // Resolve the column by character, not by byte. A shorter target line
+        // (or a CJK character) must never leave the cursor inside a UTF-8
+        // sequence, otherwise the next render panics while slicing text.
+        let offset = self.content[start..end]
+            .char_indices()
+            .nth(column)
+            .map(|(index, _)| start + index)
+            .unwrap_or(end);
         self.move_to(offset, extend, cx);
     }
 
@@ -773,9 +811,12 @@ impl Render for ScriptEditor {
                 .flex()
                 .flex_shrink_0()
                 .items_start()
-                .h(px(line_height))
-                .whitespace_nowrap()
-                .overflow_hidden()
+                .when(self.plain, |row| {
+                    row.min_h(px(line_height)).whitespace_normal().flex_wrap()
+                })
+                .when(!self.plain, |row| {
+                    row.h(px(line_height)).whitespace_nowrap().overflow_hidden()
+                })
                 .rounded_sm()
                 .when(error && !self.plain, |row| {
                     row.bg(Hsla {
@@ -810,7 +851,111 @@ impl Render for ScriptEditor {
                         }),
                 );
             }
-            if selected_start < selected_end {
+            if self.plain {
+                let font = Font {
+                    weight: FontWeight::NORMAL,
+                    ..gpui::font(editor_font)
+                };
+                let mut text = String::new();
+                let mut runs: Vec<TextRun> = Vec::new();
+                if selected_start < selected_end {
+                    push_text_run(
+                        &mut text,
+                        &mut runs,
+                        &font,
+                        &self.content[line_start..selected_start],
+                        self.foreground,
+                        None,
+                    );
+                    push_text_run(
+                        &mut text,
+                        &mut runs,
+                        &font,
+                        &self.content[selected_start..selected_end],
+                        self.foreground,
+                        Some(Hsla {
+                            a: 0.28,
+                            ..self.accent
+                        }),
+                    );
+                    push_text_run(
+                        &mut text,
+                        &mut runs,
+                        &font,
+                        &self.content[selected_end..line_end],
+                        self.foreground,
+                        None,
+                    );
+                } else if index == cursor_line {
+                    let head = self.head.min(line_end);
+                    push_text_run(
+                        &mut text,
+                        &mut runs,
+                        &font,
+                        &self.content[line_start..head],
+                        self.foreground,
+                        None,
+                    );
+                    if head < line_end {
+                        let end = self.content[head..line_end]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(offset, _)| head + offset)
+                            .unwrap_or(line_end);
+                        push_text_run(
+                            &mut text,
+                            &mut runs,
+                            &font,
+                            &self.content[head..end],
+                            self.foreground,
+                            Some(self.accent),
+                        );
+                        push_text_run(
+                            &mut text,
+                            &mut runs,
+                            &font,
+                            &self.content[end..line_end],
+                            self.foreground,
+                            None,
+                        );
+                    } else {
+                        // A block cursor at end of line. A thin space keeps the
+                        // caret visible without changing the surrounding text
+                        // layout the way a flex cursor does.
+                        push_text_run(
+                            &mut text,
+                            &mut runs,
+                            &font,
+                            "　",
+                            self.foreground,
+                            Some(self.accent),
+                        );
+                    }
+                } else {
+                    push_text_run(&mut text, &mut runs, &font, line, self.foreground, None);
+                }
+                if self.content.is_empty() {
+                    if let Some(placeholder) = &self.placeholder {
+                        text.clear();
+                        runs.clear();
+                        push_text_run(
+                            &mut text,
+                            &mut runs,
+                            &font,
+                            "\u{200a}",
+                            self.foreground,
+                            Some(self.accent),
+                        );
+                        push_text_run(&mut text, &mut runs, &font, placeholder, self.muted, None);
+                    }
+                }
+                row = row.child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.))
+                        .child(StyledText::new(text).with_runs(runs)),
+                );
+            } else if selected_start < selected_end {
                 row = row
                     .child(
                         div()
