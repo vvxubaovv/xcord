@@ -16,8 +16,8 @@ use gpui::prelude::*;
 use gpui::{
     div, point, px, rgb, size, Bounds, ClipboardItem, Context, CursorStyle, Div, DragMoveEvent,
     Entity, Focusable, Font, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    PathPromptOptions, Render, Rgba, ScrollHandle, SharedString, Stateful, Timer, TitlebarOptions,
-    Window, WindowBounds, WindowOptions,
+    PathPromptOptions, Render, Rgba, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
+    Stateful, Timer, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use tokio::sync::broadcast::error::RecvError;
 use xcord_cordis::{Context as PluginContext, Kernel, PluginInfo, PluginState};
@@ -369,6 +369,7 @@ pub struct XcordApp {
     transfer_status: Option<String>,
     tearoff_watch: Cell<bool>,
     session_scroll: ScrollHandle,
+    tab_scroll: ScrollHandle,
     pending_session_scroll: RefCell<Option<String>>,
     located_session: RefCell<Option<String>>,
     login_runs: RefCell<HashMap<TerminalId, LoginRun>>,
@@ -634,6 +635,7 @@ impl XcordApp {
             transfer_status: None,
             tearoff_watch: Cell::new(false),
             session_scroll: ScrollHandle::new(),
+            tab_scroll: ScrollHandle::new(),
             pending_session_scroll: RefCell::new(None),
             located_session: RefCell::new(None),
             login_runs: RefCell::new(HashMap::new()),
@@ -5954,17 +5956,29 @@ impl XcordApp {
         self.open_session_dialog(Some(copy.id), cx);
     }
 
+    fn scroll_tab_bar(&self, delta: f32, cx: &mut Context<Self>) {
+        let offset = self.tab_scroll.offset();
+        let max = self.tab_scroll.max_offset().width;
+        let x = (f32::from(offset.x) + delta).clamp(-f32::from(max), 0.0);
+        self.tab_scroll.set_offset(point(px(x), offset.y));
+        cx.notify();
+    }
+
+    fn tab_bar_text_width(text: &str) -> f32 {
+        text.chars()
+            .map(|ch| if ch.is_ascii() { 7.5 } else { 14.0 })
+            .sum()
+    }
+
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
-        let mut tabs = div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .flex_1()
-            .overflow_hidden()
-            .px_2();
+        let mut tabs = div().flex().items_center().gap_1().flex_shrink_0().px_2();
         let groups = self.tab_groups.borrow().clone();
         let assignments = self.tab_group_of.borrow().clone();
+        let mut content_width = 24.0;
+        if !groups.is_empty() {
+            content_width += Self::tab_bar_text_width(&self.tr("Ungrouped")) + 28.0;
+        }
         if !groups.is_empty() {
             tabs = tabs.child(
                 div()
@@ -5985,6 +5999,7 @@ impl XcordApp {
         }
         for tab in &self.tabs {
             if !assignments.contains_key(&tab.id) {
+                content_width += Self::tab_bar_text_width(&tab.title) + 76.0;
                 tabs = tabs.child(self.render_tab_item(tab, cx));
             }
         }
@@ -5998,6 +6013,7 @@ impl XcordApp {
             let toggle_id = group.id.clone();
             let menu_id = group.id.clone();
             let collapsed = self.collapsed_tab_groups.borrow().contains(&group.id);
+            content_width += Self::tab_bar_text_width(&group.name) + 90.0;
             tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!("tab-group-{}", group.id)))
@@ -6044,18 +6060,87 @@ impl XcordApp {
                 continue;
             }
             for tab in group_tabs {
+                content_width += Self::tab_bar_text_width(&tab.title) + 76.0;
                 tabs = tabs.child(self.render_tab_item(tab, cx));
             }
         }
+        tabs = tabs.w(px(content_width.max(240.)));
 
-        div()
+        let can_scroll = f32::from(self.tab_scroll.max_offset().width) > 0.5 || self.tabs.len() > 3;
+        let mut bar = div()
             .h(px(42.))
             .flex()
             .items_center()
             .bg(rgbc(theme.panel))
             .border_b_1()
             .border_color(rgbc(theme.border))
-            .child(tabs)
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                if event.modifiers.shift {
+                    let delta = match event.delta {
+                        ScrollDelta::Lines(delta) => f32::from(delta.y) * 28.0,
+                        ScrollDelta::Pixels(delta) => f32::from(delta.y),
+                    };
+                    this.scroll_tab_bar(-delta, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .id("tab-bar-scroll")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_x_scroll()
+                    .track_scroll(&self.tab_scroll)
+                    .child(tabs),
+            );
+        if can_scroll {
+            bar = bar.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .child(
+                        div()
+                            .id("tab-scroll-left")
+                            .w(px(22.))
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.scroll_tab_bar(140.0, cx)),
+                            )
+                            .child("‹"),
+                    )
+                    .child(
+                        div()
+                            .id("tab-scroll-right")
+                            .w(px(22.))
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .text_size(px(10.))
+                            .text_color(rgbc(theme.muted))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgbc(theme.panel_alt)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.scroll_tab_bar(-140.0, cx)),
+                            )
+                            .child("›"),
+                    ),
+            );
+        }
+        bar
     }
 
     fn render_tab_group_menu(&self, group_id: &str, cx: &mut Context<Self>) -> Div {
