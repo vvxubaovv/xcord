@@ -656,7 +656,7 @@ impl XcordApp {
             automation_help,
             automation_diagnostic: None,
             automation_editor_revision: 0,
-            automation_help_open: true,
+            automation_help_open: false,
 
             ftp_open: false,
             ftp_profile: None,
@@ -10248,7 +10248,13 @@ impl XcordApp {
     fn render_welcome(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let recent = self.sessions.list().into_iter().take(4).collect::<Vec<_>>();
-        let mut recent_list = div().flex().flex_col().gap_2().w(px(420.));
+        let mut recent_list = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .max_w(px(420.))
+            .min_w(px(0.));
         for profile in recent {
             let id = profile.id.clone();
             recent_list = recent_list.child(
@@ -10275,21 +10281,26 @@ impl XcordApp {
                         div()
                             .flex()
                             .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
                             .child(
                                 div()
                                     .text_size(px(12.5))
                                     .text_color(rgbc(theme.foreground))
+                                    .overflow_hidden()
                                     .child(profile.name.clone()),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.))
                                     .text_color(rgbc(theme.muted))
+                                    .overflow_hidden()
                                     .child(profile.endpoint()),
                             ),
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .text_size(px(10.))
                             .text_color(rgbc(theme.accent))
                             .child(self.tr("connect")),
@@ -10299,7 +10310,11 @@ impl XcordApp {
 
         div()
             .flex_1()
+            .w_full()
+            .min_w(px(0.))
             .min_h(px(0.))
+            .overflow_hidden()
+            .px_4()
             .flex()
             .flex_col()
             .items_center()
@@ -10322,6 +10337,8 @@ impl XcordApp {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .justify_center()
                     .gap_3()
                     .child(primary_button(self.tr("New session"), theme).on_mouse_up(
                         MouseButton::Left,
