@@ -8358,7 +8358,7 @@ dependencies = [
 
 [[package]]
 name = "xcord"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-channel 2.5.0",
  "base64 0.22.1",
@@ -8384,7 +8384,7 @@ dependencies = [
 
 [[package]]
 name = "xcord-builtins"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-channel 2.5.0",
  "bytes",
@@ -8409,7 +8409,7 @@ dependencies = [
 
 [[package]]
 name = "xcord-cordis"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "log",
  "parking_lot",
@@ -8420,14 +8420,14 @@ dependencies = [
 
 [[package]]
 name = "xcord-mcp"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "xcord-store",
 ]
 
 [[package]]
 name = "xcord-plugin-api"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "async-channel 2.5.0",
  "bytes",
@@ -8442,7 +8442,7 @@ dependencies = [
 
 [[package]]
 name = "xcord-ssh"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -8459,7 +8459,7 @@ dependencies = [
 
 [[package]]
 name = "xcord-store"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "home",
@@ -8473,7 +8473,7 @@ dependencies = [
 
 [[package]]
 name = "xcord-vt"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "serde",
  "unicode-width",
