@@ -13,13 +13,14 @@ use gpui::{
     div, fill, point, px, size, App, Bounds, ClipboardItem, Context, CursorStyle, Element,
     ElementId, FocusHandle, Focusable, GlobalElementId, InspectorElementId, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, Rgba, SharedString, StyledText,
-    TextLayout, Window,
+    TextLayout, TextRun, Window,
 };
 
 pub struct SelectableText {
     id: usize,
     owner: Rc<Cell<Option<usize>>>,
     text: String,
+    runs: Option<Vec<TextRun>>,
     color: Rgba,
     font_size: f32,
     monospace: bool,
@@ -44,6 +45,7 @@ impl SelectableText {
             id,
             owner,
             text,
+            runs: None,
             color,
             font_size,
             monospace: false,
@@ -55,11 +57,17 @@ impl SelectableText {
         }
     }
 
+    pub fn set_runs(&mut self, runs: Vec<TextRun>, cx: &mut Context<Self>) {
+        self.runs = Some(runs);
+        cx.notify();
+    }
+
     pub fn set_text(&mut self, text: String, cx: &mut Context<Self>) {
         if self.text == text {
             return;
         }
         self.text = text;
+        self.runs = None;
         if let Some((start, end)) = self.selection {
             let len = self.text.len();
             self.selection = Some((start.min(len), end.min(len)));
@@ -206,8 +214,13 @@ impl Render for SelectableText {
         } else {
             None
         };
+        let inner = if let Some(runs) = self.runs.clone() {
+            StyledText::new(text.clone()).with_runs(runs)
+        } else {
+            StyledText::new(text.clone())
+        };
         let element = SelectableTextElement {
-            inner: StyledText::new(text.clone()),
+            inner,
             text,
             selection,
             selection_color: self.selection_color,

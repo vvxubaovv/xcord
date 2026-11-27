@@ -509,7 +509,28 @@ async fn run_session(
                     Some(ChannelMsg::ExitStatus { exit_status: status }) => {
                         exit_status = Some(status);
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    Some(ChannelMsg::Eof) => {
+                        // `exit`/Ctrl+D can deliver Eof before ExitStatus.
+                        // Drain briefly so a clean exit is distinguishable
+                        // from a dropped connection.
+                        let deadline = tokio::time::sleep(Duration::from_millis(350));
+                        tokio::pin!(deadline);
+                        loop {
+                            tokio::select! {
+                                _ = &mut deadline => break,
+                                message = channel.wait() => match message {
+                                    Some(ChannelMsg::ExitStatus { exit_status: status }) => {
+                                        exit_status = Some(status);
+                                        break;
+                                    }
+                                    Some(ChannelMsg::Close) | None => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Some(ChannelMsg::Close) | None => break,
                     _ => {}
                 }
             }

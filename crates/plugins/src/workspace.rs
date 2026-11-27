@@ -586,6 +586,14 @@ impl WorkspaceState {
                 reason,
                 exit_status,
             } => {
+                // A normal shell exit (`exit` / Ctrl+D) reports status 0 and
+                // carries no failure to inspect. Close that tab. Non-zero
+                // exits and transport failures stay open with their output so
+                // the user can read what went wrong.
+                if exit_status == Some(0) {
+                    self.close_impl(id);
+                    return;
+                }
                 {
                     let mut tabs = self.tabs.borrow_mut();
                     if let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) {

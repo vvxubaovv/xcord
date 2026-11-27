@@ -2,6 +2,8 @@
 
 mod detached_terminal;
 mod ime;
+mod markdown;
+mod mermaid;
 pub(crate) mod root;
 mod script_editor;
 mod selectable_text;

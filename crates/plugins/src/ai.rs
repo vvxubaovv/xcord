@@ -553,6 +553,16 @@ impl AiService {
         *self.error.borrow_mut() = None;
 
         let mut system = settings.ai_system_prompt.clone();
+        // The quick actions are UI labels; their prompts are intentionally
+        // short. Make the reply language follow the current UI locale unless
+        // the user explicitly asks for another language.
+        let language_instruction = if self.i18n.locale().starts_with("zh") {
+            "Always answer in Simplified Chinese (简体中文), matching the user's interface language, unless the user explicitly requests another language."
+        } else {
+            "Always answer in English, matching the user's interface language, unless the user explicitly requests another language."
+        };
+        system.push_str("\n\n");
+        system.push_str(language_instruction);
         system.push_str("\n\nAutomation script context (Rhai):\n");
         system.push_str(AUTOMATION_SYNTAX);
         system.push_str(

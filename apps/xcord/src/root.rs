@@ -332,6 +332,7 @@ pub struct XcordApp {
     ai_last_messages: Cell<usize>,
     ai_last_chars: Cell<usize>,
     ai_text_entities: RefCell<Vec<Entity<SelectableText>>>,
+    ai_markdown_views: RefCell<Vec<crate::markdown::MarkdownView>>,
     ai_selection_owner: Rc<Cell<Option<usize>>>,
 
     b64_upload_open: bool,
@@ -601,6 +602,7 @@ impl XcordApp {
             ai_last_messages: Cell::new(0),
             ai_last_chars: Cell::new(0),
             ai_text_entities: RefCell::new(Vec::new()),
+            ai_markdown_views: RefCell::new(Vec::new()),
             ai_selection_owner: Rc::new(Cell::new(None)),
             b64_upload_open: false,
             b64_upload_source: None,
@@ -2928,6 +2930,29 @@ impl XcordApp {
         }
         let text_entities = entities.clone();
         drop(entities);
+
+        let mut markdown_views_ref_guard = self.ai_markdown_views.borrow_mut();
+        let markdown_views = &mut *markdown_views_ref_guard;
+        while markdown_views.len() < snapshot.messages.len() {
+            let index = markdown_views.len();
+            markdown_views.push(crate::markdown::MarkdownView::new(
+                100_000 + index * 10_000,
+                self.ai_selection_owner.clone(),
+                theme.clone(),
+            ));
+        }
+        if markdown_views.len() > snapshot.messages.len() {
+            markdown_views.truncate(snapshot.messages.len());
+        }
+        for (index, message) in snapshot.messages.iter().enumerate() {
+            if message.role != "AI" || message.role.starts_with("Tool") {
+                continue;
+            }
+            markdown_views[index].set_content(message.text.clone(), theme.clone(), 11.5, cx);
+        }
+        drop(markdown_views_ref_guard);
+        let markdown_views = self.ai_markdown_views.borrow();
+
         let mut messages = div()
             .id("ai-messages")
             .flex()
@@ -2939,6 +2964,16 @@ impl XcordApp {
                 this.ai_follow.set(false);
                 cx.notify();
             }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    let mut changed = this.ai_selected_message.take().is_some();
+                    changed |= this.ai_selection_owner.replace(None).is_some();
+                    if changed {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _, _, cx| {
@@ -3003,6 +3038,8 @@ impl XcordApp {
                     &copy_label,
                     self.ai_selected_message.get() == Some(index),
                     text_entities[index].clone(),
+                    (message.role == "AI" && !message.role.starts_with("Tool"))
+                        .then(|| &markdown_views[index]),
                     cx,
                 ));
             }
@@ -3031,7 +3068,7 @@ impl XcordApp {
                                 self.ai_status(&snapshot.status)
                             }),
                     )
-                    .child(small_button("停止", theme).on_mouse_up(
+                    .child(small_button(self.tr("Stop"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             this.ai.cancel();
@@ -3230,11 +3267,11 @@ impl XcordApp {
                                     }
                                 }),
                             ))
-                            .child(small_button("新对话", theme).on_mouse_up(
+                            .child(small_button(self.tr("New chat"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.new_ai_conversation(cx)),
                             ))
-                            .child(small_button("历史", theme).on_mouse_up(
+                            .child(small_button(self.tr("History"), theme).on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
                                     this.ai_history_open = !this.ai_history_open;
@@ -4393,11 +4430,13 @@ impl XcordApp {
                 this.refresh_plugins();
                 cx.notify();
             }))
-            .child(self.header_button("导入导出", cx, |this, cx| {
-                this.transfer_open = true;
-                this.transfer_status = None;
-                cx.notify();
-            }))
+            .child(
+                self.header_button(self.tr("Import / Export"), cx, |this, cx| {
+                    this.transfer_open = true;
+                    this.transfer_status = None;
+                    cx.notify();
+                }),
+            )
             .child(self.header_button(self.tr("Settings"), cx, |this, cx| this.open_settings(cx)))
     }
 
@@ -4716,6 +4755,16 @@ impl XcordApp {
             .bg(rgbc(theme.panel))
             .border_r_1()
             .border_color(rgbc(theme.border))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    let mut changed = this.ai_selected_message.take().is_some();
+                    changed |= this.ai_selection_owner.replace(None).is_some();
+                    if changed {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(
                 div()
                     .p_3()
@@ -7465,7 +7514,7 @@ impl XcordApp {
                             }),
                     )
                     .child(div().flex_1())
-                    .child(self.tiny_text_button("AI 编辑", cx, |this, cx| {
+                    .child(self.tiny_text_button(self.tr("Edit with AI"), cx, |this, cx| {
                         let name = this
                             .automation_selected_script()
                             .map(|script| script.name)
@@ -9391,7 +9440,7 @@ impl XcordApp {
         let status = self
             .transfer_status
             .clone()
-            .unwrap_or_else(|| "选择导入或导出方式。".to_string());
+            .unwrap_or_else(|| self.tr("Choose an import or export mode.").to_string());
         div()
             .w(px(620.))
             .p(px(22.))
@@ -9412,7 +9461,7 @@ impl XcordApp {
                             .text_size(px(15.))
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgbc(theme.foreground))
-                            .child("导入 / 导出连接"),
+                            .child(self.tr("Import / Export Connections")),
                     )
                     .child(div().flex_1())
                     .child(
@@ -9438,17 +9487,17 @@ impl XcordApp {
                 div()
                     .text_size(px(10.5))
                     .text_color(rgbc(theme.muted))
-                    .child("YAML 会包含密码明文，请妥善保管导出文件。Xshell 导入支持 5/6 的 SID+RC4 加密密码；Xshell 7+ 主密码保护的密码可能无法解密。"),
+                    .child(self.tr("YAML contains plaintext passwords; keep the exported file safe. Xshell 5/6 SID+RC4 passwords are supported; Xshell 7+ master-password passwords may not decrypt.")),
             )
             .child(
                 div()
                     .flex()
                     .gap_2()
-                    .child(primary_button("导出 YAML", theme).on_mouse_up(
+                    .child(primary_button(self.tr("Export YAML"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.pick_export_yaml(cx)),
                     ))
-                    .child(secondary_button("导入 YAML", theme).on_mouse_up(
+                    .child(secondary_button(self.tr("Import YAML"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.pick_import_yaml(cx)),
                     )),
@@ -9457,11 +9506,11 @@ impl XcordApp {
                 div()
                     .flex()
                     .gap_2()
-                    .child(secondary_button("导入 Xshell", theme).on_mouse_up(
+                    .child(secondary_button(self.tr("Import Xshell"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.pick_import_xshell(cx)),
                     ))
-                    .child(secondary_button("导出 Xshell", theme).on_mouse_up(
+                    .child(secondary_button(self.tr("Export Xshell"), theme).on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.pick_export_xshell(cx)),
                     )),
@@ -10383,7 +10432,17 @@ impl XcordApp {
             .h_full()
             .flex()
             .flex_col()
-            .bg(rgbc(theme.background));
+            .bg(rgbc(theme.background))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    let mut changed = this.ai_selected_message.take().is_some();
+                    changed |= this.ai_selection_owner.replace(None).is_some();
+                    if changed {
+                        cx.notify();
+                    }
+                }),
+            );
         main = main.child(self.render_tab_bar(cx));
         if let Some(group) = self.tab_group_menu.clone() {
             main = main.child(self.render_tab_group_menu(&group, cx));
@@ -11873,7 +11932,7 @@ impl XcordApp {
                     .gap_3()
                     .child(
                         checkbox(
-                            "\u{4e0b}\u{8f7d}\u{5b8c}\u{6210}\u{540e}\u{5728}\u{6587}\u{4ef6}\u{6d4f}\u{89c8}\u{5668}\u{4e2d}\u{663e}\u{793a}",
+                            self.tr("Reveal completed downloads in the file manager"),
                             form.download_reveal,
                             theme,
                         )
@@ -12237,6 +12296,7 @@ fn render_ai_message(
     copy_label: &str,
     selected: bool,
     text: Entity<SelectableText>,
+    markdown_view: Option<&crate::markdown::MarkdownView>,
     cx: &mut Context<XcordApp>,
 ) -> Div {
     let is_tool = message.role.starts_with("Tool");
@@ -12256,22 +12316,10 @@ fn render_ai_message(
         })
         .when(selected, |card| card.bg(rgba(theme.accent, 0.08)))
         .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |this, _, window, cx| {
-                this.ai_selected_message.set(Some(index));
-                this.ai_menu_open.set(false);
-                let handle = this.ai_input.read(cx).focus_handle(cx);
-                window.focus(&handle);
-                cx.notify();
-            }),
-        )
-        .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, _, window, cx| {
+            cx.listener(move |this, _, _window, cx| {
                 this.ai_selected_message.set(Some(index));
                 this.ai_menu_open.set(true);
-                let handle = this.ai_input.read(cx).focus_handle(cx);
-                window.focus(&handle);
                 cx.stop_propagation();
                 cx.notify();
             }),
@@ -12294,6 +12342,17 @@ fn render_ai_message(
             .items_center()
             .justify_between()
             .gap_2()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.ai_selected_message.set(Some(index));
+                    this.ai_menu_open.set(false);
+                    let handle = this.ai_input.read(cx).focus_handle(cx);
+                    window.focus(&handle);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .text_size(px(9.5))
@@ -12322,7 +12381,11 @@ fn render_ai_message(
                     .child(copy_label.to_string()),
             ),
     )
-    .child(text)
+    .child(if let Some(view) = markdown_view {
+        div().w_full().min_w(px(0.)).child(view.render())
+    } else {
+        div().w_full().min_w(px(0.)).child(text)
+    })
 }
 
 #[derive(Debug)]
@@ -12829,7 +12892,7 @@ fn ui_font() -> Font {
     }
 }
 
-fn rgbc(color: [u8; 3]) -> Rgba {
+pub(crate) fn rgbc(color: [u8; 3]) -> Rgba {
     rgb(rgb_u32(color))
 }
 
@@ -12837,7 +12900,7 @@ fn rgb_u32(color: [u8; 3]) -> u32 {
     ((color[0] as u32) << 16) | ((color[1] as u32) << 8) | color[2] as u32
 }
 
-fn rgba(color: [u8; 3], alpha: f32) -> Rgba {
+pub(crate) fn rgba(color: [u8; 3], alpha: f32) -> Rgba {
     gpui::rgba((rgb_u32(color) << 8) | (alpha.clamp(0.0, 1.0) * 255.0) as u32)
 }
 
